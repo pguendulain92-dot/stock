@@ -21,8 +21,8 @@ comentarios del código son la fuente de verdad y este documento los amplía.
 | Pieza | Acá | Tu equivalente en Java |
 |---|---|---|
 | Lenguaje | Ruby 3.3.6 (`.ruby-version`) | Java 17/21 |
-| Framework | Rails 8.1 (`config/application.rb`) | Spring Boot |
-| Servidor | Puma (multi-proceso + multi-thread) | Tomcat / Undertow |
+| Framework | Rails 8.1.3.1 (`Gemfile.lock`), `load_defaults 8.1` | Spring Boot |
+| Servidor | Puma multi-thread (`config/puma.rb`: 3 threads, sin `workers`) | Tomcat / Undertow |
 | ORM | Active Record | Hibernate / JPA |
 | Base | PostgreSQL 16 | PostgreSQL |
 | Dependencias | Bundler + `Gemfile.lock` | Maven + `pom.xml` |
@@ -205,7 +205,7 @@ cosmética.
     COMMIT
     si llenó el lote -> se re-encola solo (drena rápido tras un pico)
 
- ── salida: Outbox::Publisher.build(ENV["OUTBOX_ADAPTER"]) ──────────────
+ ── salida: Outbox::Publisher.build   (lee ENV["OUTBOX_ADAPTER"]) ───────
    "log" (default) | "noop" (tests) | "webhook" (HMAC-SHA256 + timestamp)
 ```
 
@@ -271,9 +271,10 @@ idempotente**, porque la entrega es at-least-once.
 
 `app/lib` **es** un autoload path (aparece en
 `ActiveSupport::Dependencies.autoload_paths`), igual que `app/services`,
-`app/queries`, `app/policies`, `app/serializers`, `app/forms` y `app/jobs`. Todos
-los subdirectorios de `app/` son raíces de autoload por convención: no hay que
-declarar nada. El `lib/` de la raíz también, vía
+`app/queries`, `app/policies`, `app/serializers`, `app/forms` y `app/jobs`. Los
+subdirectorios de `app/` son raíces de autoload por convención —todos menos
+`assets`, `javascript` y `views`, que Rails excluye—, así que no hay que declarar
+nada. El `lib/` de la raíz también, vía
 `config.autoload_lib(ignore: %w[assets tasks])`.
 
 > `app/events/`, `app/services/catalog/` y `app/serializers/api/v1/` existen pero
@@ -347,8 +348,12 @@ consulta con 6 filtros opcionales, joins y agregaciones **no** va en el modelo:
 lo infla, mezcla "qué es un producto" con "cómo busca productos la pantalla X" y
 no se puede testear sin instanciar el modelo entero.
 
-**Regla del contrato**: devolver `Relation`, no `Array`. Un `to_a` fuerza la
-ejecución y mata la paginación y toda optimización posterior.
+**Regla del contrato** (`app/queries/application_query.rb`): devolver `Relation`,
+no `Array`. Un `to_a` fuerza la ejecución y mata la paginación y toda
+optimización posterior. La cumplen `LowStock`, `Ledger` y `Search`. Las tres de
+agregación (`Availability`, `Valuation`, `Reconciliation`) devuelven Hash o Array
+a propósito: un `GROUP BY` + `pluck` ya colapsó las filas, no queda Relation que
+encadenar. Si rompés la regla, que sea por eso y esté escrito.
 
 | Query object | Para qué | El truco que enseña |
 |---|---|---|
@@ -395,6 +400,13 @@ en ese controller levanta `AbstractController::ActionNotFound`. Como
 `StockOperationsController` y `ReportsController` heredan de esta base y no tienen
 `index`, un `only: %i[index]` acá rompería **todas** sus acciones.
 
+Precisión que conviene tener a mano: eso lo gobierna
+`config.action_controller.raise_on_missing_callback_actions`, que el generador
+pone en `true` en dev y test (`config/environments/development.rb:79` y
+`test.rb:64`) pero cuyo default de la gema es `false`. O sea: en producción no
+explota, el callback simplemente no matchea. Lo vas a ver en tu máquina y en CI,
+que es donde querés verlo.
+
 ### 4.5 `serializers/` — el contrato de la API es código
 
 `render json: product` serializa **todas** las columnas. El día que agregás
@@ -408,9 +420,10 @@ error, que junto con `STATUS_FOR` **es** el contrato de errores de la API.
 ### 4.6 `forms/` — el DTO validado
 
 Va cuando la entrada **no** se corresponde 1:1 con un modelo: varios modelos,
-campos virtuales, un wizard. `app/forms/stock_transfer_form.rb` recibe `sku` y
-`warehouse_code` (claves naturales, lo que el cliente realmente tiene a mano) y
-arma la transferencia con sus líneas. Dos detalles que valen la entrevista:
+campos virtuales, un wizard. `app/forms/stock_transfer_form.rb` recibe
+`source_warehouse_code`, `destination_warehouse_code` y un `sku` por línea
+(claves naturales, lo que el cliente realmente tiene a mano) y arma la
+transferencia con sus líneas. Dos detalles que valen la entrevista:
 
 - `products_by_sku` hace **una** query para todos los SKUs. Buscarlos de a uno
   dentro del loop de validación es un N+1 dentro de un `valid?` — el N+1 más
@@ -429,7 +442,7 @@ modelo, sin tener tabla. Duck typing puro.
   `Authorization` no se adjunta solo. El token se busca por índice sobre el
   **digest** SHA-256, así que nunca se compara un secreto en Ruby y no hay timing
   attack posible.
-- **`Api::Idempotency`** — idempotencia HTTP estilo Stripe (ver §9, fila 9).
+- **`Api::Idempotency`** — idempotencia HTTP estilo Stripe (ver §10, fila 9).
 - **`Api::ErrorHandling`** — `rescue_from` + el mapa `STATUS_FOR`
   (`app/controllers/concerns/api/error_handling.rb:38`) que traduce un
   `Result.error.code` a un status HTTP. Nunca devuelve `e.message` crudo de una
@@ -464,9 +477,10 @@ modelo, sin tener tabla. Duck typing puro.
    sequence_counters  (key PK string, value bigint) -> referencias correlativas
 ```
 
-Estado real de la base de desarrollo, medido hoy con `bin/rails runner`:
-15 productos, 4 depósitos (1 virtual: `IN-TRANSIT`), 48 `stock_items`,
-100 movimientos, 103 eventos en el outbox.
+Estado de la base de desarrollo al momento de escribir esto, medido con
+`bin/rails runner`: 15 productos, 4 depósitos (1 virtual: `IN-TRANSIT`),
+48 `stock_items`, 106 movimientos, 126 eventos en el outbox. Los dos últimos
+suben con cada corrida; los primeros salen del seed.
 
 ### 5.1 Qué es cada tabla
 
@@ -474,11 +488,11 @@ Estado real de la base de desarrollo, medido hoy con `bin/rails runner`:
 |---|---|---|
 | `products` | El catálogo. SKU como clave natural | `citext` para el SKU (case-insensitive en la base, no en Ruby). Índice GIN trigram sobre `name`. `lock_version` → optimistic locking. |
 | `warehouses` | Depósitos, `code` natural ("BA-01") | La bandera `virtual` es la que habilita el depósito de tránsito. |
-| `stock_items` | **El agregado.** Un renglón por (producto, depósito) | `quantity_available` es columna **generada** (`quantity_on_hand - quantity_reserved`, `STORED`). Único sobre `(product_id, warehouse_id)`. Tres CHECK constraints. |
+| `stock_items` | **El agregado.** Un renglón por (producto, depósito) | `quantity_available` es columna **generada** (`quantity_on_hand - quantity_reserved`, `STORED`). Único sobre `(product_id, warehouse_id)`. Cinco CHECK constraints, entre ellos `quantity_on_hand >= 0` y `quantity_reserved <= quantity_on_hand`. |
 | `stock_movements` | **El ledger.** Append-only, inmutable | `quantity` con **signo**. Sólo `created_at`, sin `updated_at`. Único **parcial** sobre `idempotency_key WHERE NOT NULL`. |
 | `stock_reservations` | Stock apartado, con TTL | Toda reserva nace con `expires_at`. Índice parcial sobre `expires_at WHERE status = 'held'`. |
-| `stock_transfers` (+ `_lines`) | Movimiento entre depósitos, en dos pasos | `transit_warehouse_id`; máquina de estados `draft → in_transit → received`. |
-| `purchase_orders` (+ `_lines`) | Compras a proveedor | `subtotal_cents` es columna generada. Recepción parcial soportada. |
+| `stock_transfers` (+ `_lines`) | Movimiento entre depósitos, en dos pasos | `transit_warehouse_id`; máquina de estados `draft → in_transit → received`, con `cancelled` como salida desde `draft`. |
+| `purchase_orders` (+ `_lines`) | Compras a proveedor | La columna generada es `purchase_order_lines.subtotal_cents` (`quantity_ordered * unit_cost_cents`); el total de la cabecera lo recalcula un callback de la línea. Recepción parcial soportada. |
 | `outbox_events` | Eventos pendientes de publicar | Índice parcial sobre `id WHERE published_at IS NULL`: la cola pendiente es chica aunque la tabla tenga 500 M de filas. |
 | `idempotency_keys` | Deduplicación de POST | Único sobre `(user_id, key)`. Guarda `response_body` y un fingerprint del request. |
 | `sequence_counters` | Referencias correlativas sin huecos | PK de tipo string. UPSERT con `RETURNING`. |
@@ -537,9 +551,11 @@ receive:   IN-TRANSIT  --transfer_out(-9) -->  CB-01
            IN-TRANSIT  --scrap      (-1) -->                 (faltante imputado)
 ```
 
-Así `SUM(quantity)` sobre **todo** el ledger sigue siendo constante en cada paso,
-y el faltante (*shrinkage*) tiene dónde imputarse. Sin el depósito intermedio esas
-unidades quedan como fantasmas para siempre. Es el modelo que usa cualquier WMS
+Cada par `transfer_out`/`transfer_in` suma cero, así que **mover** mercadería no
+altera el `SUM(quantity)` global del ledger: lo único que lo baja es el `scrap`, y
+ése es exactamente el asiento donde queda imputado el faltante (*shrinkage*), con
+fecha, depósito y motivo. Sin el depósito intermedio esas unidades desaparecen sin
+asiento y quedan como fantasmas para siempre. Es el modelo que usa cualquier WMS
 serio; está en `app/services/stock/transfers/dispatch.rb` y `receive.rb`.
 
 **Otras decisiones deliberadas.** *Desnormalización* de `product_id` y
@@ -549,8 +565,11 @@ más frecuente y pesada; el costo es mantenerlos consistentes, y lo hace
 `denormalize_from_stock_item` (`app/models/stock_movement.rb:68`). *Asociación
 polimórfica sin FK* (`reference_type` / `reference_id`): es la limitación
 inherente del polimorfismo en SQL, no podés tener una FK a N tablas. *`ON DELETE
-RESTRICT` en casi todo y `SET NULL` en `user_id`*: nunca borres historia contable
-en cascada. *Enums como string*: con enteros, reordenar las claves cambia el
+RESTRICT` en todo lo que es historia o catálogo (stock, movimientos, productos,
+depósitos), `SET NULL` en `stock_movements.user_id` y
+`stock_reservations.user_id`, y `CASCADE` sólo en lo accesorio que no tiene
+sentido sin su padre (sesiones, `api_tokens`, `idempotency_keys`, las líneas de
+orden y de transferencia)*: nunca borres historia contable en cascada. *Enums como string*: con enteros, reordenar las claves cambia el
 significado de los datos históricos en silencio. *Columna generada en vez de
 calcular en Ruby*: no se puede desincronizar, se puede **indexar**, y la ven todos
 los clientes de la base. Es la `@Formula` de Hibernate, pero materializada.
@@ -578,7 +597,7 @@ transacción** que el asiento, así que nunca hay ventana de inconsistencia.
 
 ### 6.2 Cómo se verifica
 
-`app/queries/stock_items/reconciliation.rb:24`:
+`app/queries/stock_items/reconciliation.rb:25` (método `call`):
 
 ```ruby
 StockItem.left_joins(:stock_movements)
@@ -603,7 +622,7 @@ SELECT (SELECT SUM(quantity)         FROM stock_movements) AS ledger_total,
 
  ledger_total | proyeccion_total
 --------------+------------------
-         2275 |             2275
+         2295 |             2295
 ```
 
 `Stock::ReconcileBalancesJob` corre esto a las 3 AM y **alerta sin corregir**.
@@ -720,7 +739,7 @@ Comprobación (transacción externa revertida al final para no ensuciar la base)
 
 ```
 reorder_quantity original = 25
-el service interno devolvio: :inner_devolvio_result
+el service interno devolvio: boom
 en memoria dentro de la tx externa: 999
 >>> la tx externa SIGUE VIVA y la escritura del inner NO se revirtio sola
 despues del rollback externo: 25
@@ -899,9 +918,17 @@ disparan **antes** de que la externa termine y encolás un job para datos que
 todavía pueden hacer rollback. La solución correcta es
 `ActiveRecord.after_all_transactions_commit`, que es lo que usa
 `Outbox::Recorder#schedule_publish` (`app/services/outbox/recorder.rb:47`).
-Callbacks legítimos en el repo, y son sólo dos: `denormalize_from_stock_item` en
-`StockMovement` y `recompute_path` en `Category`. Ninguno toca otra tabla ni
-encola nada.
+En el repo hay una decena de callbacks y la mayoría son inocuos: derivan un valor
+de la **misma** fila antes de validar o de crear (`denormalize_from_stock_item` en
+`StockMovement`, `recompute_path` y `assign_slug` en `Category`,
+`assign_reference` en `StockTransfer` y `PurchaseOrder`, el `expires_at ||=` de
+`Session`, `IdempotencyKey` y `StockReservation`). Los dos que **sí** salen de su
+propia fila son los que hay que mirar con lupa:
+`ProductSupplier#unset_other_preferred` (un `update_all` sobre las filas hermanas,
+para no chocar con el índice único parcial) y
+`PurchaseOrderLine#refresh_order_totals` (escribe en `purchase_orders`). Ninguno
+encola un job: ese efecto vive en `Outbox::Recorder`, fuera de los callbacks, y
+por las razones de arriba.
 
 **`default_scope`.** Nunca. Está explicado en
 `app/models/concerns/discardable.rb`: se cuela en todas las asociaciones, joins y
@@ -934,11 +961,11 @@ agregación).
 | 8 | `quantity_available` "no se actualiza" después de escribir | Es una columna **generada**: la asignación se descarta en silencio y el objeto queda viejo. `StockItem.readonly_attributes` está vacío, así que ni te avisa | `reload` después de escribir, como hace `ApplyMovement#apply_to` (`:132`) |
 | 9 | Doble ingreso de mercadería tras un timeout del cliente | El cliente reintentó un POST no idempotente | `Idempotency-Key` + índice único parcial sobre `stock_movements.idempotency_key`. Y el **fingerprint** del body: misma clave con body distinto → 422, no la respuesta vieja |
 | 10 | El disponible baja solo y nunca se recupera | Reservas sin vencer: carritos abandonados que inmovilizan stock | `expires_at` obligatorio en toda reserva + `Stock::ExpireReservationsJob` cada minuto. Es el job que más se olvida |
-| 11 | Un listado de 200 productos tarda 6 segundos | N+1 de **agregación**: `products.map { \|p\| p.stock_items.sum(...) }`. `includes` **no** lo arregla | `StockItems::Availability` — un `GROUP BY` + `pluck`. Bullet lo caza en dev/test |
+| 11 | Un listado de 200 productos tarda 6 segundos | N+1 de **agregación**: `products.map { \|p\| p.stock_items.sum(...) }`. `includes` **no** lo arregla | `StockItems::Availability` — un `GROUP BY` + `pluck`. Bullet lo caza en los specs marcados `:n_plus_one` (`spec/support/bullet.rb`) |
 | 12 | La página 5000 del ledger tarda segundos y repite filas | Paginación por `OFFSET`: Postgres genera y descarta 100.000 filas, y una inserción concurrente desplaza todo | Keyset con comparación de tuplas: `StockMovements::Ledger` |
 | 13 | Un evento roto tapa la cola del outbox para siempre | *Poison message*: sin `rescue` por evento, el lote entero falla y se reintenta igual | El `rescue` va dentro del `each`, más `attempts`/`MAX_ATTEMPTS`. Revisá `OutboxEvent.stuck` |
 | 14 | El reporte diario salió con 3 horas de diferencia | `config/recurring.yml` interpreta los horarios en `Time.zone` de la app | Definí `config.time_zone` explícitamente y no lo deduzcas |
-| 15 | `AbstractController::ActionNotFound` en endpoints que antes andaban | Un callback con `only: %i[index]` en una clase base que heredan controllers sin `index`. Cambió en Rails 7.1 | Un solo callback que decide adentro, como `verify_pundit_usage` |
+| 15 | `AbstractController::ActionNotFound` en endpoints que antes andaban — **la única fila de esta tabla que NO ves en producción**: aparece en dev, test y CI | Un callback con `only: %i[index]` en una clase base que heredan controllers sin `index`. Rails 7.1 agregó `raise_on_missing_callback_actions`, que el generador pone en `true` sólo en dev/test (default de la gema: `false`) | Un solo callback que decide adentro, como `verify_pundit_usage`. No lo tapes poniendo el flag en `false`: el error es correcto |
 | 16 | Un SKU con `\n<script>` pasó la validación | En Ruby `^`/`$` son principio/fin de **línea**, no de string (al revés que en Java) | `\A` y `\z` siempre. Brakeman lo marca solo |
 | 17 | Tablas de sesiones/idempotencia hinchadas y queries degradadas con pocas filas vivas | Un DELETE masivo dejó millones de tuplas muertas y el autovacuum no da abasto | Borrar seguido y en lotes chicos (`Cleanup::ExpiredRecordsJob`). A escala real: particionar por fecha y `DROP PARTITION` |
 
@@ -1027,7 +1054,8 @@ agregación).
 > puede ejecutar desde `bin/rails runner` sin tocar una línea: si no podés, hay
 > lógica atrapada en el controller. Lo hago cumplir con tres cosas: un
 > `after_action` que explota en dev/test si una acción no llamó a `authorize` o a
-> `policy_scope`, Bullet —que rompe la suite si aparece un N+1— y Brakeman en CI. Y
+> `policy_scope`, Bullet con `raise = true` en los specs marcados `:n_plus_one`
+> —ahí un N+1 rompe el test— y Brakeman en CI. Y
 > el modelo tiene un comentario en la cabecera que dice explícitamente qué **no** va
 > ahí, porque la documentación que vive lejos del código no la lee nadie.
 >
