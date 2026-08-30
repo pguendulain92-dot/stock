@@ -98,7 +98,7 @@ dependencias transitivas, nadie las declaró, y por eso no tienen restricción p
 
 716 líneas, cinco secciones, y cada una responde una pregunta distinta:
 
-```
+```text
 GEM / specs      -> el grafo resuelto completo, con las dependencias de cada gema
 PLATFORMS        -> para qué arquitecturas está resuelto este lock
 DEPENDENCIES     -> lo que vos pediste (las 47 líneas del Gemfile)
@@ -111,7 +111,7 @@ Tres cosas que no tienen equivalente directo en Maven:
 
 **`PLATFORMS`.** Nuestro lock declara nueve:
 
-```
+```text
 aarch64-linux  aarch64-linux-gnu  aarch64-linux-musl  arm-linux-gnu
 arm-linux-musl  arm64-darwin  x86_64-darwin  x86_64-linux-gnu  x86_64-linux-musl
 ```
@@ -124,7 +124,7 @@ explota. Se arregla con `bundle lock --add-platform x86_64-linux`. Y ojo con
 
 **`CHECKSUMS`.** Cada gema con su sha256:
 
-```
+```text
 pg (1.6.3-x86_64-linux) sha256=5d9e188c8f7a0295d162b7b88a768d8452a899977d44f3274d1946d67920ae8d
 ```
 
@@ -157,7 +157,7 @@ Rails.groups    # => [:default, "development"]
 O sea: Bundler hace `require` automático de **todas** las gemas de esos grupos. Comprobado
 con `bin/rails runner`, sin haber escrito un solo `require` en el código de la app:
 
-```
+```text
 pagy cargado?     SI      <- grupo default
 oj cargado?       SI      <- grupo default
 sidekiq cargado?  SI      <- grupo default (aunque QUEUE_ADAPTER sea solid_queue)
@@ -286,7 +286,7 @@ Es una JNI que se construye en tu máquina en `gem install`.
 
 En este repo, las gemas con extensión C instaladas son:
 
-```
+```text
 bcrypt  bcrypt_pbkdf  bigdecimal  bindex  bootsnap  date  debug  ed25519
 erb  io-console  json  msgpack  nio4r  nokogiri  oj  pg  prism  puma
 racc  rbs  stackprof  websocket-driver
@@ -381,7 +381,7 @@ gem "rails", "~> 8.1.3", ">= 8.1.3.1"
 Es un meta-gem: no tiene código propio, sólo declara sus ocho componentes en versión exacta
 (`= 8.1.3.1`). En el lock:
 
-```
+```text
 rails (8.1.3.1)
   actioncable, actionmailbox, actionmailer, actionpack, actiontext, actionview,
   activejob, activemodel, activerecord, activestorage, activesupport, railties
@@ -434,7 +434,7 @@ seq = Benchmark.realtime { n.times { BCrypt::Password.create("x", cost: 12) } }
 par = Benchmark.realtime { n.times.map { Thread.new { BCrypt::Password.create("x", cost: 12) } }.each(&:join) }
 ```
 
-```
+```text
 nucleos: 4
 secuencial 8 hashes: 1.87 s
 en 8 threads:        0.49 s   -> speedup 3.82x   (bcrypt LIBERA el GVL)
@@ -615,7 +615,7 @@ archivo en vez de invalidar el bundle entero.
 Las `assets.paths` reales incluyen directorios de gemas —así es como `turbo.min.js` y
 `stimulus.min.js` aparecen sin que vos los hayas descargado:
 
-```
+```text
 app/assets/builds, app/assets/images, app/assets/stylesheets,
 app/javascript, vendor/javascript,
 .../turbo-rails-2.0.23/app/assets/javascripts,
@@ -883,7 +883,7 @@ Costo de tenerlo en el `Gemfile` sin usarlo: Sidekiq se carga en **todos** los p
 
 Lo usa `has_secure_password` en `app/models/user.rb:10`. Medido acá:
 
-```
+```text
 cost por defecto (BCrypt::Engine.cost): 12
 cost del digest realmente guardado:     12
 tiempo de un hash:                      233 ms
@@ -958,7 +958,7 @@ controller, por qué el store importa, por qué `track` antes de `throttle`) est
 
 Lo que agrego acá es una observación de la ejecución real. Mirá `bin/rails middleware`:
 
-```
+```text
 use ActionDispatch::RemoteIp
 use Rack::Attack          <- el nuestro (config/application.rb:52)
 use Propshaft::QuietAssets
@@ -1032,7 +1032,7 @@ O sea: la gema se carga en cada proceso, suma RAM, y no serializa un solo byte.
 **Motivo 2: aunque lo conectaras, hoy es más lento.** Benchmark real, 2000 objetos serializados
 100 veces, con calentamiento previo:
 
-```
+```text
 json gem: 2.21.2 / oj: 3.17.6 / ruby 3.3.6
 
   ActiveSupport::JSON.encode (lo que usa render json:)     1.36 ms/iter
@@ -1137,7 +1137,7 @@ rollback:
 ```ruby
 add_index :products, :name
 ```
-```
+```text
 CLASE: StrongMigrations::UnsafeMigration
 
 === Dangerous operation detected #strong_migrations ===
@@ -1424,7 +1424,7 @@ está cerrada.
 
 **`brakeman` (8.0.6)** — analizador estático de seguridad específico de Rails. Corrida real:
 
-```
+```text
 Controllers: 19 | Models: 22 | Templates: 34 | Errors: 0
 Security Warnings: 0
 Duration: 1.53 s | Checks Run: 80+
@@ -1790,17 +1790,9 @@ reescribió y se optimizó fuerte. Es la lección general: una dependencia que e
 performance necesita que **revalides la medición**, porque el consejo de hace ocho años
 sigue circulando mucho después de dejar de ser cierto.
 
-**«¿Solid Queue o Sidekiq?»**
-
-Depende del volumen y de si el encolado tiene que ser transaccional. Solid Queue usa Postgres
-con `FOR UPDATE SKIP LOCKED`: menos infraestructura, y el `INSERT` del job va **en tu misma
-transacción**, así que un rollback no deja jobs huérfanos. Sidekiq usa Redis: latencia de ~1 ms
-contra 100 ms - 1 s de polling, y muchísimo más throughput, pero el enqueue sale de tu
-transacción.
-*Trade-off:* bajo ~10k jobs/min, Solid Queue te ahorra medio stack. Arriba, o si necesitás
-latencia mínima, Sidekiq.
-*El matiz que separa una buena respuesta:* `enqueue_after_transaction_commit = :always`
-(Rails 7.2+, activado en `config/initializers/sidekiq.rb`) arregla el problema del rollback
-para cualquier adapter — pero **no reemplaza al outbox**. Si el proceso muere entre el COMMIT
-y el enqueue, el job se pierde igual. Para eventos que no se pueden perder, outbox; para
-"mandale un mail", esto alcanza.
+> La pregunta «¿Solid Queue o Sidekiq?» cae seguro y la respuesta completa está en §13 y en
+> docs/07. La versión de 30 segundos: Solid Queue mete el `INSERT` del job **en tu misma
+> transacción**, Sidekiq no; por debajo de ~10k jobs/min eso vale más que la latencia de
+> ~1 ms de Redis. Y el remate que separa una buena respuesta:
+> `enqueue_after_transaction_commit` arregla el rollback pero **no reemplaza al outbox**,
+> porque si el proceso muere entre el COMMIT y el enqueue el job se pierde igual.

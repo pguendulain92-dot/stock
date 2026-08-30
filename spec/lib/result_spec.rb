@@ -95,9 +95,9 @@ RSpec.describe Result do
       resultado = described_class.success({ id: 7 })
 
       salida = case resultado
-               in { ok: true, value: { id: Integer => id } } then "ok #{id}"
-               in { ok: false } then "error"
-               end
+      in { ok: true, value: { id: Integer => id } } then "ok #{id}"
+      in { ok: false } then "error"
+      end
 
       expect(salida).to eq("ok 7")
     end
@@ -106,9 +106,9 @@ RSpec.describe Result do
       resultado = described_class.failure(:conflict, "chocó")
 
       salida = case resultado
-               in { ok: true } then "ok"
-               in { ok: false, error: { code: :conflict } } then "conflicto"
-               end
+      in { ok: true } then "ok"
+      in { ok: false, error: { code: :conflict } } then "conflicto"
+      end
 
       expect(salida).to eq("conflicto")
     end
