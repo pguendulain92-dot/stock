@@ -26,7 +26,7 @@ discriminador.
 
 | Problema | Qué pasa si no lo limitás | Discriminador correcto |
 |---|---|---|
-| **Credential stuffing** | Un atacante prueba 50.000 pares usuario/clave filtrados de otro sitio | IP **y** email (ver §5.4) |
+| **Credential stuffing** | Un atacante prueba 50.000 pares usuario/clave filtrados de otro sitio | IP **y** email (ver §4.4) |
 | **Ataque dirigido a una cuenta** | Un botnet con 5.000 IPs prueba 10 claves cada una contra `ana@empresa.com` | email (el de IP no lo ve) |
 | **Scraping** | Te copian el catálogo entero; tu competencia tiene tus precios | token / IP + endpoint |
 | **Costo** | Cada `/api/v1/reports/valuation` es una agregación sobre toda la tabla; 100 clientes concurrentes te funden la CPU de Postgres | token, con costo por endpoint |
@@ -34,7 +34,7 @@ discriminador.
 | **Cascada de fallas** | Un pico satura Puma, se llena el backlog, los health checks empiezan a fallar, el balanceador saca instancias, lo que quedó recibe más carga | global (load shedding) |
 
 Fijate que los últimos dos no son *seguridad*: son **disponibilidad**. Y eso
-cambia la respuesta correcta cuando el limitador falla (§6.5).
+cambia la respuesta correcta cuando el limitador falla (§5.5).
 
 ### 1.1 Rate limiting vs sus primos
 
@@ -45,7 +45,7 @@ pedir que los distingas.
 |---|---|---|---|
 | **Rate limiting** | requests por unidad de tiempo, por cliente | rechaza con 429 | Bucket4j, `RequestRateLimiter` de Spring Cloud Gateway |
 | **Throttling** | igual, pero *demora* en vez de rechazar | encola / duerme al cliente | `RateLimiter.acquire()` de Guava (bloquea) |
-| **Load shedding** | salud del *servidor* (latencia, cola, CPU) | tira requests **sin importar de quién sean** | `Semaphore` de Resilience4j, CoDel |
+| **Load shedding** | salud del *servidor* (latencia, cola, CPU) | tira requests **sin importar de quién sean** | Netflix `concurrency-limits` (AIMD/Gradient), CoDel |
 | **Circuit breaker** | tasa de error de una *dependencia* | deja de llamar a lo que ya está roto | `@CircuitBreaker` de Resilience4j |
 | **Bulkhead** | concurrencia por *pool* | aísla, para que una dependencia lenta no se coma todos los threads | `@Bulkhead`, pools separados |
 
@@ -65,7 +65,7 @@ Diferencias que importan:
 > **Donde se rompe la analogía con Java.** En Spring vos ponés `@RateLimiter` en
 > un método de servicio y Resilience4j interpone un proxy AOP. En Rails no hay
 > proxies: `rate_limit` es azúcar sobre `before_action` (lo vas a ver literal en
-> §9.1), y `Rack::Attack` es un middleware Rack. No hay contenedor de DI, no hay
+> §8.1), y `Rack::Attack` es un middleware Rack. No hay contenedor de DI, no hay
 > `BeanPostProcessor`, no hay bytecode instrumentado. Todo es composición
 > explícita de objetos que responden a `call`. Eso hace el stack mucho más fácil
 > de leer (`bin/rails middleware` te lo imprime entero) y mucho más difícil de
@@ -83,7 +83,7 @@ lo más afuera que puedas con la información que tenés**.
 | **CDN / WAF** (Cloudflare, CloudFront) | IP, ASN, país, JA3, path, headers | quién es el usuario, de qué plan | ~0 para vos: ni te enterás | µs, en el borde de red |
 | **Load balancer** (ALB, nginx `limit_req`) | IP, path, headers | identidad de negocio | ~0 tu app | µs |
 | **Middleware Rack** (`Rack::Attack`) | IP resuelta, path, método, headers, **body parseado** | usuario autenticado, plan, tenant | 1 worker de Puma ocupado ~3 ms | **2,9 ms** medidos |
-| **Controller** (`rate_limit`) | **todo**: usuario, token, scopes, tenant, plan | — | 1 worker + routing + auth (2 queries) | **12 ms** medidos |
+| **Controller** (`rate_limit`) | **todo**: usuario, token, scopes, tenant, plan | — | 1 worker + routing + auth (2 SELECT) | **12 ms** medidos |
 | **Base de datos** (constraint, cuota en tabla) | todo + estado histórico | — | conexión + transacción | decenas de ms |
 
 Los números de la tabla son reales, medidos con `curl` contra el repo corriendo
@@ -119,9 +119,10 @@ server-timing: cache_read.active_support;dur=0.30, cache_increment.active_suppor
 x-runtime: 0.001452
 ```
 
-1,45 ms de tiempo Rails total, de los cuales 0,73 ms son las dos llamadas a
-Redis. El resto del stack (routing, controller, ActiveRecord, vistas) ni se
-ejecutó.
+1,45 ms de tiempo Rails total, de los cuales 0,73 ms son las dos idas a Redis:
+el `cache_read` es el chequeo de ban del `Fail2Ban` de la blocklist y el
+`cache_increment` es el contador del throttle. El resto del stack (routing,
+controller, ActiveRecord, vistas) ni se ejecutó.
 
 ### 2.1 Por qué este repo necesita las DOS capas
 
@@ -144,7 +145,7 @@ puede**.
   │  │  NO sabe: quién sos                            │              │
   │  └────────────────────┬───────────────────────────┘              │
   │                       ▼                                          │
-  │  routing → controller → authenticate_api_token!  ← 2 queries     │
+  │  routing → controller → authenticate_api_token!  ← 2 SELECT      │
   │  ┌────────────────────────────────────────────────┐              │
   │  │ CAPA 2 · ActionController#rate_limit           │  ~12 ms      │
   │  │  sabe: current_api_token, user, scopes, plan   │              │
@@ -163,9 +164,12 @@ puede**.
 Un ejemplo concreto del repo: `Api::V1::ReportsController` limita a 20/min *por
 token* (`app/controllers/api/v1/reports_controller.rb:11-15`). Rack::Attack no
 podría hacer eso sin volver a resolver el token contra la base — o sea, sin
-duplicar la autenticación en el middleware. Y a la inversa: la capa 2 nunca ve
+duplicar la autenticación en el middleware. Esa resolución son dos `SELECT`
+(el `ApiToken` por digest y su `User`) más, a lo sumo una vez por minuto, el
+`UPDATE` de `ApiToken#touch_usage!` (`app/models/api_token.rb:77-81`). Y a la
+inversa: la capa 2 nunca ve
 un request con un token inválido, porque `authenticate_api_token!` ya devolvió
-401 y cortó la cadena (esto tiene una consecuencia fea; ver §9.4).
+401 y cortó la cadena (esto tiene una consecuencia fea; ver §8.3).
 
 ### 2.2 El stack real, y una sorpresa
 
@@ -214,15 +218,44 @@ def call(env)
   ...
 ```
 
-La primera instancia marca el `env` y la segunda es un passthrough. Funciona,
-pero es una capa de cebolla fantasma, y es exactamente el tipo de cosa que te
-hace perder tres horas el día que cambie el comportamiento entre versiones.
-Mínimo: **verificá con `bin/rails middleware` cuál de las dos está en la
-posición correcta** (la que va después de `RemoteIp`) y no asumas que hay una
-sola. Sacar la del railtie no es trivial —el orden en que se aplican las
-operaciones sobre el stack hace que un `delete` en `application.rb` corra
-*antes* de que el railtie agregue la suya— así que si te importa, medilo en tu
-entorno antes de dar por buena cualquier receta.
+La primera instancia (la de después de `RemoteIp`) marca el `env` y la segunda es
+un passthrough. Funciona, pero es una capa de cebolla fantasma, y es exactamente
+el tipo de cosa que te hace perder tres horas el día que cambie el comportamiento
+entre versiones.
+
+**Cómo se saca la duplicada, y por qué la solución obvia falla.** La clave está en
+cómo Rails aplica las operaciones sobre el stack:
+`Rails::Configuration::MiddlewareStackProxy` guarda **dos** listas —
+`@operations` y `@delete_operations`— y `merge_into` corre **primero todas las
+operaciones y después todas las de borrado** (`railties-8.1.3.1/lib/rails/configuration.rb:88-94`).
+`delete`, `move_before` y `move_after` van en la segunda lista; `use`,
+`insert_before` e `insert_after` en la primera.
+
+O sea que un `config.middleware.delete Rack::Attack` **no** corre antes que el
+railtie: corre *al final de todo*, y como `MiddlewareStack#delete` usa `reject!`
+(`actionpack-8.1.3.1/lib/action_dispatch/middleware/stack.rb:131-133`), te borra
+**las dos**. Simulado con el stack real:
+
+```text
+hoy (insert_after):     RequestId, RemoteIp, Attack, Logger, TempfileReaper, Attack
+insert_after + delete:  RequestId, RemoteIp, Logger, TempfileReaper       ← ¡ninguna!
+sólo move_after:        RequestId, RemoteIp, Attack, Logger, TempfileReaper
+```
+
+La receta que funciona es la tercera: **borrá el `insert_after` de
+`application.rb:52` y dejá sólo `move_after`**, que mueve la instancia que puso
+el railtie en vez de agregar otra.
+
+```ruby
+# config/application.rb — reemplazo del insert_after
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+Funciona porque `move_after` está en `@delete_operations` (corre después del
+`use` del railtie) y `MiddlewareStack#move_after` saca **una** sola instancia
+(`delete_at` sobre el primer índice) y la reinserta en la posición pedida. Queda
+un único `Rack::Attack`, justo después de `RemoteIp`. Y siempre: **verificalo con
+`bin/rails middleware`**, que es la única fuente de verdad del stack armado.
 
 > **Analogía Java y dónde se rompe.** El stack Rack es la `FilterChain` de
 > Servlet, y `insert_after` es el `@Order`. La diferencia: en Spring el orden lo
@@ -230,7 +263,7 @@ entorno antes de dar por buena cualquier receta.
 > `ApplicationContext` reflection. Acá lo imprimís con un comando y es una lista
 > ordenada de objetos. La contra: en Spring un filtro mal ordenado normalmente
 > te explota; en Rack un middleware mal ordenado **funciona silenciosamente
-> mal** (§7.2).
+> mal** (§6.3).
 
 ---
 
@@ -295,8 +328,8 @@ Leé la clave `rack-attack:rack::attack:5960376:req/ip:127.0.0.1`:
 
 ```ruby
 period = 60; limit = 100
-1_800_000_059 / 60  # => 30000000   (12:00:59)
-1_800_000_060 / 60  # => 30000001   (12:01:00)
+1_800_000_059 / 60  # => 30000000   (hh:mm:59, último segundo de la ventana)
+1_800_000_060 / 60  # => 30000001   (hh:mm+1:00, primer segundo de la siguiente)
 ```
 
 100 requests en el último segundo de una ventana + 100 en el primer segundo de
@@ -501,11 +534,16 @@ Corrido de verdad contra el Redis de esta máquina (`rate=2 tok/s`,
   req  1  allowed=1  tokens_restantes= 5
   req  5  allowed=1  tokens_restantes= 1
 
-Hash en Redis: {"tokens"=>"1", "ts"=>"1788113046.04"}  TTL=6
+Hash en Redis: {"tokens"=>"1.0066084861755371", "ts"=>"1788121255.3944094"}  TTL=6
 ```
 
-Tres cosas que se ven ahí y hay que saber explicar:
+Cuatro cosas que se ven ahí y hay que saber explicar:
 
+- **El estado son floats, no enteros.** En Redis quedó `tokens=1.0066…`: el
+  relleno es `(ahora - ts) * rate` y `ahora` tiene decimales. El
+  `math.floor(tokens)` del `return` es sólo para la respuesta; el balde guarda la
+  fracción, que es justamente lo que hace que el relleno sea continuo y no a
+  saltos de un token.
 - **La ráfaga inicial es `capacity`, no `rate`.** El balde arranca lleno. Si eso
   te molesta (un cliente nuevo no debería poder mandar 10 de una), arrancalo en
   0 o en `capacity/2`. Es una decisión de producto.
@@ -547,7 +585,7 @@ llama a una API externa, sí.
 |---|---|---|---|---|---|
 | **Fixed window** | ✗ hasta 2× en el borde | 1 entero | permite 2× accidental | 1-2 (`INCR`+`EXPIRE`) | `Rack::Attack`, `rate_limit` de Rails |
 | **Sliding window log** | ✓ exacto | O(N) timestamps | ✗ ninguna | 3-4 (`ZREM`+`ZCARD`+`ZADD`) | límites chicos y críticos (2FA, resets) |
-| **Sliding window counter** | ~ error <0,01% | 2 enteros | ✗ ninguna | 2-3 (script) | Cloudflare |
+| **Sliding window counter** | ~ error <0,003% | 2 enteros | ✗ ninguna | 2-3 (script) | Cloudflare |
 | **Token bucket** | ✓ | 2 valores (hash) | ✓ **controladas**, hasta `capacity` | 1 (script Lua) | Stripe, AWS, GitHub |
 | **Leaky bucket (queue)** | ✓ | cola + 2 valores | ✗ las suaviza | 1 (script) | shaping hacia un proveedor externo |
 
@@ -729,7 +767,8 @@ más grande: **un discriminador `nil` desactiva el throttle sin un solo warning*
 Lo mismo pasa con `password-resets/email`
 (`config/initializers/rack_attack.rb:184-186`), que lee
 `params.dig("password", "email_address")` mientras
-`app/views/passwords/new.html.erb:8` manda `email_address` plano.
+`app/views/passwords/new.html.erb:8-10` también usa `form_with url:` sin modelo y
+manda `email_address` plano.
 
 Cómo se detecta: **nunca declares un throttle nuevo sin verificar que la clave
 aparece en el store.** Un `redis-cli --scan` después de un request de prueba es
@@ -791,6 +830,7 @@ verdad cuando llamás `RedisCacheStore#increment`:
 
 ```ruby
 # activesupport-8.1.3.1/lib/active_support/cache/redis_cache_store.rb:456-481
+# (abreviado: se omite la línea que resuelve el nodo en Redis::Distributed)
 def change_counter(key, amount, options)
   redis.then do |c|
     expires_in = options[:expires_in]
@@ -839,6 +879,7 @@ al incrementar una clave inexistente:
 
 ```ruby
 # rack-attack-6.8.0/lib/rack/attack/cache.rb:76-89
+# (abreviado: se omiten los enforce_store_*! que validan que el store exista)
 def do_count(key, expires_in)
   result = store.increment(key, 1, expires_in: expires_in)
   if result.nil?
@@ -857,17 +898,46 @@ Este repo usa Solid Cache como `Rails.cache` en desarrollo y producción
 (`config/environments/development.rb:32`, `config/environments/production.rb:50`),
 y está bien para cachear reportes. Para contadores de rate limiting **no**:
 
-- Son **1-2 escrituras por request** contra tu base principal (o su base de
+- Es **una escritura por request** contra tu base principal (o su base de
   cache), o sea WAL, vacuum y contención de fila sobre las claves calientes.
 - Tu rate limiter existe para protegerte de un pico de tráfico. Ponerlo sobre la
   base que ese pico está por saturar es exactamente el acoplamiento que querías
   evitar.
-- El `increment` de Solid Cache funciona, pero cada uno es un `UPDATE` con lock
-  de fila. Una IP atacante genera una fila caliente que serializa todo.
+- El `increment` de Solid Cache funciona, pero **no es un `INCR` atómico de una
+  sola operación**: `SolidCache::Store#increment` llama a
+  `SolidCache::Entry.lock_and_write`, que abre una transacción, hace un
+  `SELECT ... FOR UPDATE` sobre la fila de la clave y recién después escribe
+  (`solid_cache-1.0.10/app/models/solid_cache/entry.rb:70-79`). Una IP atacante
+  genera una fila caliente y todos los requests de esa IP se serializan sobre
+  ese lock.
 
 Por eso `Api::V1::BaseController::RATE_LIMIT_STORE`
 (`app/controllers/api/v1/base_controller.rb:46-57`) prefiere Redis y sólo cae a
 `Rails.cache` como último recurso.
+
+**Y acá hay una trampa de configuración que conviene mirar de frente.** Ese Redis
+es *opcional*: la rama buena depende de `ENV["REDIS_URL"]`, y en este repo
+`REDIS_URL` viene comentada en `.env.example:44`. Si no la exportás, esto es lo
+que te queda (verificado con `bin/rails runner` sin `REDIS_URL`):
+
+```text
+Rack::Attack.cache.store                      => ActiveSupport::Cache::MemoryStore
+Api::V1::BaseController::RATE_LIMIT_STORE     => SolidCache::Store
+SessionsController.cache_store                => SolidCache::Store
+```
+
+O sea: la capa 1 queda con contadores **por proceso** (§5.1) y la capa 2 queda
+contando sobre **Postgres**, que es justamente lo que este apartado desaconseja.
+Peor todavía: `SessionsController` y `PasswordsController` declaran su
+`rate_limit` **sin `store:`** (`app/controllers/sessions_controller.rb:5`,
+`app/controllers/passwords_controller.rb:4`), así que usan
+`config.action_controller.cache_store` — Solid Cache — pase lo que pase con
+`REDIS_URL`. El límite de login de la UI cuenta contra tu base de datos.
+
+No es fatal en desarrollo. En producción es una línea de `.env` que, si falta,
+te deja el rate limiting funcionando "más o menos" sin un solo error. Es el
+mismo patrón que el NullStore de §5.4: **el control de seguridad se degrada en
+silencio.**
 
 ### 5.4 El NullStore: el fallo silencioso de seguridad
 
@@ -943,7 +1013,7 @@ y `REMOTE_ADDR`), le saca los proxies de confianza y se queda con el que sobra
 más a la derecha:
 
 ```ruby
-# actionpack-8.1.3.1/lib/action_dispatch/middleware/remote_ip.rb:129-169
+# actionpack-8.1.3.1/lib/action_dispatch/middleware/remote_ip.rb:129-170
 def calculate_ip
   remote_addr   = sanitize_ips(ips_from(@req.remote_addr)).last
   client_ips    = sanitize_ips(ips_from(@req.client_ip)).reverse!
@@ -955,14 +1025,44 @@ def calculate_ip
 end
 ```
 
-La lista de confianza por defecto:
+La lista de confianza por defecto (`RemoteIp::TRUSTED_PROXIES`,
+`remote_ip.rb:40-49`) son ocho CIDR, no ocho direcciones sueltas — el prefijo es
+la mitad del dato:
 
 ```text
-127.0.0.0   ::1   fc00::   10.0.0.0   172.16.0.0   192.168.0.0   169.254.0.0   fe80::
+127.0.0.0/8   ::1        fc00::/7        10.0.0.0/8
+172.16.0.0/12 192.168.0.0/16  169.254.0.0/16  fe80::/10
 ```
 
-Y en este repo, `config.action_dispatch.trusted_proxies` está en **`nil`**
-(verificado con `bin/rails runner`), o sea que se usan sólo esos defaults.
+O sea: loopback (v4 y v6), rangos privados RFC 1918, ULA IPv6 y link-local. **No
+hay una sola IP pública ahí.** Y en este repo,
+`config.action_dispatch.trusted_proxies` está en **`nil`** (verificado con
+`bin/rails runner`), así que se usan sólo esos defaults.
+
+Cuándo importa eso y cuándo no — corrido contra `RemoteIp::GetIp` de este repo:
+
+```text
+REMOTE_ADDR      X-Forwarded-For                    remote_ip resultante
+203.0.113.9      "9.9.9.9, 198.51.100.7"            198.51.100.7   ✓ el cliente real
+203.0.113.9      "198.51.100.7"                     198.51.100.7   ✓ el cliente real
+198.51.100.7     "1.2.3.4"                          1.2.3.4        ✗ spoofeado
+203.0.113.9      "198.51.100.7, 203.0.113.50"       203.0.113.50   ✗ es el proxy
+```
+
+Las dos primeras filas son un ALB con IP pública que **agrega** (no reemplaza) el
+peer real al final de la cadena: como el algoritmo se queda con el que sobra más
+a la derecha, devuelve al cliente correcto **aunque el balanceador no esté en
+`trusted_proxies`**. Incluso si el cliente inventa su propio `X-Forwarded-For`,
+el valor que agrega el ALB queda a la derecha y gana.
+
+Donde muerde de verdad son las otras dos:
+
+- **Fila 3**: alguien llega **directo a Puma** y manda el header. No hay nadie
+  que agregue el peer real, así que el único valor de la cadena es el inventado.
+  Esto no lo arregla `trusted_proxies`: lo arregla el firewall.
+- **Fila 4**: **dos o más saltos con IP pública**. Si el proxy intermedio no está
+  en `trusted_proxies`, el que "sobra más a la derecha" es *ese proxy*, y todo el
+  tráfico que pasa por él comparte un contador.
 
 ### 6.2 El experimento del spoofing
 
@@ -985,30 +1085,58 @@ rack-attack:rack::attack:89405649:logins/ip:5.6.7.8      => 7
 ```
 
 **Tres contadores independientes**, uno por IP inventada. Un atacante que pueda
-llegar directo a tu app —o que atraviese un proxy que no reescribe el header—
-tiene un balde nuevo de 5 intentos por cada valor que se le ocurra. El rate limit
-por IP deja de existir.
+llegar directo a tu app —o que atraviese un proxy que pasa `X-Forwarded-For` tal
+cual, sin agregarle el peer real— tiene un balde nuevo de 5 intentos por cada
+valor que se le ocurra. El rate limit por IP deja de existir.
 
-La defensa NO es "no uses XFF": es que **la cantidad de saltos de confianza
-coincida exactamente con tu topología real**. Si tenés ALB → Rails y el ALB está
-en una IP pública, esa IP tiene que estar en `trusted_proxies` (los defaults sólo
-cubren RFC1918 y loopback):
+La defensa NO es "no uses XFF". Son dos defensas distintas, arreglan cosas
+distintas, y confundirlas es lo que hace que la gente configure
+`trusted_proxies` creyendo que se protege de esto:
+
+**1. Que nadie pueda hablar con Puma sin pasar por el proxy.** Ésta es la que
+arregla el experimento de arriba, y es de red, no de Rails. Mientras el atacante
+llegue directo, el único valor de la cadena `X-Forwarded-For` es el que él
+escribió, y ninguna configuración de `trusted_proxies` lo cambia: él *es* el
+primer salto. Security group / firewall que sólo acepte tráfico del balanceador.
+
+**2. Que la lista de proxies de confianza coincida con tu topología.** Esto es lo
+que arregla la fila 4 de la tabla de §6.1: los saltos intermedios con IP pública
+tienen que estar en la lista, si no `remote_ip` te devuelve el proxy en vez del
+cliente. Con **un solo** salto que agrega el peer real (el caso ALB → Rails) no
+hace falta tocar nada; lo verificamos arriba.
+
+Y acá va la trampa que casi nadie ve la primera vez: **asignar
+`trusted_proxies` no agrega, REEMPLAZA.** Mirá el constructor del middleware
+(`remote_ip.rb:67-74`):
 
 ```ruby
-# config/application.rb — lo que agregarías en producción
-config.action_dispatch.trusted_proxies = [
-  IPAddr.new("10.0.0.0/8"),        # subred donde vive el ALB
-  IPAddr.new("172.31.0.0/16")      # y nada más: cada CIDR de más es un agujero
-]
+@proxies = if custom_proxies.blank?
+  TRUSTED_PROXIES          # ← los ocho defaults
+elsif custom_proxies.respond_to?(:any?)
+  custom_proxies           # ← SÓLO lo tuyo. Los defaults desaparecen.
+else
+  raise(ArgumentError, ...)  # un valor suelto en vez de un enumerable
+end
 ```
 
-Dos reglas duras:
+La propia documentación del método lo dice: *"passing an enumerable will
+**replace** the default set of trusted proxies"*. Si escribís sólo el CIDR de tu
+ALB, `127.0.0.1` deja de ser confiable — y entonces tus health checks locales, tu
+`curl` desde la máquina y cualquier sidecar pasan a contar como clientes. Lo que
+querés casi siempre es esto:
 
-1. **Cada CIDR que agregás es un agujero potencial.** Si confiás en 0.0.0.0/0,
-   `remote_ip` es lo que el cliente diga.
-2. **El firewall tiene que impedir el acceso directo a los app servers.** Si un
-   atacante puede hablar con Puma sin pasar por el balanceador, ninguna
-   configuración de `trusted_proxies` te salva: él es el primer salto.
+```ruby
+# config/application.rb — lo que agregarías si tenés proxies encadenados
+config.action_dispatch.trusted_proxies =
+  ActionDispatch::RemoteIp::TRUSTED_PROXIES + [ IPAddr.new("198.51.100.0/24") ]
+```
+
+Y ojo con el `raise`: pasar **un solo** `IPAddr` en vez de un array levanta
+`ArgumentError` al arrancar. Es de los pocos errores de esta área que sí son
+ruidosos.
+
+Regla dura: **cada CIDR que agregás es un agujero potencial.** Si confiás en
+`0.0.0.0/0`, `remote_ip` pasa a ser literalmente lo que el cliente diga.
 
 ### 6.3 El bug del orden del middleware
 
@@ -1107,7 +1235,12 @@ end
 declaración define qué regla "gana" y qué contadores quedan incompletos. Si
 alertás sobre `logins/email`, vas a ver menos eventos de los que hubo.
 
-`tracked?` en cambio usa `each_value`: **todos** los tracks se evalúan siempre.
+`tracked?` en cambio usa `each_value` (`configuration.rb:99-103`): entre tracks no
+hay short-circuit, se evalúan **todos**. Pero ojo con el "siempre": mirá el
+`else` del snippet de §7.1 — `tracked?` vive ahí, así que una request
+safelisteada, bloqueada o throttleada **no cuenta en ningún track**. Si estás
+calibrando un límite nuevo con `track` mientras otro throttle ya está cortando,
+tus números de calibración están sesgados hacia abajo.
 
 ### 7.3 Fail2Ban y Allow2Ban
 
@@ -1481,20 +1614,33 @@ aceptable pero no lo ideal.
 
 ```ruby
 # Consumidor de la API con backoff exponencial + jitter completo.
+require "net/http"
+
+# La excepción tiene que llevarse el dato del server, no la respuesta entera:
+# `raise MiError, resp` guardaría la respuesta como MENSAJE, y `e.response` no
+# existe en StandardError. Es el error clásico al escribir esto de memoria.
+class TooManyRequests < StandardError
+  attr_reader :retry_after
+
+  def initialize(retry_after)
+    @retry_after = retry_after.to_i   # nil.to_i => 0, así que no hace falta guarda
+    super("429 Too Many Requests")
+  end
+end
+
 def con_reintentos(max: 5)
   intento = 0
   begin
     resp = yield
-    raise TooManyRequests, resp if resp.code.to_i == 429
+    raise TooManyRequests.new(resp["Retry-After"]) if resp.code.to_i == 429
     resp
   rescue TooManyRequests => e
     intento += 1
     raise if intento > max
 
     # 1) Si el server dijo cuánto esperar, HACELE CASO. Es la fuente de verdad.
-    sugerido = e.response["Retry-After"].to_i
-    # 2) Si no, backoff exponencial acotado.
-    base = sugerido.positive? ? sugerido : [2**intento, 60].min
+    # 2) Si no dijo nada (retry_after == 0), backoff exponencial acotado.
+    base = e.retry_after.positive? ? e.retry_after : [ 2**intento, 60 ].min
     # 3) JITTER COMPLETO, no "base + random". Si 500 clientes se bloquean en el
     #    mismo segundo y todos esperan "base + un poquito", vuelven todos juntos
     #    y te generan un segundo pico idéntico al primero (thundering herd).
@@ -1502,6 +1648,20 @@ def con_reintentos(max: 5)
     retry
   end
 end
+
+con_reintentos { Net::HTTP.post_form(URI("http://localhost:3001/session"),
+                                     "email_address" => "a@b.c", "password" => "x") }
+```
+
+Corrido contra el repo con el throttle de login ya agotado:
+
+```text
+  intento 1: 429, Retry-After=3s, duermo 0.12s
+  intento 2: 429, Retry-After=2s, duermo 0.17s
+  intento 3: 429, Retry-After=2s, duermo 0.07s
+  intento 4: 429, Retry-After=2s, duermo 0.33s
+  intento 5: 429, Retry-After=2s, duermo 1.59s
+  final: 422        ← pasó la ventana, el server volvió a atender
 ```
 
 Los tres puntos, en orden de importancia:
@@ -1544,7 +1704,8 @@ de tus clientes hace 5 req/min y uno hace 5.000, el promedio no describe a nadie
 El límite razonable sale del p99 de los clientes legítimos, con margen:
 
 ```sql
--- Con los eventos de rack_attack ya en tu tabla de logs / warehouse
+-- `api_request_logs` NO existe en este repo: es la tabla de logs / warehouse
+-- donde habrías volcado los eventos de rack_attack (§7.5).
 SELECT
   percentile_cont(0.50) WITHIN GROUP (ORDER BY reqs) AS p50,
   percentile_cont(0.95) WITHIN GROUP (ORDER BY reqs) AS p95,
@@ -1562,24 +1723,42 @@ Regla práctica: **límite ≈ p99 × 2**, redondeado a un número que se pueda 
 en voz alta (100, 500, 1000). Que sea "lindo" importa: va en la documentación
 pública y los clientes lo van a hardcodear.
 
-**3. Límites por plan, no un número global.** El límite es parte del producto:
+**3. Límites por plan, no un número global.** El límite es parte del producto. Y
+acá viene la limitación concreta de la API de Rails, que conviene saber **antes**
+de diseñar la feature: **`rate_limit` no acepta un callable en `to:`**. El
+chequeo es `count && count > to` (`rate_limiting.rb:77`), o sea que compara
+contra el valor tal cual; `to:` no se `instance_exec`a como `by:` y `with:`. Si
+le pasás un lambda no explota al declararlo: explota en el **primer request**,
+con `ArgumentError: comparison of Integer with Proc failed` (comprobado).
+
+Las tres salidas reales:
 
 ```ruby
-# Cómo se vería en este repo (el ApiToken ya tiene `user`; el plan iría ahí)
+# a) Un rate_limit por plan, con la condición en `if:` (es un before_action,
+#    así que acepta las opciones de siempre).
 LIMITES = { "free" => 100, "pro" => 1_000, "enterprise" => 10_000 }.freeze
 
-rate_limit to: ->(controller) { LIMITES.fetch(controller.current_api_token.user.plan, 100) },
-           within: 1.hour, name: "por-plan", ...
+LIMITES.each do |plan, tope|
+  rate_limit to: tope, within: 1.hour, name: "plan-#{plan}",
+             by: -> { current_api_token&.id },
+             if: -> { current_api_token&.user&.plan == plan },
+             store: RATE_LIMIT_STORE,
+             with: -> { rate_limited!(60) }
+end
+
+# b) El chequeo a mano en un before_action, usando el mismo store.
+# c) Subirlo a la capa 1: `Rack::Attack` SÍ acepta callables en `limit:` y
+#    `period:` (throttle.rb:61-67), y ahí el tope puede depender del request.
 ```
 
-⚠️ Ojo: `rate_limit` de Rails **no acepta un callable en `to:`** (`count > to`
-compara contra el valor tal cual). Para límites dinámicos tenés dos opciones:
-declarar un `rate_limit` por plan con `only:`/condiciones, o escribir el chequeo
-a mano en un `before_action` usando el store. `Rack::Attack` **sí** acepta
-callables en `limit:` y `period:`
-(`rack-attack-6.8.0/lib/rack/attack/throttle.rb:61-67`), que es una razón
-concreta para poner los límites por plan en la capa 1 si el plan se puede
-derivar del token sin tocar la base.
+(En este repo `User` **no** tiene columna `plan` —el schema tiene `role`, con
+check constraint de `admin/manager/operator/viewer`, `db/schema.rb:330-341`—, así
+que lo de arriba es el diseño, no código que corra hoy.)
+
+La opción (c) es la más barata en runtime, pero sólo sirve si el plan se puede
+derivar del request **sin tocar la base**: si tenés que resolver el token contra
+Postgres para saber el plan, ya estás pagando lo que la capa 1 existía para
+ahorrar.
 
 **4. Comunicalos.** Tres cosas, mínimo:
 - La documentación de la API dice el número, la ventana y el discriminador
@@ -1667,30 +1846,51 @@ Resultado real de la suite:
 
 ```bash
 $ bundle exec rspec spec/requests/api/v1/rate_limiting_spec.rb
+Randomized with seed 35078
+
 API v1 · Rate limiting
   capa 2: ActionController#rate_limit (por token, por controller)
-    corta EXACTAMENTE al superar el límite de reportes (20/min)
-    devuelve Retry-After y un cuerpo accionable
-    los distintos rate_limit NO comparten contador (name: distinto)
     el contador es POR TOKEN: otro token arranca de cero
+    corta EXACTAMENTE al superar el límite de reportes (20/min)
+    los distintos rate_limit NO comparten contador (name: distinto)
+    devuelve Retry-After y un cuerpo accionable
   capa 1: Rack::Attack (borde, antes de Rails)
-    bloquea rutas de escaneo de vulnerabilidades
+    limita los intentos de login por IP
     el cuerpo del 429 es JSON parseable, no una página de error
     NUNCA limita el health check (si lo limitás, el balanceador te saca de rotación)
-    limita los intentos de login por IP
+    bloquea rutas de escaneo de vulnerabilidades
 
-Finished in 1.71 seconds (files took 1.89 seconds to load)
+Finished in 1.72 seconds (files took 1.82 seconds to load)
 8 examples, 0 failures
 ```
 
-**Lo que NO se puede testear bien con RSpec:** el borde de ventana (necesitás
-controlar el reloj — `travel_to` de ActiveSupport sirve para la capa 2, pero
-`Rack::Attack::Cache` usa `Time.now.to_i` directo y también lo respeta), la
-concurrencia real entre workers, y el comportamiento con Redis caído. Para eso:
-`redis-cli DEBUG SLEEP 5` en un entorno de staging, y `--scan` para inspeccionar
-claves como hicimos en todo este documento. **Un `redis-cli --scan` después de un
-request de prueba es el smoke test más barato y más efectivo que existe para
-rate limiting.**
+(El orden de los ejemplos cambia entre corridas porque la suite está en modo
+aleatorio. Que los ejemplos pasen **en cualquier orden** es justamente lo que
+prueba que el `before` de limpieza y el `around` de `Rack::Attack.enabled`
+hacen su trabajo.)
+
+**El borde de ventana SÍ se puede testear**, y conviene, porque es el defecto que
+más sorprende. `Rack::Attack::Cache#key_and_expiry` usa `Time.now.to_i` directo
+y `travel_to` de ActiveSupport lo estubea, así que las dos capas responden al
+reloj falso. Verificado contra el throttle real del repo (`req/ip`, 300/5min):
+
+```ruby
+travel_to(Time.utc(2026, 1, 1, 12, 0, 59)) do
+  300.times { throttle.matched_by?(request) }
+  throttle.matched_by?(request)   # => true   (la 301 corta)
+end
+
+travel_to(Time.utc(2026, 1, 1, 12, 5, 0)) do
+  throttle.matched_by?(request)   # => false  (ventana nueva, contador en 0)
+end
+```
+
+**Lo que NO se puede testear bien con RSpec:** la concurrencia real entre workers
+(cada uno es un proceso; el request spec corre en uno solo) y el comportamiento
+con Redis caído. Para eso: `redis-cli DEBUG SLEEP 5` en un entorno de staging, y
+`--scan` para inspeccionar claves como hicimos en todo este documento. **Un
+`redis-cli --scan` después de un request de prueba es el smoke test más barato y
+más efectivo que existe para rate limiting.**
 
 ---
 
@@ -1698,9 +1898,11 @@ rate limiting.**
 
 **1. MemoryStore en producción.** Síntoma: el límite de 100 no corta hasta ~380
 requests, y no siempre en el mismo número. Causa: cada worker de Puma tiene su
-contador. Arreglo: store compartido (Redis). Detección: `Rack::Attack.cache.store`
-en la consola de producción tiene que decir `RedisCacheStoreProxy`, no
-`MemoryStore`.
+contador. En este repo la causa concreta sería **`REDIS_URL` sin exportar**: el
+inicializador cae a `MemoryStore` (y la capa 2 cae a Solid Cache, §5.3). Arreglo:
+store compartido (Redis). Detección: `Rack::Attack.cache.store` en la consola de
+producción tiene que decir `RedisCacheStoreProxy` —Rack::Attack envuelve el store
+en un proxy— y no `MemoryStore`.
 
 **2. `Rack::Attack` insertado antes de `ActionDispatch::RemoteIp`.** Síntoma: a
 partir de cierto volumen, *todos* los usuarios reciben 429 al mismo tiempo,
@@ -1710,12 +1912,17 @@ el tráfico comparte un contador. Arreglo: `insert_after ActionDispatch::RemoteI
 (`config/initializers/rack_attack.rb:45-51`). Detección: `bin/rails middleware` y
 mirar el orden; o `redis-cli --scan` y ver una sola IP en todas las claves.
 
-**3. `trusted_proxies` sin configurar con el balanceador en IP pública.**
-Síntoma: `request.remote_ip` devuelve la IP del ALB, o (peor) el rate limit se
-evade mandando `X-Forwarded-For` a mano. Demostrado en §6.2: tres XFF inventados,
-tres contadores. Arreglo: `config.action_dispatch.trusted_proxies` con los CIDR
-**exactos** de tus proxies, y firewall que impida llegar directo a Puma. En este
-repo está en `nil` (sólo los defaults RFC1918).
+**3. `X-Forwarded-For` confiable de más.** Dos variantes distintas, y se
+confunden. (a) Alguien llega **directo a Puma** y manda el header a mano: el rate
+limit por IP se evade entero. Demostrado en §6.2: tres XFF inventados, tres
+contadores. Arreglo: firewall — `trusted_proxies` no ayuda acá. (b) Tenés
+**proxies encadenados con IP pública** que no están en `trusted_proxies`:
+`remote_ip` devuelve la IP del proxy y todo el tráfico que pasa por él comparte
+contador (§6.1, fila 4). Arreglo: `config.action_dispatch.trusted_proxies` con
+los CIDR **exactos** — y acordate de que asignarlo **reemplaza** los defaults, no
+los agrega (`remote_ip.rb:67-74`), así que sumale `TRUSTED_PROXIES` si querés
+conservar loopback y RFC 1918. En este repo está en `nil` (sólo los defaults:
+RFC 1918 + loopback + ULA + link-local).
 
 **4. Dos `rate_limit` sin `name:` en la misma jerarquía de controllers.**
 Síntoma: el límite corta a la mitad del número documentado (20 corta en 11).
@@ -1810,8 +2017,8 @@ un segundo sin violarlo?"**
 > 8 intentos de login contra un límite de 5/20s no dispararon **ningún** 429
 > porque cayeron a caballo del borde. Se arregla con **sliding window counter**
 > —interpolás la ventana anterior por el tiempo que le queda de peso— que cuesta
-> dos enteros por cliente y tiene menos de 0,01% de error. Es lo que usa
-> Cloudflare.
+> dos enteros por cliente y, según los números que publicó Cloudflare, menos de
+> 0,003% de requests mal clasificadas.
 > **Trade-off:** el sliding window counter asume tráfico uniforme dentro de la
 > ventana anterior, lo cual es falso para ráfagas; el error es acotado y siempre
 > conservador.
@@ -1887,13 +2094,18 @@ un segundo sin violarlo?"**
 > este repo mandando tres valores inventados desde `curl` y obtuve **tres
 > contadores independientes** en Redis: el límite por IP deja de existir. La
 > defensa no es ignorar el header —lo necesitás, si no todos tus usuarios son el
-> balanceador— sino que la **lista de proxies de confianza coincida exactamente
-> con tu topología**. `ActionDispatch::RemoteIp` toma la cadena de XFF, filtra
-> los proxies confiables y se queda con el que sobra más a la derecha; si tu ALB
-> está en una IP pública, esa IP tiene que estar en `trusted_proxies`, porque los
-> defaults de Rails sólo cubren RFC1918 y loopback. Y el firewall tiene que
-> impedir que alguien llegue directo a Puma: si puede, él es el primer salto y
-> ninguna configuración te salva.
+> balanceador— sino entender qué arregla cada cosa.
+> `ActionDispatch::RemoteIp` toma la cadena de XFF, filtra los proxies confiables
+> y se queda con el que sobra más a la derecha. Con **un solo** salto que
+> *agrega* el peer real al final —un ALB típico— eso ya te devuelve al cliente
+> correcto aunque el balanceador no esté en `trusted_proxies`, porque el valor
+> que él agrega queda a la derecha del que inventó el cliente; lo verifiqué
+> armando las cuatro combinaciones. `trusted_proxies` importa cuando tenés
+> **varios saltos con IP pública**: ahí, si el intermedio no está en la lista,
+> `remote_ip` devuelve el proxy y todos comparten contador. Y lo del spoofing
+> puro lo arregla el firewall, no Rails: si alguien puede hablar con Puma sin
+> pasar por el balanceador, él es el primer salto y no hay configuración que te
+> salve.
 > **Trade-off:** cada CIDR que agregás a `trusted_proxies` es un agujero
 > potencial. La lista tiene que ser lo más chica posible y revisarse cuando
 > cambia la infraestructura.

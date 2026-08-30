@@ -264,13 +264,14 @@ app/views/warehouses/show.html.erb:25
 ```
 
 `pagy_nav` devuelve un `String` común (no un `SafeBuffer`) con el HTML de la
-navegación, así que con `<%=` verías las etiquetas escapadas en pantalla.
-`<%==` es acá una declaración de "confío en esta gema".
+navegación —lo confirmé en consola: `html.class # => String`,
+`html.html_safe? # => false`—, así que con `<%=` verías las etiquetas escapadas
+en pantalla. `<%==` es acá una declaración de "confío en esta gema".
 
 ¿Está bien confiar? Fui a mirar. `pagy_nav` arma las URLs con
-`Pagy::UrlHelpers#pagy_url_for` (`pagy-9.4.0/lib/pagy/url_helpers.rb`), que
-termina en `Rack::Utils.build_nested_query(query_params)`. Ese método
-percent-encodea los valores:
+`Pagy::UrlHelpers#pagy_url_for` (`pagy-9.4.0/lib/pagy/url_helpers.rb:9`), que
+termina en `Rack::Utils.build_nested_query(query_params)` (misma clase, línea
+15). Ese método percent-encodea los valores:
 
 ```ruby
 Rack::Utils.build_nested_query({"q" => %q{"><script>alert(1)</script>}, "page" => 2})
@@ -350,12 +351,25 @@ Rails.application.configure do
   # y de un solo uso.
   config.content_security_policy_nonce_generator = ->(_request) { SecureRandom.base64(16) }
   config.content_security_policy_nonce_directives = %w[script-src style-src]
+
+  # Sin esta línea, `javascript_tag` / `javascript_include_tag` / `stylesheet_link_tag`
+  # NO ponen el nonce solos: el default de `content_security_policy_nonce_auto`
+  # es `false` (railties `configuration.rb:76`), y el initializer que genera
+  # Rails lo deja comentado.
+  config.content_security_policy_nonce_auto = true
 end
 ```
 
-Con eso, `javascript_importmap_tags` y `javascript_tag` agregan el `nonce=` solo,
-y cualquier `<script>` inyectado por XSS **no se ejecuta** porque no lo lleva.
-CSP es la defensa en profundidad: no evita el XSS, evita que sirva de algo.
+Con eso, cualquier `<script>` inyectado por XSS **no se ejecuta** porque no lleva
+el nonce. CSP es la defensa en profundidad: no evita el XSS, evita que sirva de algo.
+
+Una precisión sobre quién pone el nonce, porque acá se pierde mucha gente:
+`javascript_importmap_tags` lo pasa **siempre** de forma explícita
+(`importmap-rails`, `importmap_tags_helper.rb:15` y `:21`, con
+`nonce: request&.content_security_policy_nonce`), así que funciona sin tocar
+nada más. `javascript_tag` y compañía dependen de
+`content_security_policy_nonce_auto`, que viene en `false`. Si activás CSP y te
+olvidás de esa línea, tus scripts inline se caen y los del importmap no.
 
 Arrancá siempre con `config.content_security_policy_report_only = true`,
 mirá el reporte una semana y recién ahí lo hacés bloqueante. Activar CSP a
@@ -403,7 +417,7 @@ Este repo aplica exactamente eso:
   incluye `RequestForgeryProtection`, ni cookies, ni flash, ni vistas. No es que
   "lo desactivamos": es un stack distinto, más chico, con menos superficie.
   El razonamiento está documentado en
-  `app/controllers/concerns/api/token_authentication.rb:14-19`.
+  `app/controllers/concerns/api/token_authentication.rb:11-16`.
 
 **El anti-patrón que ves en producción:** alguien pone `skip_forgery_protection`
 en un controller **con sesión de cookie** porque "el fetch de JavaScript da 422".
@@ -558,9 +572,14 @@ if user = User.authenticate_by(params.permit(:email_address, :password))
 end
 ```
 
-En `spec/`, `ActiveModel::SecurePassword.min_cost = true` (lo pone
-`rails_helper`) baja el cost a `BCrypt::Engine::MIN_COST` (4). Sin eso, una
-suite con 200 `create(:user)` se va cuatro minutos sólo hasheando.
+En test, `ActiveModel::SecurePassword.min_cost` vale `true` y el cost baja a
+`BCrypt::Engine::MIN_COST` (4). **Eso no lo configura este repo ni el
+`rails_helper`**: lo hace el railtie de ActiveModel, que ejecuta
+`ActiveModel::SecurePassword.min_cost = Rails.env.test?`
+(`activemodel-8.1.3.1/lib/active_model/railtie.rb:18`). Lo verifiqué en las dos
+puntas: `grep -r min_cost spec/` no devuelve nada, y `RAILS_ENV=test bin/rails
+runner` imprime `true` igual. Sin ese ajuste, una suite con 200 `create(:user)`
+se iría varios minutos sólo hasheando.
 
 **Dónde se rompe la analogía con Java:** Spring Security usa
 `BCryptPasswordEncoder` con **strength 10 por defecto** y tiene
@@ -596,14 +615,19 @@ El atacante no necesita adivinar la contraseña: mide el tiempo de respuesta y
 (saber que `ceo@competencia.com` tiene cuenta) y es el paso 1 de un credential
 stuffing dirigido.
 
-Lo medí en este repo. Diez iteraciones de cada caso, promedio por llamada:
+Lo medí en este repo con `bin/rails runner`: diez iteraciones de cada caso tras
+warmup, promedio por llamada, y la corrida repetida cuatro veces para descartar
+ruido.
 
 | Camino | Usuario existe | Usuario NO existe | Ratio |
 |---|---|---|---|
-| `find_by` + `authenticate` (ingenuo) | **235.2 ms** | **3.4 ms** | **69×** |
-| `User.authenticate_by` | **234.0 ms** | **233.1 ms** | **1.004×** |
+| `find_by` + `authenticate` (ingenuo) | **233 ms** | **0,7 ms** | **~330×** |
+| `User.authenticate_by` | **236 ms** | **235 ms** | **~1,01×** |
 
-69× es medible **desde internet**, con jitter de red y todo. 0.4% no.
+Los milisegundos absolutos dependen del hardware (son bcrypt cost 12 en esta
+máquina); lo que importa es el orden de magnitud, y ése es estable: dos órdenes
+de magnitud de diferencia en el camino ingenuo, 1% en el correcto. 330× es
+medible **desde internet**, con jitter de red y todo. 1% no.
 
 Por eso `app/controllers/sessions_controller.rb:17` usa:
 
@@ -648,8 +672,9 @@ Dos consecuencias que hay que decir en voz alta:
    idéntico ("Email o contraseña incorrectos", nunca "ese email no existe"), y
    el rate limiting tiene que estar (§5.3).
 2. **`/passwords#create` sí filtra por otro canal.**
-   `app/controllers/passwords_controller.rb:11` hace
-   `User.find_by(email_address:)` y sólo manda mail si existe. La *respuesta*
+   `app/controllers/passwords_controller.rb:10` hace
+   `User.find_by(email_address: params[:email_address])` y sólo manda mail si
+   existe (`deliver_later` en la línea 11). La *respuesta*
    es idéntica en los dos casos ("instrucciones enviadas si existe una cuenta"),
    que es lo correcto. Pero el timing no está igualado: la rama que existe hace
    un `deliver_later` (encolar un job). En una app con cola en Postgres, eso son
@@ -696,8 +721,11 @@ documenta en `app/controllers/api/v1/base_controller.rb` y en `docs/08`:
    comparación `count && count > to` nunca se cumple, y el límite queda
    desactivado en silencio. Es un fallo **de seguridad** silencioso.
 2. **Dos `rate_limit` sin `name:` en la misma jerarquía de controllers comparten
-   la clave del contador** (`["rate-limit", scope, name, by].compact.join(":")`),
-   así que cada request lo incrementa dos veces y un límite de 20 corta en 10.
+   la clave del contador** (`["rate-limit", scope, name, by].compact.join(":")`,
+   con `scope` = `controller_path` por defecto —
+   `actionpack-8.1.3.1/lib/action_controller/metal/rate_limiting.rb:75`), así
+   que cada request lo incrementa dos veces y el límite efectivo queda a la
+   mitad: uno de 20 corta en la request 11.
 
 Lo que **falta** acá y hay que saber pedirlo: **bloqueo de cuenta**
 (N fallos → cuenta bloqueada M minutos, con desbloqueo por mail) y
@@ -709,7 +737,8 @@ frena a un atacante paciente con 3 intentos por hora.
 Este repo **no tiene** validación de largo mínimo ni de complejidad. `User`
 valida presencia y formato del email, largo del nombre, y nada del password
 más allá del máximo de 72 bytes que impone `has_secure_password`. Los seeds
-usan `password123` (`db/seeds.rb:20`).
+usan `ENV.fetch("SEED_ADMIN_PASSWORD", "password123")` (`db/seeds.rb:20`), o sea
+que `password123` es el default cuando no inyectás la variable.
 
 Para dev está bien. Para producción, lo que dice NIST SP 800-63B hoy:
 
@@ -1054,6 +1083,17 @@ Dos cosas finas acá:
    Como `ReportsController` y `StockOperationsController` heredan de esta base y
    no tienen `index`, un `only: %i[index]` acá rompería todas sus acciones.
 
+   El detalle que hay que agregar: ese `raise` está detrás de
+   `config.action_controller.raise_on_missing_callback_actions`
+   (`actionpack-8.1.3.1/lib/abstract_controller/callbacks.rb:47-64`), que Rails
+   activa **sólo en development y test** — acá,
+   `config/environments/development.rb:79` y `config/environments/test.rb:64`.
+   En producción no levanta nada: el callback simplemente no matchea y la acción
+   corre **sin verificar autorización**. O sea que el bug se vería en dev como
+   una excepción ruidosa y en producción como un endpoint sin control de acceso.
+   Peor combinación imposible, y es la razón por la que el callback único que
+   decide adentro es la forma correcta.
+
 Cuando una acción legítimamente no necesita autorizar, se declara explícito:
 `skip_authorization` / `skip_policy_scope`
 (`app/controllers/api/v1/reports_controller.rb`,
@@ -1177,12 +1217,12 @@ $ git ls-files | grep -E "master.key|credentials"
 config/credentials.yml.enc          # ✅ sólo el encriptado
 ```
 
-`.gitignore` línea 33: `/config/*.key`. ✅
+`.gitignore` línea 34: `/config/*.key`. ✅
 
 En producción la clave llega por `RAILS_MASTER_KEY` (así lo documenta el
 `Dockerfile:6`), nunca por archivo en la imagen.
 
-`Dockerfile:54` tiene el detalle que a todos les falta:
+`Dockerfile:55` tiene el detalle que a todos les falta:
 
 ```dockerfile
 RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
@@ -1212,7 +1252,7 @@ Este repo usa **las dos**, y el criterio es correcto:
   `SEED_ADMIN_PASSWORD` (ver `.env.example`). Cambia por entorno y lo inyecta el
   orquestador.
 
-`.env` está en `.gitignore` (líneas 11 y 40-42) y sólo se commitea
+`.env` está en `.gitignore` (líneas 11 y 38-40) y sólo se commitea
 `.env.example` con valores falsos. `dotenv-rails` está en el grupo
 `:development, :test` del `Gemfile`, así que **en producción no se carga**: las
 variables tienen que venir del entorno real. Eso es 12-factor bien hecho.
@@ -1316,9 +1356,12 @@ Las dos que faltan son la misma causa: `config.force_ssl` comentado en
 y esto se pregunta:
 
 1. Redirige 301 todo `http://` a `https://`.
-2. Manda `Strict-Transport-Security` (`config.ssl_options[:hsts]`, que en este
-   repo ya está configurado con `{subdomains: true}` — lo confirmé en runtime —
-   pero no se aplica porque el middleware no está).
+2. Manda `Strict-Transport-Security`. En runtime, `config.ssl_options` acá vale
+   `{hsts: {subdomains: true}}` — pero **eso no lo configura este repo**: la
+   línea `config.ssl_options` de `production.rb:34` está comentada, y el valor
+   sale del default que pone `load_defaults` desde 5.0
+   (`railties-8.1.3.1/lib/rails/application/configuration.rb:124`). No se aplica
+   igual, porque el middleware no está montado.
 3. Marca **todas** las cookies como `secure`.
 
 Y `config.assume_ssl = true` es su complemento en arquitecturas con proxy: le
@@ -1336,7 +1379,7 @@ contra **DNS rebinding** y **Host header injection**. Sin allow-list de hosts, u
 atacante manda `Host: evil.com`, y cualquier URL absoluta que genere la app
 (un link en un mail de reset de contraseña, por ejemplo) apunta a su dominio.
 En este repo `config.action_mailer.default_url_options = { host: "example.com" }`
-(línea 60) está hardcodeado, así que el mail no es vulnerable — pero
+(línea 61) está hardcodeado, así que el mail no es vulnerable — pero
 `config.hosts` sigue siendo lo correcto.
 
 ---
@@ -1385,9 +1428,9 @@ Que `github-actions` esté ahí es importante: una action de terceros corre con
 los secretos del repo. Fijar `uses: foo/bar@v3` te ata a un tag **mutable** — el
 autor puede reapuntarlo. Para actions de terceros, fijá el **SHA completo**.
 
-Este repo usa `actions/checkout@v6`, `ruby/setup-ruby@v1` y
-`actions/cache@v4` — todas de organizaciones de primer nivel, riesgo aceptable,
-pero es exactamente el trade-off que hay que poder nombrar.
+Este repo usa `actions/checkout@v6`, `ruby/setup-ruby@v1`, `actions/cache@v4` y
+`actions/upload-artifact@v4` — todas de organizaciones de primer nivel, riesgo
+aceptable, pero es exactamente el trade-off que hay que poder nombrar.
 
 También hay `bin/importmap audit` (job `scan_js`), que audita los paquetes JS
 del importmap contra la base de npm. Importmaps evita npm en runtime, pero no te
@@ -1406,8 +1449,13 @@ Riesgos reales del ecosistema Ruby, en orden de probabilidad:
    `pg` es una de ellas. Compilar en el build, no en el runtime.
 
 Mitigaciones concretas:
-- `bundle lock --add-checksums` (Bundler 2.5+) fija el SHA-256 de cada gema en
-  el lock. Es el `--require-hashes` de pip.
+- **Checksums en el lockfile**, que es el `--require-hashes` de pip: fijan el
+  SHA-256 de cada gema, así que una versión republicada con otro contenido no
+  instala. En Bundler 2.5 esto se pedía con `bundle lock --add-checksums`; ese
+  flag **ya no existe** en el Bundler de este repo (4.0.9 — lo verifiqué en las
+  opciones de `bundle lock`), porque ahora se escriben solos. Y de hecho ya
+  están: `Gemfile.lock` tiene una sección `CHECKSUMS` (línea 530) con 180
+  entradas `sha256`. Lo único que hay que hacer es no borrarla en un merge.
 - Un mirror interno (Artifactory, Gemfury) con aprobación explícita.
 - `bundle install --frozen` en CI: falla si `Gemfile` y `Gemfile.lock` divergen.
 
@@ -1430,8 +1478,8 @@ $ bundle exec brakeman -q --no-pager
 Application Path: /home/user/stock
 Rails Version: 8.1.3.1
 Brakeman Version: 8.0.6
-Duration: 1.294695277 seconds
-Checks Run: 89 checks (BasicAuth, ..., YAMLParsing)
+Duration: 1.246347296 seconds
+Checks Run: BasicAuth, ..., YAMLParsing   (79 checks)
 
 Controllers: 20   Models: 22   Templates: 34   Errors: 0
 Security Warnings: 0
@@ -1439,7 +1487,8 @@ Security Warnings: 0
 No warnings found
 ```
 
-**Cero advertencias** con el set de checks por defecto. No hay
+**Cero advertencias** con el set de checks por defecto, que en Brakeman 8.0.6
+son **79** (los conté de la propia salida; con `-A` suben a 86). No hay
 `config/brakeman.ignore` (lo verifiqué: el archivo no existe), así que no es
 que estén silenciadas — genuinamente no hay hallazgos.
 
@@ -1500,12 +1549,21 @@ Y `application_cable/connection.rb:11` hereda el mismo problema para WebSockets.
 | Mass assignment sin `permit` | race conditions / TOCTOU |
 | Open redirect (`redirect_to params[:x]`) | secretos hardcodeados fuera de patrones conocidos |
 | `eval`, `send`, `constantize` con input | vulnerabilidades **en las gemas** (eso es bundler-audit) |
-| Config faltante (`force_ssl`, sesión, CSRF) | lógica de negocio (descuentos negativos, stock que se duplica) |
+| Config faltante: sesión (`SessionSettings`), CSRF (`ForgerySetting`) por defecto; `force_ssl` **sólo con `-A`** | lógica de negocio (descuentos negativos, stock que se duplica) |
 | Deserialización insegura (YAML, Marshal) | todo lo que dependa de datos en runtime |
 
-**Cero warnings de Brakeman ≠ app segura.** El bug de expiración de sesión (§6.4)
-y la CSP ausente (§2.4) son ejemplos concretos en este mismo repo: uno lo marcó
-por accidente, el otro no lo marca ningún check.
+**Cero warnings de Brakeman ≠ app segura.** Tres ejemplos concretos en este
+mismo repo, y ninguno salió del análisis estático:
+
+- el bug de expiración de sesión (§6.4) — Brakeman lo tocó de casualidad, con un
+  `UnscopedFind` que apuntaba a otra cosa;
+- la CSP ausente (§2.4) — no hay check para eso;
+- el techo de paginación que no existe (§12.3) — `Pagy::DEFAULT[:max_limit]` es
+  una opción inventada, así que `?limit=1000000` llega crudo al `LIMIT`.
+
+Los tres son bugs de **configuración semántica**: la línea está escrita, se lee
+bien, y no hace nada. Un analizador de AST no tiene forma de saber que
+`max_limit` no es una clave que la gema lea.
 
 **Comparación con Java:** SpotBugs analiza bytecode y es agnóstico del framework;
 Brakeman analiza el AST de Ruby **con conocimiento de Rails**, así que entiende
@@ -1543,9 +1601,11 @@ defensa real es escribir el regex bien y acotar el input **antes** de matchear:
 validates :email_address, format: { with: URI::MailTo::EMAIL_REGEXP }
 ```
 
-`URI::MailTo::EMAIL_REGEXP` está anclado (`\A...\z`) y no tiene cuantificación
-anidada. Lo probé con `"a"*60 + "!"` (el input que mata a un regex de email mal
-escrito): **0.004 ms**, sin backtracking.
+`URI::MailTo::EMAIL_REGEXP` está anclado (`\A...\z` — lo confirmé mirando
+`.source`) y no tiene cuantificación anidada. Lo probé con `"a"*60 + "!"` (el
+input que mata a un regex de email mal escrito), mil iteraciones: **0,0001 ms
+por match**. No hay backtracking: el ancla lo corta en el primer carácter que no
+encaja.
 
 `app/queries/products/search.rb:63` usa `@term.match?(/\A[A-Za-z0-9._-]{2,32}\z/)`:
 anclado, clase de caracteres simple, cuantificador **acotado**. Imposible de
@@ -1568,14 +1628,30 @@ RE2/J. En este punto puntual Rails 8 está mejor parado.
 ### 12.2 Payloads gigantes
 
 Nada en Rails limita el tamaño del body por sí solo. El límite tiene que estar
-**afuera**: `client_max_body_size` en nginx, o `--max-request-body` en Thruster
-(que este repo usa, según el `Gemfile`).
+**afuera**: `client_max_body_size` en nginx, o la variable de entorno
+`MAX_REQUEST_BODY` en Thruster (que este repo usa: `gem "thruster"`,
+`Gemfile:235`, versión 0.1.26). Ojo con el default de Thruster: es **`0`, o sea
+sin límite** (`thruster-0.1.26/README.md:85`). No alcanza con tener Thruster
+adelante; hay que setear la variable.
 
-Adentro, lo que se puede limitar es el JSON anidado: `params` con 10.000 niveles
-de anidamiento revienta el parser. Rails tiene
-`ActionDispatch::Request::Utils.perform_deep_munge` y los límites de
-`Rack::QueryParser` (`param_depth_limit`, 100 por defecto), que ya te cubren
-el caso patológico de query string.
+Adentro, lo que sí está acotado por defecto es el parseo de la query string.
+`Rack::QueryParser` (Rack 3.2.7) trae tres techos, y los verifiqué en runtime:
+
+| Límite | Valor acá | Qué corta |
+|---|---|---|
+| `param_depth_limit` | **32** | `?a[b][c][d]...` anidado; más profundo levanta `ParamsTooDeepError` |
+| `params_limit` | **4096** | cantidad de parámetros en una misma query string |
+| `bytesize_limit` | **4 MiB** | tamaño total de la query string |
+
+(**Es 32, no 100.** El 100 circula en medio internet y sale de versiones viejas
+de Rack; en la que corre acá el default está escrito literalmente en
+`rack-3.2.7/lib/rack/utils.rb:35`: `QueryParser.make_default(32)`. Vale la pena
+verificarlo en tu versión antes de citarlo en una entrevista.)
+
+Aparte, `ActionDispatch::Request::Utils.perform_deep_munge` — activo acá — es
+otra cosa distinta: no limita profundidad, elimina los `nil` de arrays y hashes
+de `params` para que `?a[]=` no llegue como `[nil]` a un `where` y termine en un
+`IS NULL` que no esperabas. Es una mitigación de inyección, no de DoS.
 
 Y la validación de largo en los modelos es la última línea:
 `app/models/product.rb:51` (`name`, máx 200), `app/models/user.rb`
@@ -1584,25 +1660,80 @@ Y la validación de largo en los modelos es la última línea:
 `Product#description` **no** tiene validación de largo: es un hueco real,
 menor pero real.
 
-### 12.3 Paginación sin límite
+### 12.3 Paginación sin límite — y el techo que este repo cree tener y no tiene
 
 El clásico: `?limit=1000000` y el worker se muere cargando objetos.
 
 `config/initializers/pagy.rb`:
 
 ```ruby
+require "pagy/extras/overflow"
+require "pagy/extras/headers"
+
 Pagy::DEFAULT[:limit]     = 25
-Pagy::DEFAULT[:max_limit] = 100      # ← el que importa
+Pagy::DEFAULT[:max_limit] = 100      # ← "el que importa"… salvo que no hace nada
 Pagy::DEFAULT[:overflow]  = :last_page
 ```
 
-`max_limit` es el techo duro: `?limit=100000` se recorta a 100 y no hay forma de
-pasarlo desde la query string. Sin esa línea, `paginate(scope)` en
-`app/controllers/api/v1/base_controller.rb` (`pagy(scope, limit: params[:limit])`)
-sería un DoS de una línea.
+⚠️ **`max_limit` no es una opción de Pagy 9.4.0.** Es fácil de creer —el nombre
+suena bien, el comentario del initializer suena convincente— pero fui a mirar la
+gema y `grep -rn max_limit pagy-9.4.0/lib/` **no devuelve una sola línea**. La
+opción real se llama `limit_max` (al revés), y sólo existe si cargás el extra
+`limit`:
 
-`overflow: :last_page` cubre `?page=99999`: en vez de un 500 o una página vacía
-rara, devuelve la última.
+```ruby
+# pagy-9.4.0/lib/pagy/extras/limit.rb
+DEFAULT[:limit_param] = :limit
+DEFAULT[:limit_max]   = 100
+DEFAULT[:limit_extra] = true
+```
+
+Este initializer requiere `overflow` y `headers`, **no `limit`**. O sea que
+`Pagy::DEFAULT[:max_limit] = 100` escribe una clave que nadie lee, y no hay techo.
+Lo comprobé en runtime:
+
+```ruby
+Pagy::DEFAULT[:max_limit]   # => 100    ← la clave inventada, inerte
+Pagy::DEFAULT[:limit_max]   # => nil    ← la clave real, sin setear
+Pagy::Backend.ancestors.grep(/Limit/)   # => []   ← el extra no está cargado
+
+pagy, records = pagy(Product.all, limit: "100000")
+pagy.limit        # => 100000
+records.to_sql    # => SELECT "products".* FROM "products" LIMIT 100000 OFFSET 0
+```
+
+El parámetro del usuario llega crudo al `LIMIT` del SQL. Y `paginate(scope)`
+—`pagy(scope, limit: params[:limit])`, `app/controllers/api/v1/base_controller.rb:135`—
+es exactamente el camino de seis endpoints de la API v1 (productos, stock items,
+purchase orders, transfers, reservas, reportes). **`GET /api/v1/products?limit=1000000`
+es hoy un DoS de una línea.** La UI web no está expuesta: todos sus `pagy` pasan
+un literal (25 o 30).
+
+El arreglo son dos líneas, y conviene poner las dos porque cubren capas distintas:
+
+```ruby
+# config/initializers/pagy.rb
+require "pagy/extras/limit"      # ← sin esto, limit_max no existe
+Pagy::DEFAULT[:limit_max] = 100
+```
+
+```ruby
+# app/controllers/api/v1/base_controller.rb — no depender del initializer
+def paginate(scope)
+  pagy(scope, limit: params[:limit].presence&.to_i&.clamp(1, 100) || 25)
+end
+```
+
+**La moraleja es más general que el bug:** una opción de configuración mal
+escrita no falla, no avisa y no aparece en ningún test. Un `Hash` acepta
+cualquier clave. Es el mismo modo de falla que el `NullStore` del rate limiter
+(§5.3) y que la CSP en `nil` (§2.4): configuración que *parece* estar puesta.
+Cuando un control de seguridad depende de una opción, el test no es "¿está la
+línea en el initializer?" sino "¿pasa lo que tiene que pasar cuando pido el
+abuso?".
+
+`overflow: :last_page` sí funciona (el extra `overflow` está requerido) y cubre
+`?page=99999`: en vez de un 500 o una página vacía rara, devuelve la última.
 
 El ledger tiene su propio techo, `app/queries/stock_movements/ledger.rb`:
 
@@ -1614,7 +1745,12 @@ MAX_LIMIT     = 200
 ```
 
 `clamp(1, 200)` — no confía en el default de la gema y no depende de que alguien
-no toque el initializer. **Defensa en profundidad en 12 caracteres.**
+no toque el initializer. **Defensa en profundidad en 12 caracteres**, y hoy es lo
+único que salva a un endpoint de la API: `Api::V1::StockMovementsController#index`
+le pasa `params[:limit] || 50` al query object, o sea el mismo parámetro crudo
+que revienta a los otros seis, y el `clamp` lo corta en 200. Ese contraste es el
+argumento entero a favor de validar en el borde de cada objeto en vez de confiar
+en un initializer global.
 
 ### 12.4 Queries sin timeout
 
@@ -1646,7 +1782,7 @@ Spring aplica el timeout **del lado del cliente** (JDBC `Statement.setQueryTimeo
 que manda un cancel. Acá `statement_timeout` es del lado del **servidor**
 Postgres, que es más confiable: si el proceso Ruby muere, la query se mata igual.
 
-### 12.5 Detalle observado: Rack::Attack está montado dos veces
+### 12.5 Rack::Attack está montado dos veces (y por qué NO duplica los contadores)
 
 Corriendo `bin/rails middleware` en este repo, `Rack::Attack` aparece **dos
 veces** en el stack:
@@ -1665,17 +1801,53 @@ La gema `rack-attack` inserta su middleware automáticamente vía railtie, y
 (con un motivo excelente, documentado ahí: sin eso `req.ip` sería la IP del
 balanceador y todos los usuarios compartirían un contador).
 
-Consecuencia práctica: cada request pasa por los throttles **dos veces**, o sea
-que cada contador se incrementa el doble y los límites efectivos son la mitad de
-los declarados. No es un agujero de seguridad (queda **más** restrictivo, no
-menos), pero es exactamente el tipo de cosa que hace que un cliente legítimo
-reciba 429 "sin explicación". El arreglo es desactivar el auto-insert:
+**La conclusión intuitiva es que cada contador se incrementa dos veces y los
+límites efectivos quedan a la mitad. Es falsa, y vale la pena saber por qué.**
+
+`Rack::Attack#call` empieza con un guard de idempotencia
+(`rack-attack-6.8.0/lib/rack/attack.rb:105`):
+
+```ruby
+def call(env)
+  return @app.call(env) if !self.class.enabled || env["rack.attack.called"]
+
+  env["rack.attack.called"] = true
+  # ...
+```
+
+La primera instancia marca el `env`; la segunda lo ve marcado y pasa de largo
+sin evaluar un solo safelist, blocklist o throttle. Es un no-op.
+
+Lo medí contra un server real (puerto 3002, con `REDIS_URL` apuntando a una DB
+de Redis vacía, leyendo los contadores con `redis-cli`):
+
+```text
+$ 3 GET /session/new  con X-Forwarded-For: 203.0.113.55
+rack-attack:rack::attack:<ventana>:req/ip:203.0.113.55        = 3      ← no 6
+
+$ 4 POST /session     con X-Forwarded-For: 198.51.100.7
+rack-attack:rack::attack:<ventana>:req/ip:198.51.100.7        = 4      ← no 8
+rack-attack:rack::attack:<ventana>:logins/ip:198.51.100.7     = 4
+rack-attack:rack::attack:<ventana>:logins/email:nadie@x.com   = 4
+```
+
+Los límites son los que dicen ser. Lo único que cuesta el montaje doble es una
+llamada de método por request y un lector desconcertado mirando
+`bin/rails middleware`. Aun así conviene limpiarlo, porque la duplicación es
+ruido y porque el día que alguien reordene el stack la intención tiene que estar
+escrita:
 
 ```ruby
 # config/application.rb
 config.middleware.delete Rack::Attack
 config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
 ```
+
+**La lección que sí vale para la entrevista:** un middleware que se puede
+insertar dos veces necesita ser idempotente, y rack-attack lo es a propósito.
+Si escribís uno propio que incrementa contadores, cobra o escribe en la base,
+poné el mismo guard — porque el auto-insert de un railtie más un
+`insert_after` tuyo es una combinación normalísima.
 
 ---
 
@@ -1692,7 +1864,7 @@ todos van a helpers de ruta (`root_path`, `products_path`, `stock_item_path(@x)`
 o a un modelo (`redirect_to @warehouse`).
 
 El único que toma algo "externo" es
-`app/controllers/concerns/authentication.rb:33-38`:
+`app/controllers/concerns/authentication.rb:32-39`:
 
 ```ruby
 def request_authentication
@@ -1724,18 +1896,33 @@ rescue URI::InvalidURIError
 end
 ```
 
-Rails 7+ también trae `redirect_to url, allow_other_host: false`, que es el
-default de `config.action_controller.raise_on_open_redirects = true` (activo con
-`load_defaults` ≥ 7.0, o sea acá). Eso ya te levanta
-`ActionController::Redirecting::UnsafeRedirectError` si intentás redirigir a otro
-host desde un valor no literal. Es una red de seguridad del framework, no un
-reemplazo de validar.
+Rails también trae la red de seguridad del framework: `redirect_to` a otro host
+desde un valor no literal levanta
+`ActionController::Redirecting::UnsafeRedirectError` salvo que pases
+`allow_other_host: true`.
+
+**Ojo con el nombre de la opción, porque cambió.** La que se cita en todos lados
+—`config.action_controller.raise_on_open_redirects`— está **deprecada en Rails
+8.1**: sigue existiendo pero vale `false`, y el railtie de Action Controller
+avisa si la seteás (`actionpack-8.1.3.1/lib/action_controller/railtie.rb:114-121`).
+La que rige hoy es `action_on_open_redirect`, que `load_defaults 7.0` pone en
+`:raise` (`railties-8.1.3.1/lib/rails/application/configuration.rb:266`).
+Verificado en runtime de este repo:
+
+```ruby
+ActionController::Base.raise_on_open_redirects   # => false   (deprecada)
+ActionController::Base.action_on_open_redirect   # => :raise  (la que aplica)
+```
+
+O sea: la protección está activa acá, pero si auditás una app buscando
+`raise_on_open_redirects` y lo ves en `false`, no concluyas que está apagada.
+Y en cualquier caso es una red, no un reemplazo de validar.
 
 ### 13.2 SSRF — el webhook del outbox
 
 **Este es el vector de mayor riesgo de la app**, y hay que verlo bien.
 
-`app/services/outbox/publisher.rb:20` y `:54`:
+`app/services/outbox/publisher.rb:20` y `:52`:
 
 ```ruby
 "webhook" => -> { WebhookAdapter.new(url: ENV.fetch("OUTBOX_WEBHOOK_URL")) }
@@ -1820,7 +2007,7 @@ validación en Ruby:
 Lo que este repo **sí** hace bien:
 - `open_timeout: 5, read_timeout: 5` — sin eso, un endpoint que nunca responde
   te deja un worker de jobs colgado indefinidamente. Es DoS por webhook lento.
-- Firma HMAC con timestamp (`publisher.rb:84`) contra replay. Eso protege al
+- Firma HMAC con timestamp (`publisher.rb:61-69`; el `sign` está en `:84`) contra replay. Eso protege al
   **receptor**, no a nosotros, pero es la mitad del contrato que casi nadie
   implementa.
 
@@ -1913,7 +2100,7 @@ datos de la N. Eso es **fuga de datos entre usuarios**, y es un bug de seguridad
 real, no de higiene. El comentario de `app/models/current.rb` lo dice explícito.
 
 Y el `request_id` es lo único que la API devuelve al cliente cuando algo
-explota (`app/controllers/concerns/api/error_handling.rb:113-122`):
+explota (`app/controllers/concerns/api/error_handling.rb:113-123`):
 
 ```ruby
 Rails.logger.error(event: "api.internal_error", request_id: request.request_id,
@@ -2015,7 +2202,7 @@ Está anotado en `app/services/outbox/publisher.rb:83`.
 de red necesita decenas de miles de muestras. Es un ataque real pero de baja
 probabilidad comparado con XSS o IDOR. La respuesta madura es: "usá
 `secure_compare` porque es gratis, pero si tenés que priorizar, la enumeración
-de usuarios por timing (§5.2, **69× de diferencia**) es mucho más explotable
+de usuarios por timing (§5.2, **~330× de diferencia**) es mucho más explotable
 que un `==` sobre un token".
 
 ---
@@ -2067,8 +2254,15 @@ las requests autenticadas). Un `.html` subido es peor.
 
 - Servir desde un **dominio separado** (`uploads.tuapp.com`), sin cookies.
 - `Content-Disposition: attachment` para todo lo que no sea imagen conocida.
-  Active Storage lo hace por defecto en `rails_blob_path` salvo que le pidas
-  `disposition: :inline`.
+  **Active Storage ya lo impone, y no al revés:** `Blob#forced_disposition_for_serving`
+  devuelve `:attachment` para cualquier tipo que no esté en
+  `ActiveStorage.content_types_allowed_inline` (hoy: webp, avif, png, gif, jpeg,
+  tiff, bmp, psd y pdf — `activestorage-8.1.3.1/lib/active_storage/engine.rb:65`).
+  Pedirle `disposition: :inline` a un `.svg` o a un `.html` **no** te lo sirve
+  inline: el `forced_disposition` pisa lo que pediste. Y además esos tipos están
+  en `content_types_to_serve_as_binary` (`engine.rb:53`), así que se sirven con
+  content-type binario. Es una de las mejores defensas que Active Storage te da
+  gratis, y conviene saber que no es opcional.
 - `X-Content-Type-Options: nosniff` ya está (§9).
 - Y **regenerar** las imágenes con `image_processing` (variantes): eso elimina
   metadata EXIF (que incluye geolocalización) y de paso destruye cualquier
@@ -2094,21 +2288,21 @@ en un **job**, no en el request.
 | 1 | Una sesión de hace 3 meses sigue funcionando | `find_session_by_cookie` usa `Session.find_by`, no `Session.active.find_by` (`app/controllers/concerns/authentication.rb:29`). Verificado: una sesión con `expires_at` de hace 10 días sigue autenticando | `Session.active.find_by(id:)`. Y no dependas del job de las 4 AM para cerrar sesiones |
 | 2 | Brakeman: "The application does not force use of HTTPS" | `config.force_ssl` comentado (`config/environments/production.rb:31`). Sin él: sin HSTS, sin redirect, y las cookies **sin `secure`** | `config.assume_ssl = true` + `config.force_ssl = true`. Sin `assume_ssl`, con proxy delante, entrás en loop de redirect |
 | 3 | Cualquier XSS ejecuta scripts sin restricción | `config/initializers/content_security_policy.rb` entero comentado. `Rails.application.config.content_security_policy # => nil`, pese a que el layout emite `csp_meta_tag` | Definir la política, nonce con `SecureRandom.base64(16)` (**no** `session.id`), arrancar con `report_only` |
-| 4 | El scanner enumera qué emails están registrados | Login con `find_by` + `authenticate`: **235 ms vs 3.4 ms** medidos acá. 69× de diferencia, visible desde internet | `User.authenticate_by` (ya usado en `sessions_controller.rb:17`). Mensaje de error idéntico en los dos casos |
+| 4 | El scanner enumera qué emails están registrados | Login con `find_by` + `authenticate`: **233 ms vs 0,7 ms** medidos acá. Dos órdenes de magnitud, visible desde internet | `User.authenticate_by` (ya usado en `sessions_controller.rb:17`). Mensaje de error idéntico en los dos casos |
 | 5 | Un operador se autopromueve a admin | `permit(..., :role)` en un `user_params` que no discrimina quién pide | Allow-list condicional + `UserPolicy#change_role?` (`app/policies/user_policy.rb:12`) |
 | 6 | Un endpoint nuevo quedó sin control de acceso 8 meses | Te olvidaste de `authorize`. Nadie avisa | `after_action :verify_authorized`. Está en el `BaseController` de la API (`base_controller.rb:117`) pero **falta en `ApplicationController`** |
 | 7 | El listado muestra registros de otro tenant | Autorizaste el `show` pero el `index` usa `Model.all` | `policy_scope` + `verify_policy_scoped`. El `Scope` base devuelve `scope.none`: falla cerrado |
-| 8 | 429 espurios: los límites cortan a la mitad | `Rack::Attack` montado **dos veces** en el stack (railtie + `insert_after` de `config/application.rb`) — verificado con `bin/rails middleware`. Cada request incrementa los contadores dos veces | `config.middleware.delete Rack::Attack` antes del `insert_after` |
-| 9 | El rate limit no limita nada y no hay error | `rate_limit` sobre un `NullStore`: `increment` devuelve `nil` y la comparación nunca se cumple | Elegir el store explícito y avisar si no sirve (`base_controller.rb:46-59`) |
+| 8 | `bin/rails middleware` muestra `Rack::Attack` **dos veces** y alguien concluye que los límites cortan a la mitad | El railtie de la gema lo auto-inserta y `config/application.rb:52` lo vuelve a insertar tras `RemoteIp`. **No duplica nada**: `Rack::Attack#call` corta con `env["rack.attack.called"]` (`rack-attack-6.8.0/lib/rack/attack.rb:105`) — medido contra un server real: 4 requests → contador 4 | Igual conviene limpiarlo: `config.middleware.delete Rack::Attack` antes del `insert_after`. Y si escribís un middleware propio que cuenta o cobra, ponele el mismo guard |
+| 9 | El rate limit no limita nada y no hay error | `rate_limit` sobre un `NullStore`: `increment` devuelve `nil` y la comparación nunca se cumple | Elegir el store explícito y avisar si no sirve (`base_controller.rb:46-57`) |
 | 10 | Dos `rate_limit` comparten contador; el de 20 corta en 11 | Sin `name:`, la clave es `["rate-limit", controller_path, nil, by]` para los dos | `name:` distinto en cada declaración |
 | 11 | El worker se cuelga y no vuelve | Query sin `statement_timeout`, o webhook sin `read_timeout` | `statement_timeout`/`lock_timeout` en `database.yml:52`; `open_timeout`/`read_timeout` en `Net::HTTP.start` |
-| 12 | `?limit=100000` tumba el proceso | Paginación sin techo | `Pagy::DEFAULT[:max_limit] = 100`, y `clamp` propio en el query object (`ledger.rb`) |
+| 12 | `?limit=100000` tumba el proceso | Paginación sin techo. **Pasa hoy en la API de este repo**: `max_limit` no es una opción de Pagy 9.4.0 (la real es `limit_max`, y necesita `require "pagy/extras/limit"`), así que `paginate` manda el parámetro crudo al `LIMIT` | Cargar el extra `limit` y setear `limit_max`, **más** un `clamp` propio en el controller — como ya hace `ledger.rb` |
 | 13 | Un `%` en el buscador dispara un Seq Scan de la tabla entera | `LIKE` sin `sanitize_sql_like` | `sanitize_sql_like` en todo input que llegue a `LIKE`/`ILIKE` (`supplier.rb:23`, `products/search.rb:59`) |
 | 14 | El log tiene `password_digest` y emails de usuarios | `user.inspect` en un log o en el error report | `config.active_record.attributes_for_inspect = [:id]` + `filter_parameters` |
 | 15 | El cliente ve `PG::UndefinedColumn: column products.foo does not exist` | Se devuelve `e.message` crudo en el 500 | Mensaje genérico + `request_id` (`error_handling.rb:113`) |
 | 16 | Reset de contraseña: el atacante sigue adentro | No se revocan las sesiones al cambiar la clave | `@user.sessions.destroy_all` (ya está en `passwords_controller.rb:22`) |
 | 17 | El webhook configurable lee las credenciales IAM del host | SSRF: URL de destino que controla el usuario | Allow-list de esquema + resolver DNS y validar la **IP**, conectar a esa IP, no seguir redirects, egress proxy, IMDSv2 |
-| 18 | La suite tarda 6 minutos hasheando passwords | `bcrypt` con cost 12 en tests | `ActiveModel::SecurePassword.min_cost = true` en `rails_helper` |
+| 18 | La suite tarda minutos hasheando passwords | `bcrypt` con cost 12 en tests. Rails ya baja el cost solo (`min_cost = Rails.env.test?`, `active_model/railtie.rb:18`), así que si te pasa es porque alguien lo pisó, o porque estás generando digests fuera de `RAILS_ENV=test` | No lo re-configures a mano: verificá `ActiveModel::SecurePassword.min_cost` en el entorno que corre la suite |
 
 ---
 
@@ -2135,15 +2329,15 @@ mucho más fácil de romper. Prefiero rígido.
 
 Si el login hace `find_by(email)` y después `authenticate`, un email inexistente
 responde en milisegundos y uno existente paga el costo de bcrypt. Medí las dos
-formas en la app en la que estuve trabajando: **235 ms vs 3.4 ms**, 69× de
-diferencia. Eso es medible desde internet con jitter de red, y te deja enumerar
+formas en la app en la que estuve trabajando: **233 ms vs 0,7 ms**, dos
+órdenes de magnitud de diferencia. Eso es medible desde internet con jitter de red, y te deja enumerar
 la base de usuarios sin adivinar una sola contraseña — que es el paso 1 de un
 credential stuffing dirigido.
 
 `User.authenticate_by` (Rails 7.1+) lo arregla: cuando no encuentra el usuario,
 hace `new(passwords)`, que dispara el setter de `has_secure_password` y **quema
 deliberadamente el mismo tiempo de bcrypt**. Medido con `authenticate_by`:
-234.0 vs 233.1 ms, 0.4% de diferencia.
+236 vs 235 ms, ~1% de diferencia.
 
 *Trade-off:* no cierra el canal por completo (iguala bcrypt, no la query) y le
 regala CPU al atacante en cada intento fallido. Por eso hace falta además rate
@@ -2209,8 +2403,11 @@ y sigue resolviendo. Un analizador estático no es un oráculo; es un generador 
 preguntas.
 
 Lo que Brakeman **no** encuentra: lógica de autorización rota, IDOR real en un
-modelo multi-tenant, race conditions, y bugs de negocio. Y no vio la CSP
-ausente porque no hay un check para eso. Cero warnings no es "app segura".
+modelo multi-tenant, race conditions, y bugs de negocio. Tampoco vio la CSP
+ausente (no hay check) ni que `Pagy::DEFAULT[:max_limit]` sea una opción que la
+gema no lee, con lo cual la API no tiene techo de paginación. Los dos son
+"configuración que parece puesta", y ningún análisis estático los ve. Cero
+warnings no es "app segura".
 Va con bundler-audit (que acá dio **0 vulnerabilidades** contra 1237 avisos de
 la Ruby Advisory DB) y Dependabot, que en este repo también cubre
 `github-actions` — que es el ecosistema que todos se olvidan y que corre con

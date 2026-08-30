@@ -35,7 +35,7 @@ Ruby 3.3.6, Rails 8.1.3.1).
 | Transacción + traducción de errores | `app/services/application_service.rb:68` | `transactional` |
 | Abortar sin `ActiveRecord::Rollback` | `app/services/application_service.rb:46` | `BusinessRuleViolation` |
 | Efectos después del commit | `app/services/outbox/recorder.rb:47` | `after_all_transactions_commit` |
-| Encolar después del commit | `config/initializers/sidekiq.rb:74` | `enqueue_after_transaction_commit` |
+| Encolar después del commit (⚠️ no-op en Rails 8.1) | `config/initializers/sidekiq.rb:74` | `enqueue_after_transaction_commit`, ver §7.1 |
 | Lotes para evitar transacciones largas | `app/services/stock/expire_reservations.rb:37` | `in_batches` |
 | Timeouts de sesión | `config/database.yml` | `lock_timeout`, `statement_timeout` |
 | Tests de concurrencia reales | `spec/integration/concurrency_spec.rb` | 8 ejemplos con threads |
@@ -115,7 +115,7 @@ Corrí esto contra `stock_development` sobre una tabla scratch, con dos threads 
 conexiones distintas. **REPEATABLE READ**, dos `UPDATE` sobre la misma fila:
 
 ```text
-[[2, "ActiveRecord::SerializationFailure",
+[[1, "ActiveRecord::SerializationFailure",
      "PG::TRSerializationFailure: ERROR:  could not serialize access due to concurrent update"]]
 ```
 
@@ -151,7 +151,7 @@ mucha concurrencia la tasa de abortos crece.
 | Default | READ COMMITTED | **REPEATABLE READ** | el del driver/DB (en Postgres, READ COMMITTED) |
 | Dirty read | imposible siempre | posible en READ UNCOMMITTED | depende de la DB |
 | Phantoms en RR | prevenidos (snapshot) | prevenidos con **gap locks** (bloquean rangos) | depende de la DB |
-| Lectura bloqueante en RR | ve el snapshot | **ve la última versión commiteada** (half-consistent read) | idem DB |
+| Lectura bloqueante en RR | ve el snapshot | **ve la última versión commiteada** (*current read*) | idem DB |
 | Lost update | lo resolvés vos | lo resolvés vos | `@Version` o `LockModeType` |
 
 Los dos errores clásicos de un javero que viene de MySQL:
@@ -251,8 +251,8 @@ costumbre que te salve: `lock_version` sólo actúa si la tabla tiene la columna
 8 threads reales, 3 unidades cada uno, stock inicial 10, con y sin `FOR UPDATE`:
 
 ```text
-SIN lock   -> qty final=4   errores={}
-CON lock   -> qty final=1   errores={}
+SIN lock   -> qty final=4   errores=[]
+CON lock   -> qty final=1   errores=[]
 ```
 
 Sin lock quedaron 4: se aplicaron sólo 2 de los 8 descuentos (6 *lost updates*).
@@ -363,6 +363,19 @@ rescue ActiveRecord::LockWaitTimeout, ActiveRecord::StatementInvalid => e
 end
 ```
 
+El error que rescata, provocado a mano contra `stock_development`:
+
+```text
+ActiveRecord::LockWaitTimeout
+PG::LockNotAvailable: ERROR:  could not obtain lock on row in relation "stock_items"
+```
+
+Aclaración honesta: `lock_or_fail!` vive en `ApplicationRecord` pero **hoy ningún
+service del repo lo llama**. El camino crítico prefiere esperar hasta el
+`lock_timeout` antes que devolver un 409 por contención normal; el helper está
+para el caso "prefiero fallar ya" (un endpoint interactivo, un job que puede
+reintentar más tarde).
+
 ```ruby
 # SKIP LOCKED: saltea las tomadas. app/models/outbox_event.rb:27
 def self.claim_batch(limit: 500)
@@ -422,10 +435,10 @@ con `ActiveSupport::Notifications`:
 
 ```sql
 UPDATE "stock_items"
-   SET "bin_location" = 'TEST-30', "updated_at" = '2026-08-30 17:45:49.768749',
-       "lock_version" = 20
+   SET "bin_location" = 'TEST-30', "updated_at" = '2026-08-30 20:08:45.560872',
+       "lock_version" = 32
  WHERE "stock_items"."id" = 1
-   AND "stock_items"."lock_version" = 19
+   AND "stock_items"."lock_version" = 31
 ```
 
 Si el `UPDATE` afecta 0 filas, Rails levanta `ActiveRecord::StaleObjectError`.
@@ -525,11 +538,11 @@ tenés el objeto cargado, y no podés escribir el asiento del ledger con el
 usa `FOR UPDATE` y esto queda como herramienta para el caso "descontá si podés".
 
 El mismo patrón, en su versión más útil, es el contador correlativo
-(`app/models/sequence_counter.rb`):
+(`app/models/sequence_counter.rb:17`):
 
 ```sql
 INSERT INTO sequence_counters (key, value, created_at, updated_at)
-VALUES ($1, 1, NOW(), NOW())
+VALUES (?, 1, NOW(), NOW())
 ON CONFLICT (key) DO UPDATE
   SET value = sequence_counters.value + 1, updated_at = NOW()
 RETURNING value
@@ -540,19 +553,27 @@ revierte el número (a diferencia de `nextval`, que deja huecos). El test
 `spec/integration/concurrency_spec.rb` verifica con 10 threads que salen
 exactamente `1..10`, sin repetidos ni huecos.
 
+Y la trampa que casi arruina esto, porque no es de concurrencia de base sino de
+Rails: ese `INSERT ... RETURNING` se ejecuta con `select_value`, así que para el
+**query cache** de Active Record es un `SELECT`. Dos llamadas con la misma clave
+en la misma request devolvían el mismo número sin tocar la base. Por eso el
+método va envuelto en `connection.uncached { ... }` + `clear_query_cache`
+(`app/models/sequence_counter.rb:47`). El detalle completo está en
+`docs/10-errores-comunes.md` §6.
+
 ### 3.4 Cuándo usar cada una
 
 | | Pesimista (`FOR UPDATE`) | Optimista (`lock_version`) | UPDATE condicional |
 |---|---|---|---|
 | Costo si NO hay conflicto | un lock de fila (barato pero real) | cero | cero |
 | Costo si HAY conflicto | esperás | perdés el trabajo, reintentás | `false`, decidís vos |
-| Round-trips | 2 (SELECT + UPDATE) | 1 | 1 |
-| Riesgo de deadlock | ✅ sí, si tomás varios en distinto orden | ❌ no | ❌ no |
+| Round-trips de la escritura | 2 (`SELECT FOR UPDATE` + `UPDATE`) | 2, o 1 si el cliente ya te mandó la versión | 1 |
+| Riesgo de deadlock | ✅ sí, si tomás varios en distinto orden | ⚠️ sólo si escribís varias filas en distinto orden dentro de una tx | ❌ no (una fila, una sentencia) |
 | Riesgo de starvation | posible con mucha contención | reintentos infinitos si hay mucho conflicto | no |
 | Lógica compleja entre leer y escribir | ✅ | ✅ | ❌ |
 | Varias filas en una operación | ✅ | ⚠️ una por una | ❌ |
 | El usuario puede reintentar | irrelevante | ✅ requisito | ⚠️ |
-| Se usa en este repo para | stock, reservas, transferencias, OCs | edición de catálogo vía API/UI | decremento simple; contadores |
+| Se usa en este repo para | stock, reservas, transferencias, OCs | edición de catálogo vía API/UI | el contador correlativo (`SequenceCounter`); `atomically_decrement` está implementado y testeado, pero ningún service lo usa hoy |
 
 Regla de bolsillo, tal como está escrita en `app/models/stock_item.rb:99`:
 
@@ -659,7 +680,10 @@ Cómo se lee, campo por campo:
   del `ctid`. Te dice qué fila, aunque no su clave primaria.
 - **`HINT: See server log`**: el detalle jugoso (las **queries** exactas de cada
   proceso) va al log del servidor, no al cliente. Si vas a depurar deadlocks en
-  producción, necesitás acceso a ese log, o subir `log_min_error_statement`.
+  producción, necesitás acceso a ese log: `log_min_error_statement` ya viene en
+  `error` y por lo tanto la sentencia culpable se registra sola. Lo que sí
+  conviene prender es `log_lock_waits` (viene en `off`, verificado en esta
+  instancia), que loguea las esperas largas **antes** de que haya ciclo.
 
 En el log del servidor, además, aparece qué transacción fue elegida como víctima.
 Postgres siempre mata a una y deja seguir a la otra: **el deadlock nunca cuelga
@@ -905,7 +929,11 @@ comentario del archivo:
 ```ruby
 class BusinessRuleViolation < StandardError
   attr_reader :result
-  def initialize(result) = (@result = result; super(result.error.message))
+
+  def initialize(result)
+    @result = result
+    super(result.error.message)
+  end
 end
 ```
 
@@ -960,10 +988,16 @@ fail!(move_out.error.code, move_out.error.message, **move_out.error.details) if 
 - **`transaction(joinable: false)`** hace que los `transaction` anidados que
   vengan después se conviertan en savepoints reales en vez de unirse. Es lo que
   usan las transactional fixtures de los tests.
-- **`after_commit` no corre si estás dentro de una transacción de test.** Los
-  callbacks se disparan al commit de la transacción externa, que en tests nunca
-  llega. De ahí `test_helper`/`use_transactional_tests = false` para los specs de
-  concurrencia.
+- **El mito de `after_commit` en los tests.** Vas a leer por todos lados que
+  `after_commit` no corre bajo transactional fixtures. Era cierto **hasta Rails
+  4** (de ahí la gema `test_after_commit`). Desde Rails 5 la transacción que
+  envuelve el ejemplo se abre con `joinable: false`, así que lo que escribís
+  adentro abre su propia transacción real y los callbacks **sí** se disparan.
+  Verificado en este repo: un `after_commit` en un modelo dentro de un spec con
+  `use_transactional_fixtures = true` corre, y `ActiveRecord.after_all_transactions_commit`
+  también. Lo que las transactional fixtures sí rompen es **otro hilo con otra
+  conexión** (sección 11): eso no se arregla con callbacks, se arregla apagando
+  las fixtures transaccionales.
 - **`isolation:` no se puede pedir al unirse** (verificado, sección 1.6).
 
 ---
@@ -1012,13 +1046,38 @@ Si esto fuera un `after_commit` de modelo dentro de una transacción anidada,
 encolaría antes de que la externa termine. El SETNX del cache, además,
 *debouncea*: 500 eventos en un lote encolan **un** job, no 500.
 
-**`config.active_job.enqueue_after_transaction_commit = :always`**
-(`config/initializers/sidekiq.rb:74`). El interruptor global: **ningún**
-`perform_later` sale hasta que commitee. Debería estar prendido siempre.
+**`enqueue_after_transaction_commit`**, y acá hay una trampa de versión que este
+repo se comió entera. En Rails 7.2 esto era un interruptor global —
+`config.active_job.enqueue_after_transaction_commit = :always` — y así está
+escrito en `config/initializers/sidekiq.rb:74`. **Rails 8.1 removió esa config
+global** y también los valores `:always` / `:never` / `:default`: hoy es un
+atributo **por clase de job**. El railtie de Active Job incluso lo excluye a
+propósito cuando vuelca `config.active_job` sobre `ActiveJob::Base` ("This config
+can't be applied globally"), así que esa línea no falla, no avisa y **no hace
+nada**:
+
+```ruby
+Rails.application.config.active_job.enqueue_after_transaction_commit  # => :always
+ActiveJob::Base.enqueue_after_transaction_commit                      # => false  ⚠️
+```
+
+Verificado corriéndolo: un `perform_later` adentro de una transacción escribe la
+fila de la cola **al instante** y sobrevive al `ROLLBACK`. La forma correcta hoy
+es el atributo de clase:
+
+```ruby
+class ApplicationJob < ActiveJob::Base
+  self.enqueue_after_transaction_commit = true   # o por job puntual
+end
+```
+
+Lo que salva al repo de que esto sea grave es que el evento de dominio **no
+depende de acá**: el outbox usa `after_all_transactions_commit` y escribe su fila
+dentro de la misma transacción.
 
 ### 7.2 Por qué eso todavía no es un outbox
 
-Con `enqueue_after_transaction_commit`, la secuencia es:
+Aun con `enqueue_after_transaction_commit` bien puesto, la secuencia es:
 
 ```text
 COMMIT (Postgres)  →  [ventana]  →  enqueue (Redis)
@@ -1066,7 +1125,8 @@ Una transacción abierta 10 minutos en Postgres te cuesta tres cosas:
    la que una base Postgres "se pone lenta sin motivo".
 3. **Si falla al final, perdés todo el trabajo.**
 
-Se ve así (`xact_start` es lo que mira autovacuum):
+Se ve así (`xact_start` es lo que mirás vos; a quien le frena la mano al
+vacuum es al `backend_xmin` de esa conexión):
 
 ```sql
 SELECT pid, now() - xact_start AS duracion, state, left(query, 60)
@@ -1251,7 +1311,13 @@ de los advisory locks de sesión y de los prepared statements).
 
 ```ruby
 class Current < ActiveSupport::CurrentAttributes
-  attribute :session, :api_token, :request_id, :user_agent, :ip_address
+  attribute :session
+  attribute :api_token
+  attribute :request_id
+  attribute :user_agent
+  attribute :ip_address
+
+  # El usuario puede venir de una sesión web o de un token de API.
   def user = session&.user || api_token&.user
 end
 ```
@@ -1363,16 +1429,23 @@ bundle exec rspec spec/integration/concurrency_spec.rb
 
 ```text
 Concurrencia sobre el stock
-  optimistic locking / el segundo escritor recibe StaleObjectError
-  creación concurrente del stock_item / no crea filas duplicadas
-  contador correlativo sin huecos / 10 threads generan 10 referencias distintas
-  reservas concurrentes / no se puede reservar dos veces la misma unidad
-  prevención de deadlocks en transferencias / dos transferencias cruzadas NO se traban
-  LOST UPDATE / el ledger sigue cerrando exactamente después de la tormenta
-  LOST UPDATE / NUNCA deja el stock en negativo y sólo prosperan los que caben
-  idempotencia bajo concurrencia / la misma clave desde 5 threads aplica UNA sola vez
+  prevención de deadlocks en transferencias
+    dos transferencias cruzadas con los mismos productos NO se traban
+  optimistic locking
+    el segundo escritor recibe StaleObjectError
+  contador correlativo sin huecos
+    10 threads generan 10 referencias distintas y consecutivas
+  creación concurrente del stock_item
+    no crea filas duplicadas para el mismo par producto/depósito
+  LOST UPDATE: 8 egresos simultáneos sobre 10 unidades
+    NUNCA deja el stock en negativo y sólo prosperan los que caben
+    el ledger sigue cerrando exactamente después de la tormenta
+  idempotencia bajo concurrencia
+    la misma clave desde 5 threads aplica UNA sola vez
+  reservas concurrentes
+    no se puede reservar dos veces la misma unidad
 
-Finished in 2.1 seconds
+Finished in 2.34 seconds (files took 1.77 seconds to load)
 8 examples, 0 failures
 ```
 
@@ -1425,11 +1498,15 @@ Causa: `WEB_CONCURRENCY × RAILS_MAX_THREADS × 4 bases × N máquinas` superó
 Arreglo: hacer la cuenta antes de escalar; PgBouncer en transaction pooling; y no
 olvidar que `cache`, `queue` y `cable` abren sus propios pools.
 
-**5. Un `after_commit` que "no corre" en los tests pero sí en producción.**
-Síntoma: el test verde no verifica nada.
-Causa: transactional fixtures — la transacción del test nunca commitea.
-Arreglo: `use_transactional_tests = false` para ese spec (como
-`spec/support/concurrency.rb`), o testear el efecto directamente.
+**5. Un test de concurrencia que pasa en verde sin ejercitar un solo lock.**
+Síntoma: el spec con threads nunca falla — ni siquiera si le sacás el `.lock` al
+service.
+Causa: transactional fixtures. La transacción del ejemplo no commitea, los
+threads toman otra conexión, encuentran la base vacía y no hay carrera.
+Arreglo: `use_transactional_tests = false` para ese spec y limpieza con
+`TRUNCATE` (`spec/support/concurrency.rb`). Ojo con el mito inverso: `after_commit`
+**sí** corre bajo transactional fixtures desde Rails 5 (la transacción del test
+es `joinable: false`).
 
 **6. Un `raise ActiveRecord::Rollback` que no revierte nada.**
 Síntoma: datos parciales commiteados después de una regla de negocio que falló,
@@ -1471,6 +1548,16 @@ Síntoma: rarísimo, no reproducible, aparece bajo carga.
 Causa: un `Thread.current[:algo]` a mano en un pool de threads reusados.
 Arreglo: `ActiveSupport::CurrentAttributes` (`app/models/current.rb`), que Rails
 resetea solo al final de cada request y de cada job.
+
+**12. Un job que corre para una transacción que hizo rollback.**
+Síntoma: el worker procesa una orden o un movimiento que en la base no existe
+(`RecordNotFound` intermitente), o manda un mail por algo que se revirtió.
+Causa: `perform_later` adentro de la transacción, con el enqueue inmediato. En
+este repo la línea de `config/initializers/sidekiq.rb:74` **no lo evita**: Rails
+8.1 removió esa config global y `ActiveJob::Base.enqueue_after_transaction_commit`
+sigue en `false` (§7.1, verificado).
+Arreglo: `self.enqueue_after_transaction_commit = true` en `ApplicationJob` (o
+en el job puntual), y outbox para lo que directamente no se puede perder.
 
 ---
 
@@ -1542,8 +1629,9 @@ resetea solo al final de cada request y de cada job.
 > READ COMMITTED —`READ UNCOMMITTED` se comporta como READ COMMITTED—, y su
 > REPEATABLE READ es snapshot isolation, o sea que también elimina phantoms, a
 > diferencia del mínimo que exige el estándar. Y no es lo mismo que el
-> REPEATABLE READ de MySQL, que usa gap locks y tiene lecturas
-> "half-consistent".
+> REPEATABLE READ de MySQL, que usa gap locks y donde una lectura bloqueante
+> (`SELECT ... FOR UPDATE`) no lee el snapshot sino la última versión
+> commiteada.
 >
 > Lo que REPEATABLE READ **no** te da es write skew: dos transacciones que leen
 > lo mismo y escriben filas distintas rompen una invariante que cruza filas. Eso
@@ -1574,9 +1662,13 @@ resetea solo al final de cada request y de cada job.
 > Porque con un adapter que no es transaccional —Sidekiq sobre Redis— el job se
 > encola al instante: si la transacción hace rollback, el worker procesa una
 > orden que no existe; y al revés, el worker puede levantarlo antes del COMMIT y
-> tirar `RecordNotFound`. Tengo
-> `config.active_job.enqueue_after_transaction_commit = :always`, que lo resuelve
-> para cualquier adapter.
+> tirar `RecordNotFound`. La herramienta es
+> `enqueue_after_transaction_commit`, que difiere el encolado hasta el COMMIT
+> para cualquier adapter. Ojo con la versión: en Rails 7.2 era la config global
+> `config.active_job.enqueue_after_transaction_commit`, y en 8.1 la removieron —
+> hoy es un atributo por clase de job. En este repo quedó puesta la forma vieja,
+> que no hace nada; lo dejo anotado porque justamente es el tipo de bug que no
+> avisa.
 >
 > Pero eso **todavía no es un outbox**: entre el COMMIT y el enqueue hay una
 > ventana de microsegundos donde, si el proceso muere o Redis está caído, el job
@@ -1600,7 +1692,7 @@ resetea solo al final de cada request y de cada job.
 > devuelve las conexiones al pool al final o el test siguiente falla por
 > checkout. El pool de test está en 15 para que entren 10 threads.
 >
-> Son 8 ejemplos que corren en 2,1 segundos y cubren lost update, reservas
+> Son 8 ejemplos que corren en ~2,3 segundos y cubren lost update, reservas
 > dobles, creación concurrente del stock_item, idempotencia, optimistic locking,
 > el contador sin huecos y el deadlock de transferencias cruzadas. Y los
 > complemento con un invariante global: un job nocturno compara la proyección
@@ -1636,6 +1728,12 @@ resetea solo al final de cada request y de cada job.
   query lenta adentro de una transacción es un problema de concurrencia.
 - `docs/05-solid-y-patrones.md` — por qué los casos de uso son objetos con
   `call`, y cómo eso hace que la transacción tenga un solo dueño.
+- `docs/10-errores-comunes.md` §6 — el query cache comiéndose un
+  `INSERT ... RETURNING`, que es la otra mitad de la historia de `SequenceCounter`
+  (§3.3).
+- `docs/11-api-rest-serializacion-e-idempotencia.md` §7 — idempotencia sobre
+  HTTP: la `Idempotency-Key`, la tabla `idempotency_keys` y cómo se combina con
+  los locks de acá.
 - Los comentarios de `app/services/stock/apply_movement.rb`,
   `app/services/application_service.rb`, `app/models/stock_item.rb`,
   `db/migrate/20260830160600_create_stock_items.rb` y

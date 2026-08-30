@@ -44,7 +44,7 @@ sistema" — eso dispara una investigación de merma. Un `receive` de +10 es "ll
 el camión". Si el cliente elige el `kind` como si fuera un campo más, el día que
 agregues una regla ("ajustar requiere rol manager y motivo obligatorio") no la
 podés aplicar sin inspeccionar el body. Con endpoints separados, la regla vive en
-la ruta: `app/controllers/api/v1/stock_operations_controller.rb:66` autoriza
+la ruta: `app/controllers/api/v1/stock_operations_controller.rb:68` autoriza
 `adjust` contra una policy distinta que `receive`.
 
 **2. Los parámetros no son los mismos.** Mirá las firmas reales:
@@ -86,7 +86,7 @@ son igual de baratos: mapeás un método y listo. En Rails, `resources :x` te
 genera siete rutas, helpers de URL, y una convención que el resto del framework
 asume. **Salirte de la convención tiene costo real**: perdés los helpers
 generados, y si nombrás mal una acción, chocás con el framework. Ejemplo genuino
-de este repo (`config/routes.rb:29-40`):
+de este repo (`config/routes.rb:38`):
 
 ```ruby
 post :dispatch, action: :dispatch_transfer
@@ -159,7 +159,7 @@ el `authorize`" sea un error ruidoso y no un agujero silencioso.
 
 `reservations` y `stock_transfers` usan el id numérico en la URL:
 `POST /api/v1/reservations/5/commit`. `purchase_orders` usa la `reference`
-(`PurchaseOrder.find_by!(reference: params[:id])`, línea 24 del controller), que
+(`PurchaseOrder.find_by!(reference: params[:id])`, línea 19 del controller), que
 sí es una clave natural (`TR-2026-000001`, generada por `sequence_counters`).
 
 La inconsistencia es real y vale reconocerla: las reservas son efímeras y
@@ -185,7 +185,7 @@ Este repo versiona **por path**: `/api/v1/...` (`config/routes.rb:55`).
 
 **Path gana en la práctica** y es lo que usan Stripe (que además tiene versión
 por *cuenta*, fijada en el momento del alta), GitHub, Twilio y AWS. El comentario
-en `config/routes.rb:45-52` lo dice con el argumento operativo: con el path podés
+en `config/routes.rb:43-54` lo dice con el argumento operativo: con el path podés
 enrutar `v1` y `v2` a *deploys distintos* en el balanceador, y hacer canary de
 `v2` sin tocar `v1`.
 
@@ -225,9 +225,13 @@ def announce_deprecation
 end
 ```
 
-Ojo con el formato: `Sunset` va en **HTTP-date** (RFC 7231), `Deprecation` en
-[IMF-fixdate o un timestamp `@epoch`]. Mandarlos con formatos inventados es peor
-que no mandarlos, porque el cliente que los parsea explota.
+Ojo con el formato, porque son distintos: `Sunset` (RFC 8594) va en
+**HTTP-date**, o sea el IMF-fixdate de RFC 9110 §5.6.7 (`Wed, 01 Jul 2026
+00:00:00 GMT`). `Deprecation` (RFC 9745) NO es HTTP-date: es un **Structured
+Field Date** (el tipo `Date` de RFC 9651), que se serializa como `@` + segundos desde epoch
+(`@1767225600`). Los borradores viejos de la spec usaban HTTP-date y por eso
+circula mal copiado. Mandarlos con formatos inventados es peor que no mandarlos,
+porque el cliente que los parsea explota.
 
 La cabecera es la parte fácil. El proceso real:
 
@@ -254,10 +258,14 @@ la comunicación pesan más que la cabecera.
 
 ---
 
-## 4. Tabla de endpoints (salida real de `bin/rails routes`)
+## 4. Tabla de endpoints (los 33 de `bin/rails routes`)
 
-Los 33 endpoints de `/api/v1`. La columna *Scope* sale de los `requires_scope` de
-cada controller; *Idem.* marca las acciones envueltas por `idempotent`.
+Los 33 endpoints de `/api/v1` (`bin/rails routes | grep api/v1 | wc -l` → 33).
+Un detalle de lectura: el router siempre nombra el segmento **`:id`**; abajo lo
+escribo como `:sku`, `:code` o `:reference` porque es la clave natural que ese
+`:id` transporta en cada recurso (ver §2). La columna *Scope* sale de los
+`requires_scope` de cada controller; *Idem.* marca las acciones envueltas por
+`idempotent`.
 
 | Método | Path | Controller#acción | Scope | Idem. |
 |---|---|---|---|---|
@@ -417,15 +425,43 @@ Y el mapa completo, incluyendo lo que producen los `rescue_from` y los concerns:
 | **200** | Lectura, o comando que muta un recurso existente (`commit`, `submit`, `cancel`) | `render_result` |
 | **201** | Se creó una fila nueva del ledger o del dominio | `success_status: :created` |
 | **204** | `DELETE /products/:sku` (soft delete, sin body) | `head :no_content` |
-| **400** | Falta un parámetro (`parameter_missing`), parámetro no permitido, `quantity` no entera | `rescue_from ParameterMissing` / `ActionController::BadRequest` |
+| **400** | Falta un parámetro (`parameter_missing`) o vino uno no permitido (`unpermitted_parameters`) | `rescue_from ParameterMissing` / `UnpermittedParameters` |
 | **401** | Token ausente, inválido, vencido o revocado. **Siempre con `WWW-Authenticate`** | `token_authentication.rb:51` |
 | **403** | Token sin el scope (`insufficient_scope`), usuario deshabilitado (`account_disabled`), policy de Pundit | `require_scope!` / `render_forbidden` |
 | **404** | SKU/código/reference que no existe. **Sin decir de qué modelo** | `render_not_found` |
 | **409** | Optimistic locking perdido, `RecordNotUnique`, `LockWaitTimeout`, clave de idempotencia en vuelo, reserva ya no activa | `render_conflict` / `idempotency_conflict` |
 | **410** | La reserva **venció** | `reservation_expired` |
 | **422** | Regla de negocio violada; clave de idempotencia reusada con otro body | `STATUS_FOR` |
-| **429** | Rate limit (dos capas, ver `docs/08`). Con `Retry-After` y `RateLimit-*` | `rate_limited!` / `Rack::Attack` |
+| **429** | Rate limit, en dos capas (ver `docs/08`). La del controller manda sólo `Retry-After`; las cabeceras `RateLimit-*` las agrega Rack::Attack en `throttled_responder` | `rate_limited!` / `Rack::Attack` |
 | **500** | Bug. Mensaje genérico + `request_id` para soporte | `render_internal_error` |
+
+### 5.0 Ojo: hay dos 400 que NO salen con este formato
+
+La tabla de arriba vale para lo que pasa por `rescue_from`. Hay dos caminos que
+devuelven 400 **sin** el JSON de la API, y conviene tenerlos identificados
+porque son la fuente número uno de tickets tipo "su API me devuelve HTML":
+
+| Caso | Excepción | Qué pasa de verdad |
+|---|---|---|
+| `quantity` no entera | `ActionController::BadRequest` (la levanta `quantity_param`, `stock_operations_controller.rb:97`) | No hay `rescue_from` para ella |
+| Body JSON roto | `ActionDispatch::Http::Parameters::ParseError` | Tampoco |
+
+Las dos son `StandardError`, así que el comportamiento **cambia según el
+entorno**, y ese es el detalle feo:
+
+- En **dev/test** `rescue_from StandardError` no está registrado
+  (`error_handling.rb:24` lo declara `unless Rails.env.local?`), así que la
+  excepción sale del controller, la agarra `ActionDispatch::ShowExceptions` y el
+  cliente recibe **400 con `content-type: text/html`** (`public/400.html`).
+- En **producción** sí está registrado, y como `rescue_from` busca handlers en
+  orden inverso al de declaración y ninguno de los específicos matchea, la
+  atrapa el de `StandardError` → **500 `internal_error` en JSON**.
+
+O sea: el mismo request da 400-HTML en desarrollo y 500-JSON en producción, y
+en ninguno de los dos casos da el 400-JSON que el contrato promete. Verificado en
+los dos sentidos; el detalle completo y el arreglo están en el error #4 de la
+sección de producción. El request spec que cubre esto (`stock_operations_spec.rb:104`)
+sólo asserta el **status**, nunca el body — por eso el bug pasa verde.
 
 ### 5.1 409 vs 422 vs 410 — el criterio
 
@@ -497,8 +533,16 @@ venía de WebDAV y RFC 9110 lo renombró. Los dos son 422.
 En Spring devolvés `ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)`. En
 Rails escribís un **símbolo**, y `Rack::Utils::SYMBOL_TO_STATUS_CODE` lo traduce.
 La trampa: **si escribís mal el símbolo, no explota en compilación** (no hay
-compilación) sino en runtime, con `ArgumentError: Invalid HTTP status`. Un
-`:unprocessible_content` con typo llega a producción si no hay un request spec
+compilación) sino en runtime. Verificado con `Rack::Utils.status_code`:
+
+```ruby
+Rack::Utils.status_code(:unprocessable_content)   # => 422
+Rack::Utils.status_code(:unprocessable_entity)    # => 422, con warning de Rack:
+#   "Status code :unprocessable_entity is deprecated ... use :unprocessable_content"
+Rack::Utils.status_code(:unprocessible_content)   # ArgumentError: Unrecognized status code
+```
+
+Un `:unprocessible_content` con typo llega a producción si no hay un request spec
 que lo toque. En Java el enum te lo agarra el compilador. Acá te lo agarra el
 test — por eso los request specs no son opcionales.
 
@@ -585,6 +629,12 @@ Un `PG::UndefinedColumn` crudo te filtra nombres de tablas y columnas; un
 colisionó** (o sea, datos de otro usuario). Detalle completo al log, `request_id`
 al cliente.
 
+⚠️ Y el repo **rompe su propia regla** en un camino: `application_service.rb:80`
+traduce `RecordNotUnique` a un `Result.failure(:duplicate, ..., detail: e.message)`,
+y ese `e.message` —índice y valor colisionado incluidos— viaja al cliente dentro
+de `error.details` del 409. Reproducido en el error #6 de la sección de
+producción.
+
 Lo mismo con el 404 (`error_handling.rb:74`): no decimos qué modelo era. Si
 `GET /products/X` dijera "Couldn't find Product with sku=X", ya confirmaste que
 existe un modelo `Product` y que la clave es `sku`; y peor, un 404 que distingue
@@ -593,7 +643,7 @@ existe un modelo `Product` y que la clave es `sku`; y peor, un 404 que distingue
 ### 6.3 Cómo se prueba
 
 Los request specs asertan **status + `code` + `details`**, nunca el `message`
-(`spec/requests/api/v1/stock_operations_spec.rb:113`):
+(`spec/requests/api/v1/stock_operations_spec.rb:111`):
 
 ```ruby
 it "422 cuando no alcanza el stock, con detalle accionable" do
@@ -686,7 +736,7 @@ repetidas y es una fuente de bugs de negocio dificilísimos de diagnosticar.
 Esta es la parte que se olvida el 80% de las implementaciones caseras.
 
 ```ruby
-# app/controllers/concerns/api/idempotency.rb:80
+# app/controllers/concerns/api/idempotency.rb:88
 fingerprint = IdempotencyKey.fingerprint(request.raw_post)
 # app/models/idempotency_key.rb:18
 def self.fingerprint(payload) = OpenSSL::Digest::SHA256.hexdigest(payload.to_s)
@@ -765,15 +815,21 @@ usa— la colisión no es hipotética. El test que cubre la regresión está en
       yield  (corre la acción)
             │
             ├── response 2xx ──▶ UPDATE status='completed', guarda status + body
-            └── response ≠2xx ─▶ UPDATE status='failed' (NO cachea el body)
+            ├── response ≠2xx ─▶ UPDATE status='failed' (NO cachea el body)
+            └── EXCEPCIÓN ──────▶ (nada: la fila queda en 'processing') ⚠ BUG
 ```
+
+Esa última rama es un bug real y está reproducida en el error #1 de la sección
+de producción: si la acción levanta una excepción que atrapa un `rescue_from`
+(404, 403, 400…), `persist_response` no llega a correr y la clave queda trabada
+en `processing` hasta que vence el TTL.
 
 Los tres estados salen del modelo (`app/models/idempotency_key.rb:8`) y están
 además protegidos por un `CHECK` en Postgres
 (`db/migrate/20260830161200_create_idempotency_keys.rb`), o sea que ni un
 `update_column` te puede meter un estado inventado.
 
-El despacho usa **pattern matching** de Ruby 3 (`idempotency.rb:100`):
+El despacho usa **pattern matching** de Ruby 3 (`idempotency.rb:101`):
 
 ```ruby
 case record
@@ -869,12 +925,20 @@ end
 recibiría ese mismo 500 **para siempre** (24 h, el TTL) aunque el bug ya esté
 arreglado y aunque la operación sea perfectamente válida. El estado `failed`
 además **libera** la clave: el próximo intento con la misma clave vuelve a
-`processing` y **reejecuta** (`claim_key`, línea 152). Un error no debe quemar la
+`processing` y **reejecuta** (`claim_key`, línea 149). Un error no debe quemar la
 clave.
 
 Trade-off que conviene admitir: un 422 tampoco se cachea, así que si el cliente
 reintenta con el mismo body, vuelve a correr toda la validación. Es más caro pero
 correcto: las reglas de negocio pueden haber cambiado (llegó stock).
+
+⚠️ **Y acá está el agujero.** Todo esto vale para los errores que se renderizan
+por `render_result`, o sea los fallos de negocio. Los errores que viajan como
+**excepción** hasta un `rescue_from` —404, 403, 400, `StaleObjectError`— nunca
+llegan a `persist_response`, porque `rescue_from` vive por fuera del
+`around_action`. Esa clave no queda en `failed`: queda en `processing`, y el
+reintento recibe 409 durante 24 horas. Reproducido y con el arreglo en el error
+#1 de la sección de producción.
 
 ### 7.8 TTL y limpieza
 
@@ -1109,7 +1173,7 @@ integrador y no es sensible (ya está autenticado y es su propio token).
 hacer la credencial*; la policy de Pundit dice *qué puede hacer el usuario*. Los
 dos tienen que pasar. Ejemplo real: un token con todos los scopes en manos de un
 usuario `operator` recibe **403 de Pundit** al intentar `POST /stock/adjust`,
-porque ajustar requiere `manager` (`spec/requests/api/v1/stock_operations_spec.rb:174`).
+porque ajustar requiere `manager` (`spec/requests/api/v1/stock_operations_spec.rb:178`).
 Permiso efectivo = scopes del token **∩** permisos del rol.
 
 Detalle de implementación que vale: `scopes` es un **array nativo de Postgres**
@@ -1284,7 +1348,12 @@ end
 ```
 
 Contrato mínimo: `.new(objeto).as_json → Hash`, `.collection(array) → Array<Hash>`.
-Ocho serializers concretos en `app/serializers/`, uno por recurso expuesto.
+En `app/serializers/` hay **seis** serializers de recurso que heredan de
+`ApplicationSerializer` (`product`, `stock_item`, `stock_movement`,
+`stock_reservation`, `stock_transfer`, `purchase_order`), más `ErrorSerializer`,
+que no hereda de nada porque no serializa un modelo sino un `Result` fallido.
+Los `warehouses` no tienen serializer propio: el controller arma el Hash a mano
+en un método privado `serialize` — una inconsistencia menor pero real.
 
 ### 10.1 El riesgo de `render json: modelo`
 
@@ -1409,13 +1478,15 @@ total-count: 15
 sigue las que le das. Eso te deja cambiar el esquema de paginación sin romperlo.
 
 `Pagy::DEFAULT[:overflow] = :last_page` hace que `?page=9999` devuelva la última
-página en vez de un 500. Verificado: devuelve `200` con `current-page: 1` (hay 8
-páginas de 2, pero con el `limit` default de 25 hay 1 sola).
+página en vez de reventar. Verificado con el `limit` por defecto de 25: como los
+15 productos entran en una sola página, `GET /api/v1/products?page=9999` responde
+`200` con `current-page: 1`. Sin ese `overflow`, Pagy levanta `Pagy::OverflowError`
+y eso llega al cliente como 500.
 
 ### 11.2 Cursor (keyset) para el ledger
 
 ```ruby
-# app/queries/stock_movements/ledger.rb:76
+# app/queries/stock_movements/ledger.rb:80
 relation.where("(stock_movements.occurred_at, stock_movements.id) < (?, ?)", t, i)
         .order(occurred_at: :desc, id: :desc).limit(@limit)
 ```
@@ -1460,7 +1531,7 @@ movimientos del mismo segundo se pisan y el cursor te saltea filas. Postgres
 guarda `timestamptz` con microsegundos; si truncás al serializar el cursor,
 perdés filas en silencio.
 
-Y el manejo de cursor corrupto (`ledger.rb:80`): se loguea y **se devuelve la
+Y el manejo de cursor corrupto (`ledger.rb:84`): se loguea y **se devuelve la
 primera página**, no un 500. Un cursor roto es un bug del cliente, no una caída
 del servidor.
 
@@ -1563,9 +1634,11 @@ tratalo como un `unsafe { }` de Rust: sólo con literales, nunca con un param.
 Los filtros del repo son todos por clave natural o por columna fija:
 
 ```ruby
-# app/controllers/api/v1/stock_items_controller.rb
-scope = scope.where(warehouse_id: Warehouse.where(code: params[:warehouse_code].to_s.upcase).select(:id))
-scope = scope.where("quantity_available <= reorder_point")  if truthy?(params[:low_stock])
+# app/controllers/api/v1/stock_items_controller.rb:10-12 y :27
+scope = scope.where(warehouse_id: warehouse_filter) if params[:warehouse_code].present?
+scope = scope.where("quantity_available <= reorder_point") if truthy?(params[:low_stock])
+# ...
+def warehouse_filter = Warehouse.where(code: params[:warehouse_code].to_s.upcase).select(:id)
 ```
 
 Tres cosas a notar:
@@ -1602,7 +1675,7 @@ Lo que hay de verdad en este repo, sin inventar:
 | **Statement timeout de PG** | `statement_timeout: 15000` ms | `config/database.yml:53` |
 | **Checkout del pool** | `checkout_timeout: 5` s | `config/database.yml:44` |
 | **Threads de Puma** | `RAILS_MAX_THREADS`, default 3 | `config/puma.rb` |
-| **Timeout del webhook saliente** | `open_timeout` / `read_timeout` = 5 s | `app/services/outbox/publisher.rb:53` |
+| **Timeout del webhook saliente** | `open_timeout` / `read_timeout` = 5 s | `app/services/outbox/publisher.rb:74` |
 | **Proxy / compresión** | Thruster 0.1.26 (`CMD ["./bin/thrust", "./bin/rails", "server"]`) | `Dockerfile:77` |
 | **Límite de `limit` en el ledger** | `clamp(1, 200)` | `app/queries/stock_movements/ledger.rb:44` |
 | **Techo del TTL de reservas** | `clamp(60, 7.days)` | `app/controllers/api/v1/reservations_controller.rb:71` |
@@ -1805,7 +1878,7 @@ Cuatro propiedades que hay que poder enunciar:
    existe es *at-least-once + procesamiento idempotente* — que es exactamente el
    mismo patrón de §7, del otro lado del cable.
 2. **Poison message.** El `rescue` por evento
-   (`app/jobs/outbox/publish_pending_job.rb:50`) evita que un payload roto tape
+   (`app/jobs/outbox/publish_pending_job.rb:48`) evita que un payload roto tape
    la cola para siempre. Cuenta el intento y sigue.
 3. **Orden.** Se procesa `ORDER BY id`, pero con varios workers y `SKIP LOCKED`
    el orden **global** no está garantizado. Si necesitás orden por agregado (y en
@@ -1834,43 +1907,113 @@ de que te lo pregunten:
 ## Errores que ves en producción
 
 Todos estos los reproduje contra la app corriendo en `localhost:3001`. Los
-primeros cinco son bugs **vivos en este repo**; los demás son el patrón general.
+primeros seis son bugs **vivos en este repo**, cada uno con su reproducción; los
+demás son el patrón general que conviene tener a mano.
 
 ---
 
-**1. `GET /api/v1/reservations` devuelve 500 — falta una policy.**
+**1. Una excepción durante la acción deja la clave de idempotencia trabada en
+`processing` — y la quema por 24 horas.**
 
-*Síntoma*: el listado de reservas tira 500. En producción sale como
-`{"error":{"code":"internal_error", ...,"request_id":"..."}}` (lo agarra el
-`rescue_from StandardError`), o sea que en el dashboard parece un error genérico
-y nadie sabe qué es.
+*Síntoma*: el cliente manda un POST con `Idempotency-Key`, se come un 404 o un
+403 (un SKU mal escrito, un token sin rol), corrige el problema, reintenta con la
+misma clave… y recibe **409 `idempotency_conflict` para siempre**. Desde afuera
+parece que hay una request colgada que nunca termina. Dura hasta que vence el
+TTL: 24 horas.
+
+*Causa*: `with_idempotency` es un `around_action`. En el camino feliz hace
+`yield` y después `persist_response(fresh)`. Pero si la acción **levanta**, el
+`yield` propaga la excepción y `persist_response` **nunca corre**: la fila queda
+en `processing`, que es exactamente el estado que `claim_key` traduce a 409.
+
+La clave está en qué errores levantan y cuáles no:
+
+| Camino | Cómo termina | Estado final de la fila |
+|---|---|---|
+| Éxito 2xx | `render_result` | `completed` ✔ |
+| Fallo de negocio (`insufficient_stock`, 422) | `render_result`, **sin excepción** | `failed` ✔ (reintentable) |
+| Todo lo que pasa por `rescue_from` (404, 403, 400, 409 `StaleObjectError`, 422 `RecordInvalid`) | **excepción** | `processing` ✘ **trabada** |
+
+Los `rescue_from` viven en `process_action`, que está **por fuera** del
+`around_action`: para cuando el handler renderiza el 404, el `around_action` ya
+se desarmó sin ejecutar su segunda mitad.
+
+Reproducido contra la app corriendo:
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" \
-  "$BASE/api/v1/reservations"      # => 500
+K=demo-trabada
+
+# 1) SKU inexistente -> 404 por rescue_from RecordNotFound
+curl -s -X POST "$BASE/api/v1/stock/receive" -H "Idempotency-Key: $K" ... \
+  -d '{"sku":"NO-EXISTE","warehouse_code":"BA-01","quantity":1}'
+# {"error":{"code":"not_found","message":"Recurso no encontrado."},"status":404}
+
+bin/rails runner 'r = IdempotencyKey.find_by(key: "demo-trabada");
+                  puts "#{r.status} / #{r.response_status.inspect}"'
+# => processing / nil          <- se quedó ahí
+
+# 2) mismo body, reintento
+# => 409 {"code":"idempotency_conflict"}   <- y así por 24 h
+
+# 3) body corregido, misma clave
+# => 422 {"code":"idempotency_key_reuse"}  <- el fingerprint tampoco lo deja salir
 ```
 
-```text
-Pundit::NotDefinedError (unable to find scope `StockReservationPolicy::Scope`
-  for `StockReservation(...)`):
-app/controllers/api/v1/reservations_controller.rb:11:in `index'
+Fijate lo cerrado que queda el callejón: con el mismo body da 409, con el body
+arreglado da 422. El cliente **no tiene ninguna forma** de completar esa
+operación con esa clave; tiene que inventar una nueva, que es justo lo que la
+idempotencia le pedía no hacer.
+
+Y no es un caso de borde: `POST /api/v1/products` está envuelto por
+`idempotent only: %i[create]`, y el error más común de ese endpoint —SKU
+repetido— sale por `rescue_from ActiveRecord::RecordInvalid`. O sea que traba la
+clave igual:
+
+```bash
+curl -s -X POST "$BASE/api/v1/products" -H "Idempotency-Key: $K2" ... \
+  -d '{"product":{"sku":"AMO-115", ...}}'
+# 422 {"error":{"code":"validation_failed","message":"Sku has already been taken", ...}}
+# y la fila queda en 'processing'
 ```
 
-*Causa*: `reservations_controller.rb:11` llama `policy_scope(StockReservation)` y
-**`app/policies/stock_reservation_policy.rb` no existe** (los otros ocho
-recursos sí tienen la suya). `show`, `create`, `commit` y `destroy` funcionan
-porque autorizan contra `StockItemPolicy`; sólo `index` está roto. Y no hay
-`spec/requests/api/v1/reservations_spec.rb`, por eso nadie se enteró.
+Y contrastá con el 422 de negocio, que sí funciona bien porque no levanta:
 
-*Arreglo*: crear `StockReservationPolicy` con su `Scope` (mirá
-`StockItemPolicy` como molde), **y** agregar un request spec del `index`.
-`Pundit::NotDefinedError` no está en la lista de `rescue_from`, así que además
-conviene mapearlo a un 500 explícito con su propio `code`, para que en el
-dashboard se distinga de un bug de negocio.
+```bash
+curl -s -X POST "$BASE/api/v1/stock/issue" -H "Idempotency-Key: otra" ... \
+  -d '{"sku":"AMO-115","warehouse_code":"BA-01","quantity":999999}'
+# 422 insufficient_stock ; la fila queda en 'failed' y el reintento REEJECUTA.
+```
 
-*Lección general*: `verify_pundit_usage` te protege de **olvidar** llamar a
-`authorize`, pero no de que la policy **no exista**. Si un endpoint no tiene
-request spec, no existe.
+*Arreglo*: que el `persist_response` corra pase lo que pase, marcando `failed`
+cuando hubo excepción:
+
+```ruby
+in { record: IdempotencyKey => fresh }
+  begin
+    yield
+  rescue StandardError
+    fresh.update_columns(status: "failed", updated_at: Time.current)
+    raise
+  end
+  persist_response(fresh)
+```
+
+(`update_columns` y no `update!` a propósito: estamos en un camino de excepción y
+no queremos que una validación falle encima del error original.) La alternativa
+más limpia es un `ensure` que consulte `response.committed?`, pero cuidado: en el
+camino de excepción el status todavía no está seteado.
+
+*Lección general*: **un `around_action` es un `try/finally` a medias.** Todo lo
+que ponés después del `yield` es código que sólo corre en el camino feliz. Si
+mantenés estado externo —una fila de lock, un contador, un span de tracing— la
+segunda mitad va en un `ensure`, no suelta. Es el mismo error que en Java sería
+escribir el `close()` después del `return` en vez de en el `finally` o en un
+try-with-resources.
+
+*Nota*: este bug **no se lleva puesto** el caso que §7.7 describe como bien
+resuelto (el 422 de negocio que libera la clave). Lo que rompe es el subconjunto
+de errores que viajan como excepción, que casualmente son los más frecuentes en
+una integración nueva: SKU mal escrito, token sin permisos, parámetro faltante.
 
 ---
 
@@ -1982,7 +2125,7 @@ que no hacen `yield`.
 
 ---
 
-**4. Un JSON malformado devuelve 400 con cuerpo HTML.**
+**4. Un JSON malformado devuelve 400 con cuerpo HTML en dev, y 500 en producción.**
 
 *Síntoma*: el cliente hace `JSON.parse(response.body)` sobre el error y explota
 con `Unexpected token '<'`. El reporte que te llega es "su API devuelve HTML".
@@ -1992,38 +2135,85 @@ curl -s -D - -X POST "$BASE/api/v1/stock/receive" -H "Authorization: Bearer $TOK
   -H 'Content-Type: application/json' -d '{"sku": '
 # HTTP/1.1 400 Bad Request
 # content-type: text/html; charset=UTF-8
-# <!doctype html><html lang="en"><head><title>The server cannot process...
+# content-length: 7054              <- exactamente el tamaño de public/400.html
 ```
 
-*Causa*: el JSON se parsea en el **middleware**
-(`ActionDispatch::Http::Parameters`), o sea **antes** de que exista el
-controller. `rescue_from` no puede verlo. `ActionDispatch::ShowExceptions` mapea
-`ParseError` a 400 y sirve `public/400.html`.
+*Causa*, y acá hay que ser preciso porque la explicación que circula es falsa:
+**el body NO se parsea en un middleware.** El parseo es **perezoso**: ocurre la
+primera vez que alguien toca `params`. En este repo ese primer toque es un
+`before_action` propio, y el backtrace lo dice sin ambigüedad:
 
-*Arreglo*: un `exceptions_app` que responda JSON cuando el path empieza con
-`/api/`:
+```text
+ActionDispatch::Http::Parameters::ParseError (Error occurred while parsing request parameters)
+Caused by: JSON::ParserError (unexpected end of input at line 1 column 9)
+app/controllers/api/v1/base_controller.rb:93:in `set_default_response_format'
+```
+
+O sea que la excepción ocurre **adentro** del controller y `rescue_from` sí
+podría verla. No la ve por otra razón: **no hay ningún `rescue_from` que matchee**.
+Y como `ParseError < StandardError`, el resultado depende del entorno:
+
+| Entorno | `rescue_from StandardError` | Resultado |
+|---|---|---|
+| dev/test | no registrado (`unless Rails.env.local?`) | escapa a `ShowExceptions` → **400 + `public/400.html`** |
+| producción | registrado | **500 `internal_error` en JSON** |
+
+Las dos respuestas están mal: un body roto es culpa del cliente, así que
+corresponde 400, y con el JSON del contrato. Lo mismo vale para
+`ActionController::BadRequest` (ver §5.0): mismo mecanismo, mismo doble
+comportamiento.
+
+*Arreglo*: dos líneas en el concern, que cubren los dos casos de una:
 
 ```ruby
-# config/application.rb
-config.exceptions_app = ->(env) do
-  request = ActionDispatch::Request.new(env)
-  status  = env["action_dispatch.exception"] ? 400 : request.path_info[1..].to_i
+# app/controllers/concerns/api/error_handling.rb, dentro del `included do`
+rescue_from ActionDispatch::Http::Parameters::ParseError, with: :render_malformed_body
+rescue_from ActionController::BadRequest,                 with: :render_bad_request
 
-  if request.path.start_with?("/api/")
+def render_malformed_body(_e)
+  render_error(:malformed_request, "El cuerpo de la solicitud no es JSON válido.",
+               status: :bad_request)
+end
+
+def render_bad_request(exception)
+  render_error(:bad_request, exception.message, status: :bad_request)
+end
+```
+
+Ojo con el orden: los `rescue_from` se evalúan **en orden inverso al de
+declaración**, así que estos dos tienen que ir *después* del de `StandardError`
+para ganarle. En este archivo eso ya se cumple, porque `StandardError` se declara
+primero.
+
+`exceptions_app` **no** es el arreglo para este caso —la excepción nunca llega
+tan afuera—, pero sí lo es para lo que de verdad pasa antes del controller: el
+404 de routing y cualquier error que levante un middleware. Si querés que *eso*
+también salga en JSON:
+
+```ruby
+# config/application.rb — sólo para lo que ocurre FUERA del controller
+config.exceptions_app = lambda do |env|
+  request = ActionDispatch::Request.new(env)
+  status  = request.path_info[1..].to_i   # ShowExceptions setea PATH_INFO = "/404"
+
+  if request.get_header("action_dispatch.original_path").to_s.start_with?("/api/")
     [ status, { "Content-Type" => "application/json" },
-      [ { error: { code: "malformed_request",
-                   message: "El cuerpo no es JSON válido." } }.to_json ] ]
+      [ { error: { code: "not_found", message: "Recurso no encontrado." },
+          status: status }.to_json ] ]
   else
     ActionDispatch::PublicExceptions.new(Rails.public_path).call(env)
   end
 end
 ```
 
-*Lección general*: **todo lo que pasa antes del controller se te escapa de
-`rescue_from`.** El middleware es el equivalente de la `FilterChain` de Spring
-Security, y `@ControllerAdvice` tampoco atrapa lo que revienta en un filtro. Vale
-para el parse error, para `Rack::Attack` (que por eso arma su JSON a mano en
-`throttled_responder`) y para el 404 de routing.
+*Lección general*: antes de decir "esto pasa en el middleware", **mirá el
+backtrace**. En Rails casi nada del request se parsea con ganas: `params`,
+`format` y `remote_ip` se resuelven la primera vez que los pedís, y eso mueve el
+punto donde explotan. Lo que sí queda genuinamente fuera del alcance de
+`rescue_from` es el 404 de routing y lo que levanta un middleware —`Rack::Attack`,
+por ejemplo, arma su JSON a mano en `throttled_responder`
+(`config/initializers/rack_attack.rb:230`) justamente porque corre antes de que
+exista un controller.
 
 ---
 
@@ -2058,7 +2248,64 @@ funcionar. Es la forma de ETag/If-Match, y tiene el mismo modo de falla.
 
 ---
 
-**6. La clave de idempotencia generada dentro del retry loop.**
+**6. El 409 `duplicate` filtra el mensaje crudo de Postgres.**
+
+*Síntoma*: ninguno — hasta que alguien lee un cuerpo de error y encuentra ahí el
+nombre de un índice y **el valor que colisionó**, que puede ser dato de otro
+usuario.
+
+*Causa*: `app/services/application_service.rb:80` traduce el `RecordNotUnique` a
+un `Result.failure` y le mete `e.message` como detalle:
+
+```ruby
+rescue ActiveRecord::RecordNotUnique => e
+  Result.failure(:duplicate, "Ya existe un registro con esos datos.", detail: e.message)
+```
+
+`ErrorSerializer.from_result` renderiza `error.details` tal cual, así que eso
+sale por el cable. Reproducido pasando un `RecordNotUnique` real por la misma
+traducción:
+
+```json
+{
+  "error": {
+    "code": "duplicate",
+    "message": "Ya existe un registro con esos datos.",
+    "details": {
+      "detail": "PG::UniqueViolation: ERROR:  duplicate key value violates unique constraint \"index_categories_on_slug\"\nDETAIL:  Key (slug)=(dup-audit-zzz2) already exists.\n"
+    }
+  },
+  "status": 409
+}
+```
+
+Ahí hay tres cosas que el cliente no tenía por qué saber: que usás Postgres, cómo
+se llama el índice (o sea la tabla y la columna), y el valor duplicado.
+
+Lo notable es que el repo **ya tiene** la regla escrita y la aplica bien en el
+500 (`render_internal_error` manda sólo un `request_id`) y en el 404
+(`render_not_found` no dice ni el modelo). Este camino se la saltea, y se la
+saltea justo en el lugar donde no se nota: nadie mira los cuerpos de los 409.
+
+*Arreglo*: el `e.message` va al log, no al body.
+
+```ruby
+rescue ActiveRecord::RecordNotUnique => e
+  Rails.logger.warn(event: "service.unique_violation", message: e.message)
+  Result.failure(:duplicate, "Ya existe un registro con esos datos.")
+```
+
+Si querés darle algo accionable al cliente, extraé el **nombre lógico del campo**
+de tu propio mapa de índices, nunca el texto de la excepción.
+
+*Lección general*: **la regla "nunca `e.message` crudo" hay que aplicarla en cada
+camino, no en el handler genérico.** El `rescue_from StandardError` es el que
+todos revisan; los `rescue` puntuales que traducen una excepción a un DTO de
+error son los que se olvidan, y son los que más contexto tienen para filtrar.
+
+---
+
+**7. La clave de idempotencia generada dentro del retry loop.**
 
 *Síntoma*: duplicaste una operación aunque "tenés idempotencia". No hay error en
 ningún log.
@@ -2074,7 +2321,7 @@ segundos. La tabla `idempotency_keys` ya guarda todo lo necesario.
 
 ---
 
-**7. El cliente reintenta con el mismo body pero cambia un campo derivado.**
+**8. El cliente reintenta con el mismo body pero cambia un campo derivado.**
 
 *Síntoma*: 422 `idempotency_key_reuse` en reintentos que el cliente jura que son
 idénticos.
@@ -2092,7 +2339,7 @@ los duplicados de claves, así que yo lo dejaría como está y lo documentaría.
 
 ---
 
-**8. Cachear el 500 en la clave de idempotencia.**
+**9. Cachear el 500 en la clave de idempotencia.**
 
 *Síntoma*: arreglaste el bug, deployaste, y ese cliente sigue recibiendo el mismo
 500 durante 24 horas.
@@ -2105,7 +2352,7 @@ una entrevista es la pregunta de seguimiento obvia a "¿qué respuestas cacheás
 
 ---
 
-**9. Rate limiter sobre un `NullStore`: no limita nada y no avisa.**
+**10. Rate limiter sobre un `NullStore`: no limita nada y no avisa.**
 
 *Síntoma*: creés que tenés rate limiting; no tenés. Te enterás con la factura de
 Postgres o con una caída.
@@ -2114,7 +2361,7 @@ Postgres o con una caída.
 `ActiveSupport::Cache::NullStore` devuelve `nil`, la comparación `count && count > to`
 nunca se cumple, y el límite queda desactivado **sin un solo mensaje**.
 
-*Arreglo*: lo que hace `base_controller.rb:47` — elegir el store
+*Arreglo*: lo que hace `base_controller.rb:46` — elegir el store
 explícitamente y **loguear un warning** si el que hay no sirve. Detalle
 relacionado del mismo archivo: dos `rate_limit` sin `name:` distinto comparten
 contador y **cada request lo incrementa dos veces**, así que un límite de 20
@@ -2122,7 +2369,7 @@ corta en 11 (medido). Ver `docs/08`.
 
 ---
 
-**10. El 404 que confirma existencia.**
+**11. El 404 que confirma existencia.**
 
 *Síntoma*: alguien enumera tus recursos y no te das cuenta porque son todos 404.
 
@@ -2151,7 +2398,11 @@ sostenido, lo que corta es el rate limit por token de `docs/08`.
 > ejecutar dos veces. La fila tiene tres estados: `processing`, `completed`,
 > `failed`. Un reintento de una `completed` devuelve la respuesta cacheada con
 > `Idempotent-Replay: true`; una `failed` se puede reejecutar, porque un error no
-> debería quemar la clave.
+> debería quemar la clave. (En este repo eso vale para los fallos de negocio,
+> pero no para los que salen como excepción vía `rescue_from`: ahí la fila queda
+> trabada en `processing` porque el `around_action` no llega a su segunda mitad.
+> Es un bug que encontré auditando y que se arregla con un `rescue`/`ensure`
+> alrededor del `yield`.)
 >
 > Dos cosas que se olvidan casi siempre. Primero, el **fingerprint del body**: un
 > SHA-256 del raw post. Si llega la misma clave con otro body devolvés 422; sin

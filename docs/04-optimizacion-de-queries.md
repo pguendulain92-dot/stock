@@ -91,7 +91,8 @@ estilo `Specification` de Spring Data, pero sin tener que declarar interfaces.
 | `where`, `order`, `limit`, `joins`, `includes`, `select`, `group` | ❌ | ninguno (encadenan) |
 | `to_sql`, `explain` | ❌ (`explain` sí ejecuta con `:analyze`) | te muestra el SQL |
 | `to_a`, `each`, `map`, `load` | ✅ | `SELECT ...` completo, instancia modelos |
-| `first`, `last`, `find`, `find_by` | ✅ | agrega `ORDER BY id` + `LIMIT 1` |
+| `first`, `last` | ✅ | agrega `ORDER BY id ASC`/`DESC` + `LIMIT 1` |
+| `find`, `find_by` | ✅ | `WHERE ... LIMIT 1`, **sin** `ORDER BY` (te dan la fila que Postgres devuelva primero) |
 | `count`, `sum`, `average`, `minimum` | ✅ | agregación en la base, **no** carga filas |
 | `pluck` | ✅ | `SELECT col1, col2` → arrays de Ruby, sin modelos |
 | `exists?`, `any?`, `none?` | ✅ | `SELECT 1 ... LIMIT 1` |
@@ -238,10 +239,9 @@ del número de filas.
 
 ## 4. Cómo se detecta un N+1
 
-### 4.1 Bullet, configurado para romper el CI
+### 4.1 Bullet, configurado para romper el CI (y por qué hoy no rompe nada)
 
-Está en el Gemfile (grupo `development, test`) y configurado en
-`spec/support/bullet.rb`:
+El cableado está en `spec/support/bullet.rb`:
 
 ```ruby
 Bullet.enable = true
@@ -275,6 +275,26 @@ end
 algo que después no usaste. Es una query de más y memoria desperdiciada; en un
 listado de 500 filas con una asociación gorda se nota.
 
+> ⚠️ **Hallazgo: en este repo el cableado está muerto.** `gem "bullet", "~> 8.0"`
+> está declarado en `group :development do` (Gemfile:183), **no** en
+> `group :development, :test`. Bundler sólo requiere los grupos de `Rails.groups`,
+> que en el entorno de test son `:default` y `:test`, así que Bullet nunca se
+> carga ahí. Y como tanto `spec/support/bullet.rb:14` como
+> `spec/rails_helper.rb:62` están guardados con `if defined?(Bullet)`, los dos
+> bloques son un no-op silencioso: el ejemplo `:n_plus_one` pasa exista o no el
+> N+1. Verificado:
+>
+> ```bash
+> $ RAILS_ENV=test bin/rails runner 'puts defined?(Bullet) ? "cargado" : "NO cargado"'
+> NO cargado
+> ```
+>
+> El arreglo es de una línea: mover el `gem "bullet"` al bloque
+> `group :development, :test do`. Lo dejo anotado y no lo toco porque este
+> documento no modifica código, pero es exactamente el tipo de red de seguridad
+> que la gente cree tener y no tiene. Todo lo que sigue describe cómo se comporta Bullet
+> cuando **sí** está cargado.
+
 ### 4.2 `strict_loading`: la versión de Rails, sin gema
 
 `Product.strict_loading.limit(10).each { |p| p.category }` levanta
@@ -290,8 +310,8 @@ Bullet porque además detecta el eager loading inútil.
 |---|---|---|
 | `verbose_query_logs` | la línea de Ruby que disparó cada query | ✅ activo en desarrollo |
 | `query_log_tags` | comentario SQL con controller/action/job, visible en `pg_stat_activity` | ✅ activo en desarrollo |
-| `bullet` | detecta N+1 y eager loading inútil, rompe el test | ✅ en test |
-| `rack-mini-profiler` | badge flotante con desglose de tiempo SQL/render por request | ✅ en el Gemfile (`require: false`) |
+| `bullet` | detecta N+1 y eager loading inútil, rompe el test | ⚠️ configurado en `spec/`, pero la gema está sólo en `group :development` y no se carga en test (ver §4.1) |
+| `rack-mini-profiler` | badge flotante con desglose de tiempo SQL/render por request | ⚠️ en el Gemfile con `require: false` y nadie lo requiere: hay que cargarlo a mano |
 | `prosopite` | detecta N+1 mirando queries *estructuralmente idénticas* seguidas; menos falsos negativos que Bullet en asociaciones raras y en SQL crudo | ❌ no está |
 | APM (Datadog, Scout, New Relic) | traza de producción con la pila de queries por endpoint | ❌ no está |
 
@@ -519,7 +539,7 @@ data: records.map { |p| ProductSerializer.new(p, availability: availability[p.id
 ```
 
 Y `Arel.sql` no es cosmético: es la forma de decirle a Rails "esto es SQL que yo
-escribí y me hago cargo". Sin eso, Rails 7.1+ levanta
+escribí y me hago cargo". Sin eso, Rails moderno (7+) levanta
 `ActiveRecord::UnknownAttributeReference` para protegerte de inyección en
 `pluck`/`order`. **Nunca** metas input del usuario adentro de un `Arel.sql`.
 
@@ -692,9 +712,11 @@ También fijate que `find_each` **re-ejecuta el `includes` por lote**: en cada
 iteración salen un `Product Load` y un `Warehouse Load` extra. Es correcto y
 esperable, pero cuenta para tu presupuesto de queries.
 
-### 8.3 `cursor:` y `order:` (Rails 8.1) y por qué no alcanza
+### 8.3 `cursor:` y `order:` (Rails 8) y por qué no alcanza
 
-Rails 8.1 permite un cursor compuesto:
+Desde Rails 8 los métodos de lote aceptan un cursor compuesto (verificado sobre
+`activerecord 8.1.3.1`; el `CHANGELOG` de 8.1 no lo menciona, así que viene de
+8.0):
 
 ```bash
 $ bin/rails runner 'StockItem.find_each(batch_size: 20, cursor: [:warehouse_id, :id], order: [:asc, :asc]) { |i| i.id }'
@@ -1201,13 +1223,35 @@ es una de las primeras cosas a probar.)
 
 ### 11.2 Tipo distinto
 
-Comparar `varchar` con `integer`, o `bigint` con `numeric`, mete un cast
-implícito que puede inutilizar el índice — y en Postgres muchas veces directamente
-falla con `operator does not exist`. En Rails el caso típico es pasar un String
-donde la columna es `bigint`: `where(product_id: "3")` funciona porque
-ActiveRecord castea según el tipo de la columna, pero `where("product_id = ?", "3")`
-manda el string crudo. Escribí las condiciones con hash siempre que puedas: el
-casteo por tipo de columna es una de las cosas que ActiveRecord hace bien.
+Cuando los dos lados de la comparación no son del mismo tipo, Postgres tiene que
+resolverlo, y hay dos desenlaces muy distintos:
+
+**El caso benigno (y hay que saber que es benigno).** Un literal sin tipo se
+adapta a la columna, y el índice sigue sirviendo. Verificado:
+
+```
+$ psql -d stock_development -c "EXPLAIN SELECT id FROM stock_movements WHERE product_id = '3';"
+ Seq Scan on stock_movements  (cost=0.00..3.30 rows=9 width=8)
+   Filter: (product_id = '3'::bigint)     <- castea el LITERAL, no la columna
+```
+
+Es el mismo plan que con `product_id = 3` (acá es Seq Scan sólo porque la tabla
+tiene 108 filas, §11.5). O sea: el folklore de "pasar un String rompe el índice"
+**no aplica** al `where("product_id = ?", "3")` de Rails. El literal viaja como
+`unknown` y Postgres lo coacciona al tipo de la columna.
+
+**El caso que sí duele** es cuando el cast cae del lado de la **columna**, porque
+ahí ya no es la columna indexada sino una expresión sobre ella — el mismo
+problema de §11.1. Pasa cuando comparás una columna con un tipo que no tiene
+coerción implícita hacia el otro: `WHERE numero_texto::bigint = 3` sobre una
+columna `varchar`, o `WHERE id::text = '3'`. Y en muchos casos Postgres ni
+siquiera intenta: te tira `operator does not exist: character varying = integer`,
+que es preferible porque falla ruidoso.
+
+La regla práctica en Rails sigue siendo la misma: escribí las condiciones con
+hash siempre que puedas. No tanto por el índice como porque el casteo por tipo
+de columna, la interpolación segura y el manejo de `nil`/rangos/arrays son cosas
+que ActiveRecord hace bien y a mano se hacen mal.
 
 ### 11.3 `ILIKE '%x%'` sin trigram
 
@@ -1215,21 +1259,30 @@ Un comodín inicial inutiliza un B-tree: el índice está ordenado por prefijo y
 no tenés prefijo. Con `pg_trgm` + GIN sí se puede:
 
 ```
-$ psql -d stock_development -c "EXPLAIN (ANALYZE, BUFFERS)
+$ psql -d stock_development -c "SET enable_seqscan = off; EXPLAIN (ANALYZE, BUFFERS)
     SELECT id, sku FROM products WHERE name ILIKE '%tornillo%';"
 
- Bitmap Heap Scan on products (actual time=0.065..0.067 rows=2 loops=1)
+ Bitmap Heap Scan on products  (cost=34.88..38.89 rows=1 width=17) (actual time=0.047..0.049 rows=2 loops=1)
    Recheck Cond: ((name)::text ~~* '%tornillo%'::text)
    Heap Blocks: exact=1
-   ->  Bitmap Index Scan on index_products_on_name_trgm (actual time=0.040..0.041 rows=2 loops=1)
+   Buffers: shared hit=9
+   ->  Bitmap Index Scan on index_products_on_name_trgm  (cost=0.00..34.88 rows=1 width=0) (actual time=0.026..0.026 rows=5 loops=1)
          Index Cond: ((name)::text ~~* '%tornillo%'::text)
- Execution Time: 0.122 ms
+         Buffers: shared hit=8
 ```
 
 Ese es `index_products_on_name_trgm`
 (`db/migrate/20260830160400_create_products.rb:56-58`) haciendo su trabajo.
 El `Recheck Cond` es normal en un GIN: el índice de trigramas da candidatos
-(puede haber falsos positivos) y Postgres re-verifica sobre la fila.
+(puede haber falsos positivos) y Postgres re-verifica sobre la fila. Se ve en los
+números: el `Bitmap Index Scan` devuelve `rows=5` candidatos y el `Bitmap Heap
+Scan` deja `rows=2` después del recheck.
+
+El `SET enable_seqscan = off` no es decorativo, y conviene ser honesto al
+respecto: con 15 productos el planner elige Seq Scan y hace bien (§11.5). Sin ese
+`SET`, el mismo `EXPLAIN` te devuelve `Seq Scan on products ... Rows Removed by
+Filter: 13`. Lo que el plan de arriba demuestra es que el índice **existe y es
+usable**; que valga la pena usarlo lo decide el volumen.
 
 Y el complemento defensivo, en `Products::Search#apply_term`
 (`app/queries/products/search.rb:59`):
@@ -1343,9 +1396,13 @@ psql -d stock_development -c "EXPLAIN (ANALYZE, BUFFERS) SELECT ..."
    y Postgres lo rechaza. Verificado:
 
    ```bash
-   $ bin/rails runner 'StockItems::LowStock.call.explain(analyze: true)'
-   => ActiveRecord::StatementInvalid: PG::SyntaxError: ERROR: syntax error at or near "{"
+   $ bin/rails runner 'StockItems::LowStock.call.explain(analyze: true).inspect'
+   => ActiveRecord::StatementInvalid: PG::SyntaxError: ERROR:  syntax error at or near "{"
+      LINE 1: EXPLAIN ({:ANALYZE=>TRUE}) SELECT "stock_items".* FROM "stoc...
    ```
+
+   Ojo con el `.inspect` del ejemplo: **hace falta para ver el error**. Sin él la
+   llamada no explota, porque el proxy todavía no armó nada (punto 2).
 
    Por eso el helper `ApplicationRecord.explain_analyze`
    (`app/models/application_record.rb:44-46`) **está roto hoy**, y el comentario
@@ -1539,7 +1596,7 @@ instrumentación en **todas** las queries, no sólo en las lentas. Con
 `auto_explain.sample_rate` se muestrea.
 
 (Dato de color de ese plan: un Seq Scan de 24 ms sobre una tabla que tenía 102
-filas. Explicación en §16.)
+filas. Explicación en §17.)
 
 ### 13.3 Índices muertos y tablas hinchadas
 
@@ -1564,9 +1621,11 @@ salió sin adivinar.
 
 ### 13.4 Del lado de Rails
 
-- `rack-mini-profiler` (ya en el Gemfile, `require: false`): badge flotante con
-  el desglose de tiempo SQL/render de cada request. Se activa con
-  `bundle exec rails s` y `?pp=help`.
+- `rack-mini-profiler` (en el Gemfile con `require: false`): badge flotante con
+  el desglose de tiempo SQL/render de cada request. Ojo: `require: false` +
+  ningún `require` en `config/` ni en `app/` significa que **hoy no se carga
+  solo**. Para usarlo hay que requerirlo (un initializer de desarrollo con
+  `require "rack-mini-profiler"`), y recién ahí sirven `?pp=help` y compañía.
 - `ActiveSupport::Notifications.subscribe("sql.active_record")`: contar queries
   programáticamente, que es lo que usé para las mediciones de §3.5.
 - Un APM con tracing distribuido para producción. No hay ninguno configurado acá.
@@ -1615,7 +1674,10 @@ Cuatro decisiones a defender acá:
   (`subtotal_cents` = `quantity_ordered::bigint * unit_cost_cents`, stored), así
   que el subtotal nunca puede estar desincronizado del precio y la cantidad.
 - **`after_save`, no `after_commit`**: se ejecuta dentro de la transacción, así
-  que si algo falla después, el total vuelve atrás con todo lo demás.
+  que si algo falla después, el total vuelve atrás con todo lo demás. (Ojo al
+  leer el archivo: el comentario de `purchase_order_line.rb:20-22` dice
+  "`after_commit` y no `after_save`" y el código de abajo hace justo lo
+  contrario. El código es el que manda; el comentario quedó viejo.)
 - **Contra**: bajo escrituras concurrentes sobre la misma orden, dos callbacks
   pueden pisarse. Para eso está `counter_culture` o un `UPDATE ... SET x = x + n`
   atómico. Con órdenes de compra (un usuario edita una orden por vez) el riesgo
@@ -1682,8 +1744,9 @@ de la misma transacción, y (c) tenés un verificador que corre periódicamente.
 ### 15.1 `Rails.cache.fetch`
 
 El store en desarrollo y producción es Solid Cache
-(`config/environments/production.rb:50`), o sea **una tabla de Postgres**, no
-Redis. Eso cambia el cálculo: un `fetch` cuesta una query, así que cachear algo
+(`config/environments/development.rb:32` y `config/environments/production.rb:50`;
+en test es `:memory_store`), o sea **una tabla de Postgres**, no Redis. Eso
+cambia el cálculo: un `fetch` cuesta una query, así que cachear algo
 que ya era una query rápida no gana nada. Cachear una agregación de 200 ms sí.
 
 Los dos usos reales:
@@ -1763,10 +1826,18 @@ que el externo se entere hay que propagar el `touch`
 decir: `touch: true` convierte cada escritura en dos `UPDATE`, y si muchos hijos
 comparten padre todas compiten por la misma fila — contención de locks.
 
-Segunda trampa: si cambia el template pero no el registro, la clave no cambia.
-Rails lo resuelve metiendo un digest del template en la clave
-(`cache_versioning`), pero **sólo del template, no de los helpers ni del
-serializer**. Si tocás un helper, invalidás a mano versionando la clave.
+Segunda trampa: si cambia el template pero no el registro, la clave tendría que
+cambiar igual. Rails lo resuelve del lado de Action View: el helper `cache`
+calcula un **digest del template** (y de los parciales que renderiza) y lo mete
+en la clave; se desactiva con `<% cache producto, skip_digest: true do %>`. Pero
+es digest **del template, no de los helpers ni del serializer**: si tocás un
+helper, invalidás a mano versionando la clave.
+
+No confundir eso con `cache_versioning`, que es otra cosa: es el flag de Active
+Record que hace que `cache_key` devuelva `products/15` (estable) y el
+`updated_at` viaje aparte en `cache_version`, para que el store pueda reusar la
+entrada en vez de dejar huérfanas. Uno versiona por template, el otro por
+registro.
 
 ---
 
@@ -1873,9 +1944,13 @@ base te está protegiendo la historia contable.
 
 Para medir los planes de §9 inserté 300k filas en `stock_movements` dentro de
 transacciones que después hice `ROLLBACK`. La base quedó con los datos
-originales... y con `165 MB` de tamaño total para **102 filas** (`n_live_tup`
-195, `n_dead_tup` 0). El rollback no borra nada físicamente: en MVCC las tuplas
-abortadas quedan hasta que el VACUUM las limpia, y el espacio no vuelve al SO.
+originales... y con `165 MB` de tamaño total para **102 filas** vivas. El
+rollback no borra nada físicamente: en MVCC las tuplas abortadas quedan hasta que
+el VACUUM las limpia, y el espacio no vuelve al SO. (Detalle para no confundirse
+leyendo `pg_stat_user_tables`: ahí `n_live_tup` decía 195 y `n_dead_tup` 0. Los
+dos números son **estimaciones** que mantienen el autovacuum y el `ANALYZE`, no
+un conteo; después de un rollback masivo quedan desfasados hasta la próxima
+pasada. Para saber cuántas filas hay, `count(*)`.)
 Por eso el `auto_explain` de §13.2 mostró un Seq Scan de 24 ms sobre 102 filas:
 estaba leyendo páginas mayormente vacías. Un `VACUUM (FULL, ANALYZE)
 stock_movements` lo dejó en **136 kB**.
@@ -1886,9 +1961,10 @@ LOCK` — en producción se usa `pg_repack`. (2) Si una tabla se pone lenta y
 `n_dead_tup` es alto contra `n_live_tup`, el problema no es tu query: es el
 bloat, típicamente por transacciones largas abiertas que frenan el VACUUM.
 (3) Las **secuencias no son transaccionales**: los ids de los inserts revertidos
-se consumieron igual y el próximo movimiento real quedó con id 963103 — es
-correcto (si no, cada rollback bloquearía a los demás escritores) y explica los
-huecos que la gente reporta como bug.
+se consumieron igual: los movimientos de seed tienen ids del 1 al 101 y el
+siguiente insert real quedó con id 963103 — es correcto (si no, cada rollback
+bloquearía a los demás escritores) y explica los huecos que la gente reporta como
+bug.
 
 ---
 
@@ -1924,7 +2000,10 @@ En Rails aparece porque tocar una asociación no cargada **dispara la query en e
 instante** — no hay `LazyInitializationException` que te avise como en Hibernate;
 nunca falla, sólo se pone lento. Se arregla con `includes`, y se **previene** con
 Bullet configurado con `raise = true` para que el N+1 rompa el CI
-(`spec/support/bullet.rb`).
+(`spec/support/bullet.rb`) — con la advertencia de §4.1: acá la gema quedó sólo
+en `group :development`, así que el guard `if defined?(Bullet)` la desactiva en
+test y la red de seguridad hoy no existe. Que la protección esté escrita no
+quiere decir que esté corriendo; eso también se verifica.
 *El remate que separa una buena respuesta*: `includes` arregla el N+1 de **carga
 de asociaciones**, no el de **agregación**. Si el serializer llama
 `product.stock_items.sum(...)`, `includes` no cambia nada: sigue habiendo una
@@ -1961,7 +2040,7 @@ DESC, id DESC LIMIT n`, con un índice compuesto en el mismo orden.
 no el OR expandido equivalente. Lo medí: con tuplas todo entra en `Index Cond` y
 son 0.097 ms; con el OR, la condición cae a `Filter`, Postgres descarta 4000
 filas en memoria y son 3.156 ms. **32x**. Ojo que el `find_each(cursor:)` de
-Rails 8.1 genera el OR expandido.
+Rails 8 genera el OR expandido.
 *Contra del keyset*: no podés saltar a la página 37. Para un ledger es
 irrelevante; para una grilla administrativa con navegación por número de página,
 no.

@@ -36,7 +36,7 @@ bin/rails runner 'Rails.application.eager_load!
 | Lecturas | `ApplicationQuery` | 6 | `.call(**kwargs) -> Relation` | `@Repository` con `@Query` |
 | Entrada compleja | `ApplicationForm` | 2 | `#save -> Result` | `@Valid` RequestDTO + Bean Validation |
 | Salida JSON | `ApplicationSerializer` | 6 | `#as_json -> Hash` | DTO + Jackson |
-| Autorización | `ApplicationPolicy` | 8 | un método por acción, booleano | `@PreAuthorize` / `AccessDecisionVoter` |
+| Autorización | `ApplicationPolicy` | 9 | un método por acción, booleano | `@PreAuthorize` / `AccessDecisionVoter` |
 | Value objects | `Data.define` | 2 | inmutable, comparado por valor | `record` de Java 16+ |
 
 Los 12 services, tal como los lista el runtime:
@@ -79,8 +79,13 @@ lógica cae por gravedad en dos lugares:
 
 ### 2.2 El ejemplo real: un solo lugar escribe stock
 
-`app/services/stock/apply_movement.rb` es **el único punto del sistema que cambia
-una cantidad**. Su `call` tiene seis pasos y nada más:
+`app/services/stock/apply_movement.rb` es **el único punto del sistema que escribe
+`quantity_on_hand`** —el stock físico— y el único que escribe un asiento en el
+ledger. Lo verifiqué grepeando: la única asignación a esa columna en todo `app/`
+está en `apply_movement.rb:133`. (El modelo además expone primitivas que podrían
+escribirla —`#apply_delta!` en `stock_item.rb:74` y `.atomically_decrement` en
+`:104`—, pero hoy no las llama nadie en `app/`: sólo los specs.) Su `call` tiene
+seis pasos y nada más:
 
 ```ruby
 def call
@@ -102,8 +107,16 @@ end
 ```
 <sub>`app/services/stock/apply_movement.rb:61`</sub>
 
-Y los cinco services de negocio que le pegan encima son **finitos**. `Stock::Issue`
-completo, sin comentarios, es esto:
+La excepción hay que decirla, porque si no la afirmación es falsa:
+`Stock::Reserve` y `Stock::ReleaseReservation` **sí** escriben directo
+`quantity_reserved` (`reserve.rb:62`, `release_reservation.rb:37`), sin pasar por
+`ApplyMovement` y sin asiento en el ledger. Es deliberado y coherente: reservar no
+mueve mercadería, sólo la compromete; no hay nada físico que asentar. La regla
+exacta es "una unidad no entra ni sale de un depósito sin pasar por
+`ApplyMovement`", no "nadie toca una columna de cantidad".
+
+Y los siete services de negocio que le pegan encima son **finitos**.
+`Stock::Issue` completo, sin comentarios, es esto:
 
 ```ruby
 def call
@@ -134,7 +147,7 @@ movimientos sobre productos dados de baja" fue **una línea** en un solo archivo
 ```ruby
 fail!(:product_discarded, "El producto está dado de baja") if item.product.discarded?
 ```
-<sub>`app/services/stock/apply_movement.rb:129` — y los 5 services que dependen de él la heredaron sin tocarse</sub>
+<sub>`app/services/stock/apply_movement.rb:129` — y los 7 services que dependen de él (`Receive`, `Issue`, `Adjust`, `CommitReservation`, `Transfers::Dispatch`, `Transfers::Receive`, `Purchasing::ReceiveOrder`) la heredaron sin tocarse</sub>
 
 ### 2.3 Dónde SÍ va la lógica en el modelo
 
@@ -229,8 +242,9 @@ class Publisher
     "log"     => -> { LogAdapter.new },
     "noop"    => -> { NoopAdapter.new },
     "webhook" => -> { WebhookAdapter.new(url: ENV.fetch("OUTBOX_WEBHOOK_URL")) }
-    # "kafka"    => -> { KafkaAdapter.new(...) }
-    # "rabbitmq" => -> { RabbitAdapter.new(...) }
+    # "kafka"    => -> { KafkaAdapter.new(...) }      # ruby-kafka / rdkafka
+    # "rabbitmq" => -> { RabbitAdapter.new(...) }     # bunny
+    # "sns"      => -> { SnsAdapter.new(...) }        # aws-sdk-sns
   }.freeze
 
   def self.build(name = ENV.fetch("OUTBOX_ADAPTER", "log"))
@@ -259,6 +273,11 @@ def publisher = Outbox::Publisher.build
 ```
 <sub>`app/jobs/outbox/publish_pending_job.rb:74`</sub>
 
+Aclaración honesta: hoy la app **no** ejerce el registro. `OUTBOX_ADAPTER` no está
+seteado en ningún entorno, así que `Publisher.build` siempre devuelve
+`LogAdapter`. El valor de la estructura es que agregar Kafka mañana no toca ni el
+job ni ningún service; no que haya tres adapters rotando en producción.
+
 ### 3.4 Otras tablas de datos que reemplazan condicionales
 
 El repo usa la misma técnica en varios lugares. Todas son "agregá una fila, no
@@ -266,10 +285,10 @@ toques la lógica":
 
 | Tabla | Archivo | Qué evita |
 |---|---|---|
-| `STATUS_FOR` (código de error → HTTP) | `app/controllers/concerns/api/error_handling.rb:38` | Un `case` de 18 ramas en cada controller |
+| `STATUS_FOR` (código de error → HTTP) | `app/controllers/concerns/api/error_handling.rb:38` | Un `case` de 17 ramas en cada controller |
 | `SORTS` (nombre → cláusula ORDER BY) | `app/queries/products/search.rb:25` | Interpolar `params[:sort]` en SQL (inyección) |
 | `TRANSITIONS` (estado → estados válidos) | `app/models/stock_transfer.rb:35`, `purchase_order.rb:27` | `if status == "draft" && ...` repartido |
-| `MOVEMENT_STYLES` / `STATUS_STYLES` | `app/helpers/application_helper.rb:9` y `:20` | Clases de Tailwind duplicadas en 6 vistas |
+| `MOVEMENT_STYLES` / `STATUS_STYLES` | `app/helpers/application_helper.rb:9` y `:20` | Clases de Tailwind duplicadas en las 9 vistas que usan los badges |
 | `ROLE_RANK` (rol → nivel) | `app/models/user.rb:51` | Comparaciones de rol a mano en cada policy |
 
 ### 3.5 El equivalente Java, y dónde se rompe
@@ -439,8 +458,9 @@ class Recorder
 ```
 <sub>`app/services/outbox/recorder.rb:17`</sub>
 
-Esa es **toda** la interfaz que ven los 12 services. Y por eso implementarla
-completa cuesta cuatro líneas:
+Esa es **toda** la interfaz que ven los 11 services que emiten eventos (el
+doceavo, `Stock::ItemResolver`, no emite ninguno y por eso no recibe recorder).
+Y por eso implementarla completa cuesta siete líneas:
 
 ```ruby
 class NullRecorder
@@ -460,8 +480,9 @@ La regla operativa: **el tamaño de la interfaz es el costo de cada test**. Si e
 doble es caro de escribir, la interfaz es demasiado grande.
 
 Lo mismo con los adapters del publisher: `publish(message)`, un método. El
-`NoopAdapter` que usa el spec del job agrega sólo un `attr_reader :published`
-para poder inspeccionar (`spec/jobs/outbox_publish_pending_job_spec.rb:6`).
+`NoopAdapter` agrega sólo un `attr_reader :published` para poder inspeccionar
+(`app/services/outbox/publisher.rb:41`); es el que instancia el spec del job
+(`spec/jobs/outbox_publish_pending_job_spec.rb:6`).
 
 Y con los serializers: `#as_json` + `.collection`.
 
@@ -545,7 +566,7 @@ def initialize(stock_item:, kind:, quantity:, reserved_delta: 0,
                idempotency_key: nil, occurred_at: nil, metadata: {},
                event_recorder: Outbox::Recorder.new, clock: Time)
 ```
-<sub>`app/services/stock/apply_movement.rb:42` — los 12 services siguen el mismo patrón</sub>
+<sub>`app/services/stock/apply_movement.rb:42` — 11 de los 12 services siguen el mismo patrón; `Stock::ItemResolver` es el único sin dependencias inyectadas, porque no toca reloj ni eventos</sub>
 
 Dos dependencias inyectadas, con default de producción:
 
@@ -617,8 +638,8 @@ normal, se lee en la firma, y no requiere XML, anotaciones ni reflection.
    `@Cacheable`. Cada service escribe `transactional do` a mano. El lado bueno:
    no existe el bug de auto-invocación del proxy de Spring.
 4. **El wiring está desparramado.** No hay un `ApplicationConfig` donde veas el
-   grafo completo: está en 12 firmas de constructor. Cambiar el recorder por
-   defecto son 12 ediciones. Cuando eso empieza a doler, la respuesta idiomática
+   grafo completo: está en 11 firmas de constructor. Cambiar el recorder por
+   defecto son 11 ediciones. Cuando eso empieza a doler, la respuesta idiomática
    es una constante o una fábrica (que es exactamente lo que ya hace
    `Outbox::Publisher.build`), no meter un container.
 5. **Nada impide saltear la inyección.** `Outbox::Recorder.new.record(...)` está
@@ -650,7 +671,7 @@ class << self
   def call(...) = new(...).call
 end
 ```
-<sub>`app/services/application_service.rb:55` — `(...)` es *argument forwarding* de Ruby 3: reenvía posicionales, keywords y bloque sin enumerarlos</sub>
+<sub>`app/services/application_service.rb:55` — `(...)` es *argument forwarding*, de Ruby 2.7 en adelante (Ruby 3.0 sumó poder anteponerle argumentos: `def call(x, ...)`): reenvía posicionales, keywords y bloque sin enumerarlos</sub>
 
 **Java**: `@Service` + `@Transactional`, o el `Command` del CQRS.
 **Diferencia**: acá `call` es una convención, no una interfaz. Y `ApplicationService`
@@ -751,7 +772,7 @@ DTO no persiste nada.
 ### 7.4 Policy (Strategy)
 
 **Qué es**: una clase por recurso, un método por acción, que responde sí o no.
-**Dónde**: `app/policies/` — 8 clases + `ApplicationPolicy`.
+**Dónde**: `app/policies/` — 9 clases + `ApplicationPolicy`.
 
 ```ruby
 def index?   = viewer?
@@ -915,11 +936,10 @@ está `fail!`:
 ```ruby
 ApplyMovement.call(...).tap { |r| fail!(r.error.code, r.error.message, **r.error.details) if r.failure? }
 ```
-<sub>el patrón que repiten `Receive`, `Issue`, `Adjust`, `CommitReservation`, `Dispatch` y `ReceiveOrder`</sub>
+<sub>`app/services/stock/issue.rb:39`. Los otros seis que llaman a un sub-service hacen lo mismo; la mitad con una variable local en vez del `.tap`: `CommitReservation:61`, `Transfers::Dispatch:60` y `:68`, `Transfers::Receive:70`, `:79` y `:91`, `Purchasing::ReceiveOrder:57`</sub>
 
-`then_try` sirve para componer **fuera** de una transacción (validaciones previas,
-orquestación de varios services independientes). Saber por qué no está usado
-adentro es exactamente lo que distingue a alguien que leyó el código.
+`then_try` sirve para componer **fuera** de una transacción: validaciones previas,
+u orquestación de varios services independientes entre sí.
 
 Otros dos detalles del `Result`:
 
@@ -980,10 +1000,11 @@ Por qué un Null Object y no un `double`:
 - **Expresa la intención**: `Outbox::NullRecorder.new` se lee mejor que
   `double(record: nil)`.
 
-Se usa 15 veces, repartidas en 9 archivos de la suite: `spec/services/stock/`,
-`spec/jobs/stock_jobs_spec.rb`, `spec/queries/stock_queries_spec.rb`,
-`spec/integration/concurrency_spec.rb` y `spec/system/transfer_with_js_spec.rb`
-(`grep -rc NullRecorder spec/`).
+Se lo nombra 16 veces, repartidas en 10 archivos de la suite: los cinco de
+`spec/services/stock/`, más `spec/jobs/stock_jobs_spec.rb`,
+`spec/queries/stock_queries_spec.rb`, `spec/integration/concurrency_spec.rb`,
+`spec/requests/api/v1/endpoint_coverage_spec.rb` y
+`spec/system/transfer_with_js_spec.rb` (`grep -rn NullRecorder spec/`).
 
 **Java**: `Objects.requireNonNullElse(x, NoOpRecorder.INSTANCE)`, o el
 `Collections.emptyList()` de siempre. Mismo patrón, mismo motivo.
@@ -1174,10 +1195,11 @@ def can_transition_to?(new_status) = TRANSITIONS.fetch(status, []).include?(new_
 ```
 <sub>`app/models/stock_transfer.rb:20` y `:35`; lo mismo en `purchase_order.rb:16` y `:27` con 5 estados</sub>
 
-**Por qué a mano y no con `aasm` / `state_machines`**: para 4 estados y 3
-transiciones, la gema es más peso conceptual que ayuda (DSL propio, callbacks
-implícitos, otra cosa que aprender para leer el modelo). Lo que importa es que las
-transiciones sean **explícitas y testeadas**, y eso lo tenés con un hash congelado.
+**Por qué a mano y no con `aasm` / `state_machines`**: para 4 estados y 4
+transiciones (y 5 estados con 7 transiciones en `PurchaseOrder`), la gema es más
+peso conceptual que ayuda —DSL propio, callbacks implícitos, otra cosa que
+aprender para leer el modelo—. Lo que importa es que las transiciones sean
+**explícitas y testeadas**, y eso lo tenés con un hash congelado.
 
 **Cuándo cambiaría de opinión**: cuando necesites callbacks por transición,
 guardas condicionales, o un historial de transiciones auditables. Ahí la gema paga.
@@ -1197,7 +1219,7 @@ te cubre el caso de un estado desconocido sin explotar.
 | Service Object (Command) | `app/services/` (12) | `@Service` + `@Transactional` | Cuando es un método de 3 líneas sin transacción |
 | Query Object | `app/queries/` (6) | `@Repository` + `@Query` | Un filtro simple: usá un scope |
 | Form Object | `app/forms/` (2) | `@Valid` RequestDTO | La entrada mapea 1:1 al modelo |
-| Policy (Strategy) | `app/policies/` (8) | `@PreAuthorize` | Nunca: la autorización siempre merece su clase |
+| Policy (Strategy) | `app/policies/` (9) | `@PreAuthorize` | Nunca: la autorización siempre merece su clase |
 | Serializer | `app/serializers/` (6) | DTO + Jackson | Nunca en una API pública |
 | Value Object | `value_objects/money.rb`, `quantity.rb` | `record` / `@Embeddable` | Un `Integer` sin invariantes ni unidad |
 | Result / Either | `app/lib/result.rb` | `Either` de Vavr | Fallas inesperadas: ahí va excepción |
@@ -1275,15 +1297,19 @@ Ruby tiene convenciones que no existen en Java y que un revisor espera ver.
 | `snake_case` para métodos y variables | — | `quantity_on_hand` |
 | `CamelCase` para clases, `SCREAMING` para constantes | — | `StockItem`, `MAX_ATTEMPTS` |
 | `?` al final | devuelve un booleano | `#discarded?`, `#below_reorder_point?`, `#terminal?` |
-| `!` al final | **la versión peligrosa de un par**, no "muta" | `#save!` vs `#save`, `#discard!` |
+| `!` al final | **la versión peligrosa de un par**, no "muta" | `#save!` vs `#save`, `Result#value!` |
 | `_` prefijo | argumento que no se usa | `def deconstruct_keys(_keys)` |
 | `@` | variable de instancia | `@stock_item_id` |
 
 El `!` es el que más se malinterpreta viniendo de otros lenguajes. **No significa
 "muta el objeto"**: significa "hay un par de métodos y este es el que sorprende"
-—normalmente porque levanta excepción en vez de devolver `false`—. `Array#flatten!`
-muta *y* devuelve `nil` si no hubo cambios; `StockItem#find_or_provision!` no muta
-nada y el `!` está porque puede levantar `RecordNotFound`.
+—normalmente porque levanta excepción en vez de devolver `false` o `nil`—.
+`Array#flatten!` muta *y* devuelve `nil` si no hubo cambios. `Result#value!`
+(`app/lib/result.rb:81`) es el caso puro en este repo: **no muta nada** (el
+`Result` está congelado), y el `!` está sólo porque levanta `Result::Failure` en
+vez de devolverte el error como valor. Y `StockItem.find_or_provision!` (`:121`)
+sí escribe, pero el `!` está por el `create!` / `find_by!` que pueden explotar, no
+por la escritura.
 
 Nombres que se leen bien en este repo: `find_or_provision!`,
 `atomically_decrement`, `lock_items_in_order`, `replayed_movement`,
@@ -1409,11 +1435,14 @@ tipos.
 # frozen_string_literal: true
 ```
 
-Es la primera línea de todo el código que escribimos a mano: 160 de los 183
-archivos `.rb` del repo. Los 23 que no lo tienen son los que generó Rails
-(`sessions_controller.rb`, `passwords_mailer.rb`, `application_cable/connection.rb`,
-las migraciones…) y es una inconsistencia que vale la pena arreglar, porque el
-comentario es **por archivo**: que lo tenga el 87% no protege al 13% restante.
+Es la primera línea de casi todo el código del repo: 165 de los 188 archivos
+`.rb`. Los 23 que no lo tienen son los que generó Rails y nadie retocó — los 13
+de `config/` (`application.rb`, `boot.rb`, `puma.rb`, los `environments/`…), los
+cuatro `db/*schema.rb`, `sessions_controller.rb`, `passwords_controller.rb`, el
+concern `authentication.rb` y los dos mailers, más
+`application_cable/connection.rb`. Las migraciones **sí** lo tienen. Es una
+inconsistencia que vale la pena arreglar, porque el comentario es **por
+archivo**: que lo tenga el 88% no protege al 12% restante.
 
 Qué hace: congela los literales de string de ese archivo. Menos objetos, menos GC,
 y **una mutación accidental explota** en vez de corromper algo lejano. En Ruby 3.3
@@ -1442,7 +1471,7 @@ end
 
 ### 9.8 Qué mide realmente RuboCop
 
-Esto es importante y casi nadie lo sabe. El repo usa el preset oficial de Rails 8:
+El repo usa el preset oficial de Rails 8:
 
 ```yaml
 # .rubocop.yml
@@ -1454,7 +1483,7 @@ Corrí el análisis y lo desarmé:
 ```bash
 export PATH="/opt/rbenv/versions/3.3.6/bin:$PATH"
 bundle exec rubocop
-# => 181 files inspected, no offenses detected
+# => 188 files inspected, no offenses detected
 ```
 
 ```text
@@ -1512,7 +1541,7 @@ requerido en `.rubocop.yml`: el reporte muestra 0 cops de RSpec cargados).
 
 | # | Síntoma | Causa real | Arreglo |
 |---|---|---|---|
-| 1 | Una transferencia falló a mitad y quedaron líneas commiteadas | Alguien llamó a un sub-service y **no** cortó con `fail!`. La transacción anidada se **une** a la externa: que el hijo devuelva `Result.failure` no revierte nada | Todo llamado a un sub-service termina en `.tap { \|r\| fail!(r.error.code, r.error.message, **r.error.details) if r.failure? }` (`app/services/stock/issue.rb:39`) |
+| 1 | Una transferencia falló a mitad y quedaron líneas commiteadas | Alguien llamó a un sub-service y **no** cortó con `fail!`. La transacción anidada se **une** a la externa: que el hijo devuelva `Result.failure` no revierte nada | Todo llamado a un sub-service termina en un `fail!` si el hijo devolvió failure, sea con `.tap` (`app/services/stock/issue.rb:39`) o con variable local (`transfers/dispatch.rb:60`) |
 | 2 | Se escribió stock sin pasar por `ApplyMovement` y `SUM(movements) != quantity_on_hand` | Alguien hizo `item.update!(quantity_on_hand: n)` desde un script o la consola | `StockItems::Reconciliation` lo detecta; lo corre `Stock::ReconcileBalancesJob`. Si devuelve una sola fila, hay un bug |
 | 3 | Un `Result.failure` de un service viaja al cliente como 500 | El código de error no está en `STATUS_FOR` y cae en el default | Agregá la fila en `app/controllers/concerns/api/error_handling.rb:38`. El default es 422, así que el síntoma más común es "422 donde debería ser 404 o 409" |
 | 4 | `NameError: uninitialized constant Outbox::NullRecorder` en desarrollo, pero en producción anda | La clase estaba anidada en otro archivo. Zeitwerk carga por demanda; `eager_load` en producción la salvaba | Un archivo por constante (`app/services/outbox/null_recorder.rb:18`). `zeitwerk:check` **no** lo detecta |
@@ -1538,7 +1567,7 @@ requerido en `.rubocop.yml`: el reporte muestra 0 cops de RSpec cargados).
 > Con capas que Rails no te da y hay que crear: `services/` para casos de uso,
 > `queries/` para lecturas complejas, `forms/` para entradas que no mapean 1:1,
 > `policies/` para autorización y `serializers/` para la salida. En esta app son
-> 12 services, 6 queries, 2 forms, 8 policies y 6 serializers. El modelo se queda
+> 12 services, 6 queries, 2 forms, 9 policies y 6 serializers. El modelo se queda
 > con lecturas derivadas, validaciones de forma, scopes y primitivas de
 > persistencia. Mi regla para decidir: **si el método necesita una transacción, es
 > un caso de uso, no del modelo**.
@@ -1556,9 +1585,10 @@ requerido en `.rubocop.yml`: el reporte muestra 0 cops de RSpec cargados).
 > que poner yo.
 >
 > El ejemplo concreto: `Stock::ApplyMovement` es el único lugar del sistema que
-> cambia una cantidad. Cuando pidieron "prohibir movimientos sobre productos dados
-> de baja", fue **una línea en un archivo** y los 5 services que dependen de él la
-> heredaron sin tocarse. Si la lógica estuviera repartida en el modelo y los
+> mueve stock físico y escribe el ledger (las reservas, que sólo comprometen,
+> tocan `quantity_reserved` aparte). Cuando pidieron "prohibir movimientos sobre
+> productos dados de baja", fue **una línea en un archivo** y los 7 services que
+> dependen de él la heredaron sin tocarse. Si la lógica estuviera en el modelo y los
 > controllers, hubiera sido buscar en 40 archivos.
 
 **"Vos venís de Spring. ¿Cómo hacés inyección de dependencias sin container?"**
@@ -1573,7 +1603,7 @@ requerido en `.rubocop.yml`: el reporte muestra 0 cops de RSpec cargados).
 > (Spring te falla en el arranque, acá te enterás en la primera llamada), no hay
 > scopes —`Outbox::Recorder.new` se instancia **en cada llamada**, que acá da igual
 > porque no tiene estado, pero si tuviera un pool sería un bug silencioso—, no hay
-> AOP declarativo, y el wiring está desparramado en 12 constructores en vez de en
+> AOP declarativo, y el wiring está desparramado en 11 constructores en vez de en
 > un `ApplicationConfig`.
 
 **"¿Por qué `Result` y no excepciones?"**

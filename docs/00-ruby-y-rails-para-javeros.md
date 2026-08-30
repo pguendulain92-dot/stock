@@ -28,7 +28,8 @@ Integer.class      # => Class        <- la clase también es un objeto
 ```
 
 Como `nil` responde mensajes (`nil.to_a` → `[]`), el estilo defensivo cambia: donde en Java
-escribís `if (x != null && x.isEmpty())`, en Ruby escribís `x.blank?` y funciona con `nil`.
+escribís `if (x == null || x.isEmpty())`, en Ruby escribís `x.blank?` — una sola llamada que
+ya contempla el `nil`.
 
 Tampoco hay `static`: lo que parece uno es un método en la **clase singleton** del
 objeto-clase (`app/lib/result.rb:43-47`):
@@ -55,11 +56,11 @@ No hay resolución estática: `obj.foo(1)` es `obj.send(:foo, 1)`, y el intérpr
 skip_authorization if respond_to?(:skip_authorization, true)
 ```
 
-Ese `true` incluye métodos privados. El concern funciona en un controller con Pundit y en
-uno sin, sin `instanceof` ni interfaz opcional. En Java sería
+Ese `true` incluye métodos privados. El concern funciona en un controller con Pundit y en uno
+sin, sin `instanceof` ni interfaz opcional: en Java sería
 `try { getClass().getDeclaredMethod(...) } catch (NoSuchMethodException e) {}`.
 
-Y con símbolos calculados en runtime (`app/models/concerns/has_money.rb:31-32`):
+Y con símbolos calculados en runtime (`app/models/concerns/has_money.rb:30-33`):
 
 ```ruby
 ValueObjects::Money.new(cents: public_send(cents_column) || 0,
@@ -76,13 +77,15 @@ Cualquier clase, del core o de una gema, se puede reabrir. No es un hack, es el 
 ```ruby
 class Rack::Attack
   class Request < ::Rack::Request
-    def remote_ip = @remote_ip ||= (env["action_dispatch.remote_ip"] || ip).to_s
+    def remote_ip
+      @remote_ip ||= (env["action_dispatch.remote_ip"] || ip).to_s
+    end
   end
 end
 ```
 
-Le agregamos un método a una clase de terceros. En Java harías un wrapper, un decorator, o
-un agente que toque bytecode. Rails usa esto a lo grande:
+Le agregamos un método a una clase de terceros: en Java, un wrapper, un decorator o un agente
+que toque bytecode. Rails usa esto a lo grande:
 
 ```bash
 $ bin/rails runner 'puts Object.ancestors.inspect'
@@ -98,7 +101,7 @@ de `Object` (o sea, `prepend`eado). Eso es lo que hace funcionar `5.days.ago`,
 **Dónde se rompe:** el parche es global al proceso. Si dos gemas parchean el mismo método,
 gana la última cargada y no hay warning. Java tiene shading, classloaders y JPMS para
 evitarlo; Ruby no tiene nada equivalente. Por eso
-`config/initializers/rack_attack.rb:41-44` documenta *por qué* ese parche está permitido
+`config/initializers/rack_attack.rb:39-44` documenta *por qué* ese parche está permitido
 (la propia doc de la gema lo recomienda).
 
 ### 1.4 Duck typing en vez de interfaces
@@ -141,7 +144,7 @@ class Product < ApplicationRecord
 
 Composición: `Product` no "es un" descartable, "tiene" comportamiento descartable. A
 diferencia de la herencia múltiple de C++, los módulos se **linealizan**: no hay diamante
-ambiguo, hay un orden determinado y consultable.
+ambiguo, hay un orden determinado y consultable con `ancestors`.
 
 ---
 
@@ -153,15 +156,17 @@ En Java la jerarquía es un árbol de clases más un set plano de interfaces. En
 lista ordenada** que podés imprimir:
 
 ```bash
-$ bin/rails runner 'puts StockItem.ancestors.first(4).inspect'
-[StockItem, StockItem::GeneratedAssociationMethods, StockItem::GeneratedAttributeMethods,
- ApplicationRecord(abstract)]
+$ bin/rails runner 'p StockItem.ancestors.first(4).map(&:name)'
+["StockItem", "StockItem::GeneratedAssociationMethods",
+ "StockItem::GeneratedAttributeMethods", "ApplicationRecord"]
 ```
 
-`GeneratedAttributeMethods`: Rails leyó el esquema de Postgres al bootear, generó un módulo
-anónimo con `#sku`, `#sku=`, `#sku_changed?` y lo insertó en la cadena. Sin proxies
-dinámicos, sin bytecode generation, sin `@Entity` procesado por un annotation processor: es
-un módulo más.
+(Uso `.map(&:name)` porque `inspect` de una clase de ActiveRecord te imprime el esquema
+entero.) `GeneratedAttributeMethods`: Rails lee el esquema de Postgres —**perezosamente**, la
+primera vez que se usa el modelo, no al bootear; en dev podés ver la clase sin cargar y dice
+`call 'StockItem.load_schema'`— genera un módulo anónimo con `#sku`, `#sku=`, `#sku_changed?`
+y lo inserta en la cadena. Sin proxies dinámicos, sin bytecode generation, sin `@Entity`
+procesado por un annotation processor: es un módulo más.
 
 ```bash
 $ bin/rails runner 'puts ValueObjects::Money.ancestors.first(6).inspect'
@@ -286,8 +291,8 @@ def combine(other)                                # money.rb:104
 end
 ```
 
-`apply_if` mata el `relation = relation.where(...) if x.present?` repetido ocho veces en un
-query object con filtros opcionales.
+`apply_if` mata el `relation = relation.where(...) if x.present?` repetido en un query object
+con filtros opcionales; acá lo usa `app/queries/products/search.rb:47-48`.
 
 Ese último es "template method con bloque": `combine` centraliza la validación de moneda y
 el `with`; el bloque aporta la única línea que cambia. En Java serían dos métodos con la
@@ -315,9 +320,11 @@ by: -> { current_api_token&.id || request.remote_ip }         # base_controller.
 El último es un `Supplier<LogAdapter>` en un `Map`: una factory sin `@Configuration`, sin
 `@Bean`, sin container.
 
-**Por qué los scopes son lambdas:** `scope :active, where(...)` evaluaría el `where` una
-sola vez al cargar la clase y congelaría `Time.current`. El lambda se evalúa en cada
-llamada. Es el mismo bug que un `static final Date HOY = new Date()`.
+**Por qué los scopes son lambdas:** sin el `->`, el `where` se evaluaría una sola vez al
+cargar la clase y congelaría cualquier `Time.current` que tenga adentro — el mismo bug que un
+`static final Date HOY = new Date()`. Rails ya no te deja hacerlo: `scope :active, where(...)`
+levanta `ArgumentError: The scope body needs to be callable.` (comprobado). El lambda se
+evalúa en cada llamada.
 
 ### 3.3 El operador `&` y `Symbol#to_proc`
 
@@ -337,12 +344,10 @@ Java: `Arrays.stream(KINDS).collect(toMap(identity(), identity()))`.
 ### 3.4 Comparación con las lambdas de Java 8
 
 Tres diferencias que importan: (a) la lambda de Java tiene tipo verificado, el bloque de Ruby
-no tiene ninguno; (b) Java no tiene el concepto de "bloque implícito por llamada", que es lo
-que hace que `yield` sea tan barato de escribir; (c) Java sólo captura variables
-*effectively final*, mientras que un bloque de Ruby es una closure real y **puede mutar** el
-entorno. Esa última es la más peligrosa: Java lo prohíbe justamente para no romper la
-concurrencia. Bonus: como en Ruby no hay checked exceptions, desaparece la pesadilla de
-lanzar una excepción declarada dentro de un `Function`.
+no tiene ninguno; (b) Java no tiene "bloque implícito por llamada", que es lo que hace que
+`yield` sea tan barato de escribir; (c) Java sólo captura variables *effectively final*,
+mientras que un bloque de Ruby es una closure real y **puede mutar** el entorno. La última es
+la peligrosa: Java lo prohíbe justamente para no romper la concurrencia.
 
 ---
 
@@ -352,8 +357,9 @@ Un `Symbol` (`:sku`) es un identificador internado e inmutable, único por proce
 `String` es una secuencia de bytes mutable. Lo más cercano en Java es `String.intern()` o
 un `enum`, pero con sintaxis de primera clase.
 
-Medición real en este repo, con el GC desactivado para que los números sean limpios
-(100.000 iteraciones de cada forma, contando `T_STRING` nuevos):
+Medición real con el Ruby 3.3.6 de este entorno, en un script con `# frozen_string_literal:
+true` y el GC desactivado para que los números salgan limpios (100.000 iteraciones de cada
+forma, contando los `T_STRING` nuevos con `ObjectSpace.count_objects`):
 
 ```text
 literal congelado ("clave")   :      27 strings   # frozen_string_literal: true activo
@@ -361,17 +367,23 @@ copia mutable    (+"clave")   : 100 000 strings
 interpolación    ("cl#{1}ave"): 100 000 strings
 símbolo          (:clave)     :       0 strings
 
-:clave.object_id  estable: true
-"clave".object_id estable: false
+:clave.object_id   estable: true
+"clave".object_id  estable: true    # gracias al literal congelado
++"clave".object_id estable: false   # la copia mutable es un objeto nuevo cada vez
 ```
+
+Ojo con la anteúltima línea: `"clave".object_id` sale estable **porque el archivo tiene el
+comentario mágico**. Sacalo y da `false`, como cualquier literal mutable.
 
 Tres reglas salen de ahí:
 
 1. **Claves de hash y nombres de método/columna → símbolos.** Se comparan por identidad, no
    byte a byte, y no allocan.
-2. **`# frozen_string_literal: true` en la primera línea de cada archivo.** Está en todos
-   los `.rb` de `app/`. Es la optimización con mejor relación beneficio/esfuerzo de Ruby.
-   Efecto secundario: mutar un literal ahora tira `FrozenError`.
+2. **`# frozen_string_literal: true` en la primera línea de cada archivo.** Está en 97 de
+   los 103 `.rb` de `app/` (los 6 que faltan son los que generó `rails generate
+   authentication` y nadie tocó). Es la optimización con mejor relación beneficio/esfuerzo
+   de Ruby. Efecto secundario: mutar un literal ahora tira `FrozenError` — y como no es
+   uniforme, el error aparece sólo en algunos archivos.
 3. **Los símbolos dinámicos sí se recolectan** desde Ruby 2.2. Antes eran un vector de DoS
    (10 millones de claves JSON distintas y llenabas la tabla hasta el OOM).
 
@@ -383,10 +395,11 @@ h["sku"]   # => nil     ← acá se te va la tarde
 h[:sku]    # => "ABC"
 ```
 
-`JSON.parse` devuelve claves **String**; un hash literal usa **Symbol**. Por eso los
-`params` de un controller son un `HashWithIndifferentAccess`, donde las dos formas
-funcionan. Cuando el dato llega de JSON hay que normalizarlo en el borde
-(`app/forms/stock_transfer_form.rb:26`):
+`JSON.parse` devuelve claves **String**; un hash literal usa **Symbol**. Por eso los `params`
+de un controller no son un `Hash`: son un `ActionController::Parameters` (comprobado:
+`params.is_a?(Hash) # => false`) que por dentro guarda un `HashWithIndifferentAccess`, así
+que ahí las dos formas funcionan. En cuanto salís de `params`, se acabó: cuando el dato llega
+de JSON hay que normalizarlo en el borde (`app/forms/stock_transfer_form.rb:26`):
 
 ```ruby
 @normalized_lines ||= Array(lines).map { |l| l.respond_to?(:to_h) ? l.to_h.symbolize_keys : l }
@@ -506,16 +519,19 @@ in { record: IdempotencyKey => fresh }
 end
 ```
 
-Es el `switch` con record patterns de Java 21, con dos diferencias fundamentales:
+Es el `switch` con record patterns de Java 21, con dos diferencias que importan:
 
 - **Matchea estructura, no clase.** `{ replay: true, record: IdempotencyKey => stored }`
   exige que `:replay` valga `true` **y** que `:record` sea un `IdempotencyKey`, y lo liga a
   `stored`. Java necesita tipos sellados declarados de antemano; Ruby matchea sobre hashes
   anónimos.
 - **Si ningún patrón matchea, levanta `NoMatchingPatternError`** en vez de devolver `nil`
-  como `case/when`. Es exhaustividad en runtime en vez de en compilación: peor que Java,
-  infinitamente mejor que un `if` que se olvida un caso. El comentario de las líneas 97-100
-  lo dice: en una máquina de estados, un estado no contemplado tiene que ser **ruidoso**.
+  como `case/when`. (Cuando lo que falta es una clave del hash, la clase concreta es
+  `NoMatchingPatternKeyError`, que hereda de `NoMatchingPatternError` — comprobado, así que
+  rescatar la de arriba alcanza.) Es exhaustividad en runtime en vez de en compilación: peor
+  que Java, infinitamente mejor que un `if` que se olvida un caso. El comentario de las
+  líneas 97-100 lo dice: en una máquina de estados, un estado no contemplado tiene que ser
+  **ruidoso**.
 
 Para que un objeto tuyo sea deconstruible alcanzan dos métodos (`app/lib/result.rb:88-91`):
 
@@ -524,21 +540,26 @@ def deconstruct_keys(_keys) = { ok: @ok, value: @value, error: @error }
 def deconstruct           = [ @ok, @ok ? @value : @error ]
 ```
 
-Verificado contra la base real:
+Verificado contra la base real. El camino feliz va envuelto en una transacción con
+`Rollback` para no dejar un movimiento fantasma en la base de desarrollo (el id que imprime
+igual se consume: las secuencias de Postgres no se revierten):
 
 ```bash
 $ bin/rails runner '
-r = Stock::Receive.call(product: Product.first, warehouse: Warehouse.first, quantity: 3, user: nil)
-case r
-in { ok: true,  value: } then puts "OK -> #{value.class} id=#{value.id} qty_after=#{value.quantity_after}"
-in { ok: false, error: } then puts "FAIL -> #{error.code}: #{error.message}"
+ActiveRecord::Base.transaction do
+  r = Stock::Receive.call(product: Product.first, warehouse: Warehouse.first, quantity: 3, user: nil)
+  case r
+  in { ok: true,  value: } then puts "OK -> #{value.class} id=#{value.id} qty_after=#{value.quantity_after}"
+  in { ok: false, error: } then puts "FAIL -> #{error.code}: #{error.message}"
+  end
+  raise ActiveRecord::Rollback
 end'
-OK -> StockMovement id=101 qty_after=120
+OK -> StockMovement id=1275108 qty_after=135
 
 $ bin/rails runner 'p Stock::Issue.call(product: Product.first, warehouse: Warehouse.first,
                                         quantity: 999_999, user: nil).error.to_h'
-{:code=>:insufficient_stock, :message=>"Stock insuficiente: hay 120, se pidieron 999999",
- :details=>{:available=>105, :requested=>999999, :product_id=>1, :warehouse_id=>1}}
+{:code=>:insufficient_stock, :message=>"Stock insuficiente: hay 132, se pidieron 999999",
+ :details=>{:available=>132, :requested=>999999, :product_id=>1, :warehouse_id=>1}}
 ```
 
 `app/models/concerns/has_money.rb:37-46` usa `case/in` como despachador de tipos, que es
@@ -574,16 +595,18 @@ def to_h = { code:, message:, details: }              # result.rb:38
 def as_json(*) = { cents:, currency:, formatted: to_s }  # money.rb:94
 
 StockMovement.create!(
-  stock_item: item, product_id: item.product_id,
+  stock_item: item, product_id: item.product_id, warehouse_id: item.warehouse_id,
   user:, kind:, quantity:,                            # <- toma las variables/métodos homónimos
   quantity_after: item.quantity_on_hand,
-  unit_cost_cents:, reference:, idempotency_key:, reason:, metadata:, occurred_at: now
+  unit_cost_cents:, currency: item.product.currency,
+  reference:, idempotency_key:, reason:, metadata:, occurred_at: now
 )
 ```
 
 Java no tiene nada parecido; lo más cerca es un builder con nombres repetidos.
 
-**Argument forwarding `(...)`** (3.0) — reenvía posicionales, keywords y bloque:
+**Argument forwarding `(...)`** (2.7, y desde 3.0 admite argumentos antes del `...`) —
+reenvía posicionales, keywords y bloque:
 
 ```ruby
 def call(...) = new(...).call                                    # application_service.rb:56
@@ -636,7 +659,7 @@ hay flag global equivalente. Comprobado: sin el comentario `"lit".frozen? # => f
 | Compilador | ✗ | RuboCop (estilo y algunos errores), Brakeman (seguridad), y **tests** |
 | `interface` | ✗ | Duck typing + tests compartidos (`app/services/outbox/publisher.rb:11-14`) |
 | Sobrecarga de métodos | ✗ | Keyword args con defaults, o `case/in` sobre el tipo (`has_money.rb:37-46`) |
-| `private` real | ✗ | `private` sólo prohíbe el receptor explícito; `obj.send(:m)` lo saltea siempre |
+| `private` real | ✗ | Sólo prohíbe el receptor explícito (`self.` está permitido desde 2.7); `obj.send(:m)` lo saltea siempre |
 | `final` / `sealed` | ✗ | `freeze` (superficial) y disciplina |
 | Genéricos | ✗ | No hacen falta sin tipos; sí los extrañás leyendo código ajeno |
 | Excepciones checked | ✗ | **Todas** son unchecked → ver abajo |
@@ -670,11 +693,12 @@ Es `Either` de Vavr, hecho a mano en 100 líneas.
 CRuby tiene un **GVL** (Global VM Lock): un mutex global por proceso que hay que tener para
 ejecutar bytecode Ruby. Los `Thread` son pthreads de verdad —no green threads— pero se
 turnan. El GVL **se libera** durante I/O bloqueante y en extensiones C que lo sueltan (el
-driver `pg` lo suelta mientras espera a Postgres). Medición real, 4 threads:
+driver `pg` lo suelta mientras espera a Postgres). Medición real en esta máquina (4 cores),
+con `(1..12_000_000).reduce(:+)` como carga CPU y `sleep 0.5` como I/O, 4 tandas:
 
 ```text
-secuencial CPU : 1.51s
-4 threads CPU  : 1.53s      <- CERO ganancia. Y encima un poco peor.
+secuencial CPU : 2.37s
+4 threads CPU  : 2.41s      <- CERO ganancia. Y encima un poco peor.
 secuencial IO  : 2.00s
 4 threads IO   : 0.50s      <- 4x. Escala perfecto.
 ```
@@ -730,7 +754,12 @@ Ahí aparece `PG::ConnectionBad: FATAL: sorry, too many clients already`. Regla 
 
 ```ruby
 class Current < ActiveSupport::CurrentAttributes
-  attribute :session, :api_token, :request_id, :user_agent, :ip_address
+  attribute :session
+  attribute :api_token
+  attribute :request_id
+  attribute :user_agent
+  attribute :ip_address
+
   def user = session&.user || api_token&.user
 end
 ```
@@ -762,12 +791,11 @@ adaptadas.
 
 ### 7.6 Por qué "más threads" no acelera
 
-Tres razones en orden: el **GVL** (el trabajo CPU-bound no paraleliza: 1.51s vs 1.53s), el
-**pool** (con `RAILS_MAX_THREADS=20` y pool de 5, 15 threads esperan y después revientan) y
-**Postgres** (200 conexiones concurrentes no lo hacen ir más rápido, lo hacen pelearse
-consigo mismo). Cuando algo va lento la respuesta es **medir** — el repo trae
-`rack-mini-profiler`, `stackprof` y `memory_profiler` en `:development` — no subir
-`RAILS_MAX_THREADS`.
+Tres cuellos, en orden: el **GVL** (§7.1), el **pool** (§7.3: con `RAILS_MAX_THREADS=20` y
+pool de 5, 15 threads esperan y después revientan) y **Postgres** (200 conexiones concurrentes
+no lo hacen ir más rápido, lo hacen pelearse consigo mismo). Cuando algo va lento la respuesta
+es **medir** — el repo trae `rack-mini-profiler`, `stackprof` y `memory_profiler` en
+`:development` — no subir `RAILS_MAX_THREADS`.
 
 ---
 
@@ -789,13 +817,17 @@ Números reales de este repo:
 
 ```bash
 $ ruby -e 'puts File.read("/proc/self/status")[/VmRSS:\s+(\d+)/,1].to_i / 1024'
-19                       # Ruby pelado: 19 MB
+18                       # Ruby pelado: 18 MB
 $ bin/rails runner '...'
-RSS = 95 MB              # Rails booteado
-objetos vivos: 267 201 ; GC count: 34 ; clases cargadas: 7 945
+RSS = 94 MB              # Rails booteado, entorno de desarrollo
+objetos vivos: ~265 000 ; GC count: 35 ; clases cargadas: 4 649
 ```
 
-95 MB **por worker de Puma**, antes de servir una request. Con 4 workers son 380 MB de piso.
+(`objetos vivos` es `GC.stat[:heap_live_slots]` y baila unos miles entre corridas; `clases`
+es `ObjectSpace.each_object(Class).count` — si contás `Module` en vez de `Class` te da 5 684,
+que es el número que la gente suele citar sin darse cuenta.)
+
+94 MB **por worker de Puma**, antes de servir una request. Con 4 workers son ~376 MB de piso.
 Una JVM de Spring Boot arranca más pesada, pero todos los threads comparten ese costo; en
 Ruby lo pagás N veces, salvo por copy-on-write.
 
@@ -837,7 +869,7 @@ jemalloc justamente por esto.
 | `[1.0,2.0)` | `~> 1.5` ("pessimistic") | `~> 1.5` = `>= 1.5, < 2.0`; `~> 1.5.3` = `>= 1.5.3, < 1.6` |
 | SDKMAN / jenv | rbenv / chruby / mise | Acá hay 3.1.6, 3.2.6 y 3.3.6 instaladas |
 
-El `Gemfile:8-17` de este repo trae el mapeo comentado. Ejemplos de restricciones reales:
+El `Gemfile:6-18` de este repo trae el mapeo comentado. Ejemplos de restricciones reales:
 
 ```ruby
 gem "rails", "~> 8.1.3", ">= 8.1.3.1"   # dos restricciones combinadas
@@ -856,7 +888,7 @@ BUNDLED WITH      4.0.9
 Las gemas con extensiones nativas (`pg`) aparecen con una línea por plataforma
 (`x86_64-linux`, `arm64-darwin`, `x86_64-linux-musl`…): el equivalente a los classifiers.
 
-**`require: false`** (`Gemfile:12-15`) significa "instalala pero **no la cargues** al
+**`require: false`** (`Gemfile:12-16`) significa "instalala pero **no la cargues** al
 bootear". Se usa para herramientas de línea de comandos (`brakeman`, `rubocop`) que no
 tienen por qué estar dentro del proceso de la app: cada gema cargada suma RAM y tiempo de
 boot a **todos** los procesos (web, worker, consola). No hay equivalente directo en Maven.
@@ -894,9 +926,12 @@ Rails pone encima **Zeitwerk**: mapea nombre de constante ↔ ruta por convenci�
 `autoload` del intérprete (perezoso, no escanea nada).
 
 ```bash
-$ bin/rails runner 'puts Rails.autoloaders.main.dirs.sort.map { |d| d.sub(Rails.root.to_s + "/", "") }'
+$ bin/rails runner 'puts Rails.autoloaders.main.dirs.sort
+                        .map { |d| d.sub(Rails.root.to_s + "/", "") }'
+app/channels  app/controllers  app/controllers/concerns  app/events  app/forms
 app/helpers  app/jobs  app/lib  app/mailers  app/models  app/models/concerns
-app/policies  app/queries  app/serializers  app/services  lib  ...
+app/policies  app/queries  app/serializers  app/services  lib
+...y los app/ de las gemas-engine (activestorage, solid_queue, mission_control-jobs…)
 ```
 
 La regla: **cada root es la raíz del namespace, no un segmento de él.**
@@ -913,13 +948,13 @@ $ bin/rails runner 'Result; ValueObjects::Money
 puts Object.const_source_location("Result").inspect
 puts Object.const_source_location("ValueObjects::Money").inspect'
 ["/home/user/stock/app/lib/result.rb", 32]
-["/home/user/stock/app/models/value_objects/money.rb", 23]
+["/home/user/stock/app/models/value_objects/money.rb", 45]
 ```
 
 Diferencias con Java que hay que tener claras:
 
 - **En desarrollo recarga.** `config.eager_load` es `false` en dev (comprobado), así que al
-  editar un archivo la constante se descarta y se recarga sin reiniciar. Es JRebel, gratis.
+  editar un archivo la constante se descarta y se vuelve a cargar sin reiniciar: JRebel gratis.
 - **En producción `eager_load = true`:** todo se carga al bootear, los errores de nombres
   aparecen en el arranque y las páginas quedan listas para el CoW del fork.
 - **Nunca hay dos versiones de la misma clase.** Sin classloaders, sin jar hell. A cambio,
@@ -927,11 +962,10 @@ Diferencias con Java que hay que tener claras:
 
 ### 10.3 No hay contenedor de DI, y no hace falta
 
-La respuesta no es "Ruby no necesita DI". **Sí necesita inversión de dependencias**; lo que
-no necesita es un *contenedor*. En Java el container existe porque armar el grafo a mano es
-inviable: constructores largos, resolución por tipo, scopes, ciclos de vida. Ruby lo resuelve
-con **argumentos por nombre y valores por defecto**
-(`app/services/stock/apply_movement.rb:42-45`):
+La respuesta no es "Ruby no necesita DI". **Sí necesita inversión de dependencias**; lo que no
+necesita es un *contenedor* — que en Java existe porque armar el grafo a mano es inviable
+(constructores largos, resolución por tipo, scopes, ciclos de vida). Ruby lo resuelve con
+**argumentos por nombre y valores por defecto** (`app/services/stock/apply_movement.rb:42-45`):
 
 ```ruby
 def initialize(stock_item:, kind:, quantity:, reserved_delta: 0,
@@ -983,18 +1017,48 @@ motivo está en las líneas 33-51: en la posición 0 correría **antes** de `Rem
 `request.ip` sería la IP del load balancer, así que todos tus usuarios compartirían un
 contador.
 
-⚠️ **Pero mirá el resultado real: `Rack::Attack` aparece DOS VECES.** La segunda la agrega el
+⚠️ **Mirá el resultado real: `Rack::Attack` aparece DOS VECES.** La segunda la agrega el
 railtie de la gema (`rack-attack-6.8.0/lib/rack/attack/railtie.rb`, que hace
-`app.middleware.use(Rack::Attack)`). Con las dos instancias en la cadena, cada request pasa
-por el throttle dos veces y cada contador se incrementa el doble: un límite de 300 corta
-cerca de 150. Es **el mismo bug** que `app/controllers/api/v1/base_controller.rb:59-74`
-documenta para el `rate_limit` nativo cuando te olvidás el `name:`. Lo encontré corriendo
-`bin/rails middleware`, que es exactamente para lo que sirve el comando. El arreglo:
+`app.middleware.use(Rack::Attack)`); el `insert_after` de la app no reemplaza esa inserción,
+la suma.
+
+El instinto dice "entonces cada request pasa por el throttle dos veces y todos los contadores
+se incrementan el doble". **Lo medí y es falso**, y el porqué es la parte que vale: la gema es
+idempotente a propósito. `rack-attack-6.8.0/lib/rack/attack.rb:104-107` arranca así:
+
+```ruby
+def call(env)
+  return @app.call(env) if !self.class.enabled || env["rack.attack.called"]
+
+  env["rack.attack.called"] = true
+```
+
+La primera instancia marca el `env`; la segunda se ve marcada y pasa de largo. Comprobado
+empujando 3 requests por el stack completo con `Rack::MockRequest`, con un `alias` sobre
+`Rack::Attack#call` para ver cada pasada, y leyendo después el contador del store:
+
+```text
+>> Rack::Attack#call (rack.attack.called=nil)    <- hace el trabajo
+>> Rack::Attack#call (rack.attack.called=true)   <- no-op
+   (idem para las requests 2 y 3)
+CONTADOR req/ip tras 3 requests = 3              <- 3, no 6
+```
+
+O sea: el duplicado **no rompe los límites**, pero sí es basura en la cadena — un frame de
+Rack por request y una trampa para el que lea `bin/rails middleware` y saque la conclusión
+apurada. Vale sacarlo:
 
 ```ruby
 config.middleware.delete Rack::Attack
 config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
 ```
+
+La lección transferible, y la respuesta buena en una entrevista: **un middleware que se puede
+montar dos veces tiene que ser idempotente**, y la marca en el `env` es el patrón estándar
+para lograrlo — es literalmente lo que hace `OncePerRequestFilter` de Spring con un atributo
+del request. Cuando el componente *no* trae esa guarda, el doble conteo sí ocurre: es el caso
+del `rate_limit` nativo de Rails sin `name:` que documenta
+`app/controllers/api/v1/base_controller.rb:59-74`.
 
 ### 10.5 ActiveRecord vs JPA: **acá se rompe la analogía**
 
@@ -1064,32 +1128,35 @@ En JPA se resuelve con `@Generated` + `refresh()`; acá hay que hacerlo a mano.
 
 ## 11. Herramientas del día a día
 
-**`bin/rails console`** — el REPL contra la base real, con toda la app cargada. Es *la*
-herramienta: probás un query object, mirás el SQL que genera, llamás a un service,
-inspeccionás un `Result`. Todo este documento lo verifiqué así.
-`bin/rails console --sandbox` abre una transacción al arrancar y hace `ROLLBACK` al salir —
-la forma de tocar producción sin romper nada. No hay equivalente en Java: `jshell` no tiene
-tu contexto de Spring cargado, y un `@SpringBootTest` no es interactivo.
+**`bin/rails console`** — el REPL contra la base real, con toda la app cargada: probás un
+query object, mirás el SQL que genera, llamás a un service, inspeccionás un `Result`. Todo
+este documento se verificó así. `bin/rails console --sandbox` abre una transacción al arrancar
+y hace `ROLLBACK` al salir — la forma de tocar producción sin romper nada. No hay equivalente
+en Java: `jshell` no tiene tu contexto de Spring cargado y un `@SpringBootTest` no es
+interactivo.
 
 **`bin/rails runner`** — `java -cp app.jar com.foo.Main` sin escribir un `Main`. Para
 backfills, cron simples y verificar afirmaciones:
 `bin/rails runner 'puts StockItem.ancestors.first(3).inspect'`.
 
-**El debugger** — el gem `debug` (oficial desde 3.1) está en el `Gemfile` cargado como
+**El debugger** — el gem `debug` (default gem desde Ruby 3.1) está en el `Gemfile:139` con
 `require: "debug/prelude"`. Poné `binding.break` y el proceso para con un REPL completo:
 `n`/`s`/`fin` son step over/into/out, y remoto es `rdbg --open --port 12345 -- bin/rails s`.
 La ventaja que Java no tiene: en el breakpoint no evaluás expresiones en una caja aparte,
 **estás en el proceso** — podés redefinir un método o mutar el objeto.
 
-**`bin/rails routes`** — 121 líneas en esta app, cuatro columnas: helper, verbo, patrón,
-`controller#action`. Es el mapa de endpoints centralizado que en Spring reconstruís leyendo
-`@RequestMapping` desperdigados o mirando `/actuator/mappings`.
+**`bin/rails routes`** — 127 líneas en esta app (2 de encabezado, 125 rutas), cuatro columnas:
+helper, verbo, patrón, `controller#action`. Es el mapa de endpoints centralizado que en Spring
+reconstruís leyendo `@RequestMapping` desperdigados o mirando `/actuator/mappings`.
 
 ```text
-api_v1_stock_receive POST /api/v1/stock/receive  api/v1/stock_operations#receive {:format=>:json}
-  api_v1_stock_issue POST /api/v1/stock/issue    api/v1/stock_operations#issue   {:format=>:json}
- api_v1_stock_adjust POST /api/v1/stock/adjust   api/v1/stock_operations#adjust  {:format=>:json}
+api_v1_stock_receive POST /api/v1/stock/receive(.:format)  api/v1/stock_operations#receive {:format=>:json}
+  api_v1_stock_issue POST /api/v1/stock/issue(.:format)    api/v1/stock_operations#issue   {:format=>:json}
+ api_v1_stock_adjust POST /api/v1/stock/adjust(.:format)   api/v1/stock_operations#adjust  {:format=>:json}
 ```
+
+El `(.:format)` no es adorno: es el segmento opcional que hace que `/products/1.json` y
+`/products/1` peguen en la misma acción.
 
 **`bin/rails middleware`** — el `/actuator/mappings` de los filtros: el orden exacto de la
 cadena. Cada vez que un middleware "no anda", el primer comando es este (§10.4).
@@ -1110,7 +1177,8 @@ cadena. Cada vez que un middleware "no anda", el primer comando es este (§10.4)
 ## Errores que ves en producción
 
 **1. Mutar un literal de string con `frozen_string_literal: true`.** *Síntoma:*
-`FrozenError: can't modify frozen String`, sólo en algunos archivos. *Arreglo:* `+"texto"`
+`FrozenError: can't modify frozen String`, sólo en algunos archivos (acá: 97 de 103 lo
+tienen). *Arreglo:* `+"texto"`
 (unary plus) o `String.new`; mejor todavía, no mutes strings.
 
 **2. `.to_i` sobre entrada del usuario.** *Síntoma:* `"abc".to_i == 0` y
@@ -1156,10 +1224,14 @@ límite de 100 corta cerca de 400, inconsistente: cada proceso tiene su contador
 Redis o Solid Cache (`app/controllers/api/v1/base_controller.rb:46-57`).
 
 **11. Dos declaraciones de rate limit que comparten clave.** *Síntoma:* un límite de 20 corta
-en 10, porque cada request incrementa dos veces. Pasa con `rate_limit` sin `name:`
-(verificado y documentado en `app/controllers/api/v1/base_controller.rb:59-74`) y con un
-middleware duplicado — `bin/rails middleware` muestra `Rack::Attack` dos veces en esta app.
-*Arreglo:* `name:` distinto por límite; `config.middleware.delete` antes del `insert_after`.
+en 10, porque cada request incrementa el mismo contador dos veces. Pasa con el `rate_limit`
+nativo de Rails sin `name:`, porque la clave es
+`["rate-limit", scope, name, by].compact.join(":")` y sin `name` las dos declaraciones la
+arman igual (verificado y documentado en `app/controllers/api/v1/base_controller.rb:59-74`).
+*Arreglo:* `name:` distinto por límite. *Falso positivo relacionado:* `bin/rails middleware`
+muestra `Rack::Attack` dos veces en esta app y **no** duplica los contadores — la gema se
+protege con `env["rack.attack.called"]` (§10.4). Sacá igual el duplicado, pero no lo
+diagnostiques como doble conteo sin medirlo.
 
 **12. Pool de conexiones menor que `RAILS_MAX_THREADS`.** *Síntoma:*
 `ActiveRecord::ConnectionTimeoutError` bajo carga; o, del otro lado,
@@ -1169,7 +1241,7 @@ escala (`config/database.yml:10-27`).
 
 **13. Subir `RAILS_MAX_THREADS` para acelerar trabajo CPU-bound.** *Síntoma:* la latencia p99
 empeora y el throughput no sube. *Arreglo:* el GVL; más **workers**, no más threads (medido:
-1.53s con 4 threads vs 1.51s secuencial).
+2.41s con 4 threads vs 2.37s secuencial).
 
 **14. RSS que crece y nunca baja con el heap estable.** *Síntoma:* `heap_live_slots` plano,
 `VmRSS` en subida. No es un leak: es fragmentación de `malloc`. *Arreglo:*
@@ -1177,8 +1249,8 @@ empeora y el throughput no sube. *Arreglo:* el GVL; más **workers**, no más th
 
 **15. `default_scope { kept }` para el soft delete.** *Síntoma:* `Product.count` miente, el
 scope se cuela en joins y asociaciones, y `unscoped` te vuela también el `order` y los
-`where` del join. *Arreglo:* scopes explícitos (`Product.kept`), como en
-`app/models/concerns/discardable.rb:10-17`.
+`where` del join. *Arreglo:* scopes explícitos (`Product.kept`): la trampa está explicada en
+`app/models/concerns/discardable.rb:10-17` y los scopes se definen en las líneas 29-30.
 
 **16. N+1 adentro de una validación.** *Síntoma:* un `valid?` que hace 500 queries. Es el N+1
 más invisible que existe porque nadie mira el SQL de una validación. *Arreglo:* precargar en
@@ -1217,7 +1289,7 @@ repetitivo.
 **3. "Contame el GVL y qué implica para Puma."**
 CRuby tiene un mutex global: sólo un thread ejecuta bytecode Ruby a la vez. Los threads son
 del SO, no green threads, y el GVL **se libera** en I/O. Lo medí: 4 threads CPU-bound tardan
-lo mismo que secuencial (1.53s vs 1.51s); 4 threads I/O-bound escalan 4x (0.50s vs 2.00s).
+lo mismo que secuencial (2.41s vs 2.37s); 4 threads I/O-bound escalan 4x (0.50s vs 2.00s).
 Como una app Rails es 80-95% I/O, el modelo de threads funciona igual. Se escala con
 **procesos** (workers), no con threads: el default de Rails 8 es 3 porque más threads suben
 throughput y degradan latencia.

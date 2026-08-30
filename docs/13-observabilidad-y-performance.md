@@ -72,24 +72,38 @@ este repo con `Rails.logger.level = INFO` (o sea: **ninguno de estos cuatro logs
 se escribe**):
 
 ```
-logger.debug("id=#{item.id}")               4.068 ns/op
-logger.debug { "id=#{item.id}" }            3.017 ns/op
-logger.debug(item.attributes.to_json)      33.955 ns/op   <-- 13x
-logger.debug { item.attributes.to_json }    2.561 ns/op
+Rails.logger (ActiveSupport::BroadcastLogger):
+  debug("id=#{item.id}")                      1964 ns/op
+  debug { "id=#{item.id}" }                   2411 ns/op
+  debug(item.attributes.to_json)             31682 ns/op   <-- 12x
+  debug { item.attributes.to_json }           2581 ns/op
+
+Logger simple (ActiveSupport::Logger a File::NULL):
+  debug("id=#{item.id}")                       536 ns/op
+  debug { "id=#{item.id}" }                    169 ns/op
+  debug(item.attributes.to_json)             29474 ns/op   <-- 174x
+  debug { item.attributes.to_json }            167 ns/op
+
+de referencia: item.attributes.to_json solo  28788 ns/op
 ```
 
 La lección: **el argumento se evalúa siempre, el bloque no**. Con un mensaje
-barato da casi igual; con un mensaje que serializa un modelo, la forma con
-argumento cuesta 13 veces más — y ese costo lo pagás en producción, en el camino
-caliente, para generar una string que se tira a la basura.
+barato la diferencia es ruido (el bloque tiene su propio costo de `yield`); con
+un mensaje que serializa un modelo, la forma con argumento cuesta 12 veces más
+sobre el logger de este repo y 174 veces más sobre un logger pelado — y ese
+costo lo pagás en producción, en el camino caliente, para generar una string que
+se tira a la basura. Fijate que los ~29 µs son el `to_json`, no el logger: el
+logger no llega ni a mirarlo.
 
 Regla: si construir el mensaje cuesta algo (`inspect`, `to_json`, un `map`),
 **usá bloque**.
 
-> Nota sobre los números: ~2.5 µs por llamada suena mucho para un no-op. Es el
-> costo de atravesar el `BroadcastLogger` y el `LogSubscriber`. En producción,
-> donde el logger es uno solo, baja. Lo que importa es la **proporción**, no el
-> absoluto.
+> Nota sobre los números: ~2 µs por llamada suena mucho para un no-op, y la
+> comparación de las dos tablas dice exactamente de dónde sale: el mismo no-op
+> sobre un `ActiveSupport::Logger` pelado cuesta ~170 ns. Los otros ~1.8 µs son
+> el `BroadcastLogger` recorriendo su lista de destinos. En producción el
+> logger es uno solo (no hay broadcast) y baja. Lo que importa es la
+> **proporción**, no el absoluto.
 
 ### 1.3 Logging estructurado: lo que este repo hace y lo que le falta
 
@@ -122,8 +136,11 @@ corrida real del servidor de este repo):
 
 Eso **no es JSON**. Es `Hash#inspect` de Ruby, con `=>` y símbolos. Ni Loki ni
 Datadog ni CloudWatch lo parsean: te queda como un blob de texto y perdés
-exactamente lo que querías ganar. El default `SimpleFormatter` hace
-`msg.inspect` para todo lo que no sea `String` ni `Exception`.
+exactamente lo que querías ganar. `ActiveSupport::Logger::SimpleFormatter` es
+literalmente una línea — `String === msg ? msg : msg.inspect` — así que
+**cualquier cosa que no sea un `String` se va por `inspect`**, incluidas las
+excepciones (a diferencia del `Logger::Formatter` de la stdlib, que sí les da
+trato especial y les imprime clase, mensaje y backtrace).
 
 **El arreglo** (probado, corre tal cual en Rails 8.1):
 
@@ -191,6 +208,11 @@ Tres piezas, que en este repo ya están:
    [:application, :job, :controller, :action]
    ```
 
+   (El comentario sale **ordenado alfabéticamente**, no en el orden en que
+   declaraste los tags: `QueryLogs#rebuild_handlers` hace un
+   `sort_by! { |(key, _)| key.to_s }`. Por eso arriba se ve `action` primero y
+   por eso `job` no aparece: en una request es `nil` y se descarta.)
+
    Esto es oro puro en una guardia: cuando mirás `pg_stat_activity` y ves una
    query de 40 segundos, el comentario te dice **qué controller la disparó** sin
    que tengas que adivinar. En Java el equivalente sería un
@@ -207,14 +229,39 @@ Tres piezas, que en este repo ya están:
    ]
    ```
 
-   ⚠️ **Costo real**: el comentario va en el texto de la query, y
-   `pg_stat_statements` normaliza por texto. Con un `request_id` distinto por
-   request, **cada query es una entrada nueva** y el hash table de
-   `pg_stat_statements` se llena de basura. Rails trae
-   `config.active_record.cache_query_log_tags = true` para cachear el prefijo,
-   pero eso no arregla la cardinalidad. Regla: tags de **baja cardinalidad**
-   (controller, action, job) siempre; `request_id` sólo si tu Postgres tiene
-   `pg_stat_statements.max` holgado o si lo tenés apagado.
+   ⚠️ **El mito que vas a escuchar y que es falso**: "un tag de alta
+   cardinalidad como `request_id` fragmenta `pg_stat_statements`". No. Postgres
+   calcula el `queryid` **jumbleando el árbol de parseo**, y el lexer descarta
+   los comentarios antes de eso. Comprobado en este entorno:
+
+   ```sql
+   SET compute_query_id = on;
+   EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM products WHERE id = 1 /*request_id='AAA'*/;
+   --   Query Identifier: -4731695479662933080
+   EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM products WHERE id = 1 /*request_id='ZZZ'*/;
+   --   Query Identifier: -4731695479662933080   <-- el MISMO
+   ```
+
+   Lo que sí te cuesta un tag por request:
+
+   * **El texto que guarda `pg_stat_statements` es el de la primera ejecución
+     que creó la entrada.** Vas a ver *un* `request_id` congelado ahí adentro,
+     que no tiene nada que ver con las 200.000 ejecuciones que agrupa. Sacar
+     conclusiones de ese comentario es el error real.
+   * **Todo lo que agrupa por texto crudo sí se fragmenta**: pgBadger y demás
+     analizadores de log, la salida de `auto_explain`, el `GROUP BY query` que
+     te armás a mano sobre `pg_stat_activity`.
+   * **Bytes**: el comentario viaja por la red en **cada** query y se repite en
+     cada línea de `log_min_duration_statement`. (En el WAL no entra: el WAL
+     guarda cambios físicos de tuplas, no el texto del SQL.)
+
+   CPU no es el problema: con
+   `config.active_record.cache_query_log_tags = true` (default `false`) el
+   comentario se arma **una vez por request** y se reusa para todas sus
+   queries; Rails invalida ese cache con
+   `ActiveSupport::ExecutionContext.after_change`, o sea al cambiar de
+   request/job. Regla: tags de baja cardinalidad siempre; `request_id` cuando
+   te importe correlacionar el log de Postgres con el de la app.
 
 ### 1.5 Qué NO loguear
 
@@ -224,7 +271,7 @@ Tres piezas, que en este repo ya están:
 | Un `inspect` de modelo que vuelca toda la fila | `config.active_record.attributes_for_inspect = [ :id ]` | `config/environments/production.rb:80` |
 | Ruido del health check | `config.silence_healthcheck_path = "/up"` | `config/environments/production.rb:44` |
 | Assets | `config.assets.quiet = true` | `config/environments/development.rb:67` |
-| Backtraces enormes en cada error | `backtrace: exception.backtrace&.first(15)` | `app/controllers/concerns/api/error_handling.rb:116-121` |
+| Backtraces enormes en cada error | `backtrace: exception.backtrace&.first(15)` | `app/controllers/concerns/api/error_handling.rb:116-120` |
 
 El filtro por `:email` es más agresivo de lo que parece: cualquier parámetro que
 **contenga** "email" se reemplaza por `[FILTERED]`, incluido `email_address` del
@@ -298,7 +345,10 @@ ActiveSupport::Notifications.subscribe("sql.active_record") do |event|
   event.payload     # hash
   event.allocations # objetos asignados durante el evento
   event.cpu_time    # ms de CPU
-  event.idle_time   # ms esperando (IO). duration = cpu_time + idle_time + GC
+  event.idle_time   # ms esperando (IO). Definido como duration - cpu_time,
+                    # o sea: duration == cpu_time + idle_time, exacto.
+  event.gc_time     # ms de GC dentro del evento. NO es un tercer sumando:
+                    # el GC ya está contado adentro de cpu_time.
 end
 
 # b) Suscriptor "crudo" (5 argumentos). Es lo que usa este repo en
@@ -355,9 +405,10 @@ Otros eventos que vas a ver y conviene conocer: `render_template.action_view`,
 `render_partial.action_view`, `redirect_to.action_controller`,
 `halted_callback.action_controller` (¡el que te dice que un `before_action` cortó
 la request!), `perform.active_job`, `deliver.action_mailer`, y toda la familia
-`*.solid_queue` (`claim`, `dispatch_scheduled`, `retry`, `discard`,
-`register_process`, `thread_error`…) que Solid Queue publica y que es la base
-para monitorear la cola sin tocar la base.
+`*.solid_queue` que Solid Queue publica (`SolidQueue.instrument(canal)` emite
+`"#{canal}.solid_queue"`): `claim`, `polling`, `dispatch_scheduled`, `retry`,
+`discard`, `release_claimed`, `start_process`, `shutdown_process`,
+`thread_error`. Es la base para monitorear la cola sin consultarle la base.
 
 ### 2.4 El payload real (no adivinado)
 
@@ -409,22 +460,40 @@ El repo instrumenta cero código propio. Así se hace, con un objeto real de est
 repo:
 
 ```ruby
-# app/queries/stock_items/low_stock.rb — envolviendo el call
+# app/queries/stock_items/low_stock.rb — envolviendo el cuerpo de #call
 def call
   ActiveSupport::Notifications.instrument("query.stock",
                                           query: "low_stock", warehouse_id: @warehouse_id) do |payload|
-    relation = build_relation
+    relation = StockItem.where("quantity_available <= reorder_point")
+    relation = relation.where(warehouse_id: @warehouse_id) if @warehouse_id
+    relation = relation.where.not(reorder_point: 0) unless @include_zero_reorder
+    relation = relation.where(product_id: Product.kept.active.select(:id)) if @only_active_products
+    relation = relation.includes(:product, :warehouse)
+                       .order(Arel.sql("(quantity_available - reorder_point) ASC"), :id)
+
     payload[:count] = relation.size   # el payload es mutable DENTRO del bloque
     relation
   end
 end
 ```
 
-Salida real de una corrida con `StockItems::Valuation`:
+Salida real, con un suscriptor que imprime `payload` y `duration`:
 
 ```
-custom -> query.stock {:nombre=>"valuation"} 7.12ms  id=54200199872f6d7cb0be
+query.stock {:query=>"low_stock", :warehouse_id=>nil, :count=>13} 55.05ms
+query.stock {:query=>"low_stock", :warehouse_id=>1, :count=>13}    1.93ms
 ```
+
+⚠️ Dos trampas en esas cinco líneas, y las dos son clásicas:
+
+* **La primera corrida no vale.** 55 ms contra 1,93 ms es el costo de arrancar
+  (conexión, carga del schema, preparado del statement), no el de la query.
+  Medir la primera iteración es la forma más común de mentirse solo.
+* **`relation.size` sobre una relación no cargada dispara un `COUNT(*)`**, y la
+  relación se materializa recién cuando el llamador la recorre, o sea **afuera**
+  del bloque. `event.duration` acá mide el `COUNT`, no el fetch. Si querés medir
+  el trabajo real, cerrá el bloque con `relation.to_a` y usá `.size` sobre el
+  array ya cargado.
 
 El `payload[:count] = …` adentro del bloque es el patrón importante: te permite
 publicar datos que **sólo se conocen después** de ejecutar. En Java sería un
@@ -458,29 +527,44 @@ en el `?` evita filtrar parámetros al log y baja la cardinalidad.
 
 ### 2.6 El costo de instrumentar (medido)
 
-`ActiveSupport::Notifications.instrument` sobre un bloque trivial, 200.000
-iteraciones, Ruby 3.3.6:
+`ActiveSupport::Notifications.instrument` sobre un bloque trivial, 300.000
+iteraciones, mejor de 3 corridas, Ruby 3.3.6:
 
 | Escenario | Costo por llamada |
 |---|---|
-| Sin `instrument` (baseline) | **46 ns** |
-| `instrument` sin ningún suscriptor | **475 ns** |
-| `instrument` con 1 suscriptor de bloque | **4.465 ns** |
-| `instrument` con el suscriptor catch-all de `ServerTiming` | **7.834 ns** |
+| Sin `instrument` (baseline) | **64 ns** |
+| `instrument` sin ningún suscriptor | **502 ns** |
+| `instrument` + 1 suscriptor de **5 argumentos** | **4433 ns** (4,4 µs) |
+| `instrument` + 1 suscriptor de **1 argumento** (`Event`) | **7603 ns** (7,6 µs) |
+| `instrument` + el catch-all de `ServerTiming` | **7703 ns** (7,7 µs) |
 
-Tres conclusiones:
+Cuatro conclusiones:
 
-1. **Instrumentar sin suscriptores es casi gratis** (~0.5 µs). Podés dejar
+1. **Instrumentar sin suscriptores es casi gratis** (~0,5 µs). Podés dejar
    `instrument` en el código sin miedo; lo que cuesta es *escuchar*.
-2. **Cada suscriptor multiplica el costo.** Un suscriptor que hace I/O (escribe
+2. **La aridad del bloque decide el precio.** Con 5 argumentos
+   (`|name, start, finish, id, payload|`) Rails usa un suscriptor `Timed`, que
+   sólo anota dos timestamps. Con 1 argumento construye un
+   `Notifications::Event` completo — y ese objeto mide CPU, allocations y GC en
+   cada evento: **1,7 veces más caro**. La API linda no es la barata.
+3. **Cada suscriptor multiplica el costo.** Un suscriptor que hace I/O (escribe
    a un socket, a un archivo) dentro del evento te mete esa latencia **en la
    request**. Si tenés que mandar métricas por red, encolá en un buffer y flusheá
    aparte.
-3. **En desarrollo tus mediciones están sesgadas.** `config.server_timing = true`
+4. **En desarrollo tus mediciones están sesgadas.** `config.server_timing = true`
    (`config/environments/development.rb:16`) instala un suscriptor con el patrón
    `/\A[^!]/` — o sea, **a todos los eventos** — que crea un objeto `Event` por
-   cada uno. Eso multiplica por ~16 el costo de instrumentar respecto de "sin
-   suscriptores". Ese header tan útil…
+   cada uno. Eso multiplica por ~15 el costo de instrumentar respecto de "sin
+   suscriptores", y no hace falta levantar el servidor para pagarlo: en un
+   `bin/rails runner` pelado ese suscriptor **ya está enganchado**, porque el
+   middleware se registra al construirse el stack. Se ve así:
+
+   ```ruby
+   ActiveSupport::Notifications.notifier.listening?("cualquier.cosa")  # => true
+   ActionDispatch::ServerTiming.unsubscribe                            # sacarlo antes de medir
+   ```
+
+   Ese header tan útil…
 
    ```
    server-timing: cache_read.active_support;dur=0.05, cache_increment.active_support;dur=65.03,
@@ -493,7 +577,7 @@ Tres conclusiones:
    (De paso, ese `cache_increment.active_support;dur=65.03` es el `rate_limit`
    del `BaseController` pegándole a **Solid Cache sobre Postgres**. 65 ms de los
    259 ms de la request se fueron en contar. Es exactamente lo que advierte el
-   comentario de `app/controllers/api/v1/base_controller.rb:46`: para contadores
+   comentario de `app/controllers/api/v1/base_controller.rb:38`: para contadores
    de alta frecuencia, Redis.)
 
 ---
@@ -504,8 +588,8 @@ Tres conclusiones:
 
 100 requests: 99 tardan 10 ms y una tarda 5 segundos.
 
-* Promedio: **59,5 ms**. Suena bien.
-* p50: **10 ms**. p95: **10 ms**. p99: **5.000 ms**.
+* Promedio: **59,9 ms**. Suena bien.
+* p50: **10 ms**. p95: **10 ms**. El 1% peor: **5.000 ms**.
 
 El promedio es sensible a los outliers pero los **diluye**: nunca te dice cuánta
 gente sufrió. Y como la latencia no tiene distribución normal (tiene cola larga
@@ -547,12 +631,12 @@ oculta que el servicio se está cayendo.
 | `db_runtime` / `duration` | mismo evento | > 60% = el problema es la base |
 | `queries_count` por acción | mismo evento (Rails 8.1) | > 30 en un `index` ⇒ N+1 |
 | Tasa de 5xx | mismo evento, `payload[:status]` | > 0.1% sostenido |
-| Tasa de 429 | `rack_attack.throttle` (`config/initializers/rack_attack.rb:268`) + `rate_limit.action_controller` | un pico ⇒ o hay ataque, o le rompiste la integración a un cliente |
+| Tasa de 429 | `throttle.rack_attack` (suscrito en `config/initializers/rack_attack.rb:268`) + `rate_limit.action_controller` | un pico ⇒ o hay ataque, o le rompiste la integración a un cliente |
 | Pool de conexiones | `ActiveRecord::Base.connection_pool.stat` | `waiting > 0` sostenido = saturación |
 | Profundidad de cola | `solid_queue_ready_executions` | crecimiento monótono = los workers no dan abasto |
 | **Latencia** de cola | `now() - min(created_at)` de los ready | \> `polling_interval × 10` |
 | Lag del outbox | `min(occurred_at)` de `published_at IS NULL` | > 300 s (el propio `rake stock:outbox` lo marca) |
-| Heartbeat de workers | `solid_queue_processes.last_heartbeat_at` | > 60 s ⇒ worker muerto |
+| Heartbeat de workers | `solid_queue_processes.last_heartbeat_at` | > 5 min ⇒ worker muerto (ver abajo) |
 | Drift del ledger | `Stock::ReconcileBalancesJob` → log `status: "DRIFT_DETECTED"` | **cualquier valor > 0 es un bug** |
 | Cache hit ratio de Postgres | `pg_statio_user_tables` | < 95% ⇒ falta RAM o falta índice |
 
@@ -586,12 +670,28 @@ Ojo con el prefijo: `config/initializers/active_job.rb` pone
 staging no dispara nunca.
 
 ```sql
--- Workers vivos (base stock_development_queue). Salida real:
---  dispatcher-e747d24d…  | Dispatcher | vm | 13662 | 00:00:05.48
---  worker-d6f49733…      | Worker     | vm | 13669 | 00:00:05.22
+-- Workers vivos (base stock_development_queue). Salida real de este repo:
+--  dispatcher-e747d24d…       | Dispatcher       | vm | 13662 | 00:00:59.19
+--  scheduler-99e3de0f…        | Scheduler        | vm | 13678 | 00:00:58.77
+--  supervisor(fork)-c05410e1… | Supervisor(fork) | vm | 13650 | 00:00:59.58
+--  worker-d6f49733…           | Worker           | vm | 13669 | 00:00:58.99
+--  worker-074a4979…           | Worker           | vm | 13674 | 00:00:58.96
+--  worker-c0954d7a…           | Worker           | vm | 13666 | 00:00:58.94
 SELECT name, kind, hostname, pid, now() - last_heartbeat_at AS antiguedad
 FROM solid_queue_processes ORDER BY kind;
 ```
+
+Seis filas y no dos: `config/queue.yml` declara tres grupos de workers
+(`critical`, `outbox`, y `default,mailers,maintenance,*`), y el supervisor
+forkea además un dispatcher y un scheduler.
+
+⚠️ **No alertes con `antiguedad > 60 s`.** Solid Queue late cada
+`SolidQueue.process_heartbeat_interval`, que **por defecto es 60 segundos**: un
+worker perfectamente sano pasa la mayor parte del tiempo con un heartbeat de
+entre 0 y 59 s, como se ve arriba. El umbral que usa la propia gema para dar un
+proceso por muerto es `SolidQueue.process_alive_threshold`, **5 minutos**.
+Alertá con ese, no con el intervalo del latido: es el error de configuración de
+alertas más fácil de cometer y te llena la guardia de falsos positivos.
 
 ```ruby
 # Pool de conexiones. Salida real en este repo (runner, sin carga):
@@ -722,43 +822,51 @@ end
 ```
 $ bundle exec stackprof tmp/ledger.dump --limit 12
   Mode: wall(1000)
-  Samples: 1337 (0.00% miss rate)
-  GC: 169 (12.64%)
+  Samples: 1397 (0.00% miss rate)
+  GC: 192 (13.74%)
      TOTAL    (pct)     SAMPLES    (pct)     FRAME
-       179  (13.4%)         179  (13.4%)     String#sub
-        93   (7.0%)          93   (7.0%)     (sweeping)
-        75   (5.6%)          75   (5.6%)     (marking)
-        61   (4.6%)          61   (4.6%)     Thread::Backtrace::Location#to_s
-        46   (3.4%)          46   (3.4%)     Regexp#match?
-       372  (27.8%)          38   (2.8%)     ActiveSupport::BacktraceCleaner#clean_frame
-      1075  (80.4%)          26   (1.9%)     Array#each
-       427  (31.9%)          25   (1.9%)     Thread.each_caller_location
+       182  (13.0%)         182  (13.0%)     String#sub
+       104   (7.4%)         104   (7.4%)     (sweeping)
+        86   (6.2%)          86   (6.2%)     (marking)
+        63   (4.5%)          63   (4.5%)     Thread::Backtrace::Location#to_s
+        51   (3.7%)          51   (3.7%)     Regexp#match?
+       391  (28.0%)          41   (2.9%)     ActiveSupport::BacktraceCleaner#clean_frame
+       456  (32.6%)          29   (2.1%)     Thread.each_caller_location
+        36   (2.6%)          27   (1.9%)     ActiveRecord::…::Preloader::Association#load_records
+       148  (10.6%)          25   (1.8%)     Class#new
+        72   (5.2%)          23   (1.6%)     Enumerable#group_by
+      1120  (80.2%)          21   (1.5%)     Array#each
 ```
 
 **Leelo así**: `SAMPLES` (o *self*) es el tiempo gastado **en esa función**;
 `TOTAL` incluye a sus llamadas. Un frame con `TOTAL` alto y `SAMPLES` bajo es un
-*orquestador* (`Array#each`, 80% total / 1.9% self): no es el culpable, es el
+*orquestador* (`Array#each`, 80,2% total / 1,5% self): no es el culpable, es el
 camino. El culpable es el que tiene **self alto**.
 
-Y acá aparece el hallazgo: **el 32% del tiempo se lo lleva
-`Thread.each_caller_location` + `BacktraceCleaner#clean_frame`**, que no es
-código del dominio. Es `config.active_record.verbose_query_logs = true`
+Y acá aparece el hallazgo: **el 32,6% del tiempo se lo lleva
+`Thread.each_caller_location`, y adentro `BacktraceCleaner#clean_frame`** (que
+es de donde salen el `String#sub` de 13% y el `Regexp#match?` de 3,7%). Nada de
+eso es código del dominio: es
+`config.active_record.verbose_query_logs = true`
 (`config/environments/development.rb:55`) calculando, **para cada query**, la
 línea de tu código que la disparó — lo que imprime las flechitas `↳` en el log.
 
-Corriendo exactamente lo mismo con eso apagado:
+Corriendo exactamente lo mismo con eso apagado
+(`ActiveRecord.verbose_query_logs = false`, volcado a
+`tmp/ledger_sin_verbose.dump`):
 
 ```
-  Samples: 715 (0.00% miss rate)     # antes: 1337
-  GC: 106 (14.83%)
-        79  (11.0%)          79  (11.0%)     (marking)
-       156  (21.8%)          28   (3.9%)     Class#new
-        29   (4.1%)          18   (2.5%)     ActiveModel::LazyAttributeSet#fetch_value
-        71   (9.9%)          17   (2.4%)     Enumerable#group_by
-        63   (8.8%)          15   (2.1%)     ActiveRecord::Associations::Preloader::Branch#grouped_records
+  Samples: 788 (0.00% miss rate)     # antes: 1397
+  GC: 100 (12.69%)
+        73   (9.3%)          73   (9.3%)     (marking)
+        27   (3.4%)          27   (3.4%)     (sweeping)
+       140  (17.8%)          23   (2.9%)     Class#new
+        24   (3.0%)          17   (2.2%)     ActiveModel::LazyAttributeSet#fetch_value
+        21   (2.7%)          15   (1.9%)     ActiveRecord::…::Preloader::Association#load_records
+        17   (2.2%)          14   (1.8%)     ActiveRecord::…::Preloader::Association#loaded?
 ```
 
-**El 47% del tiempo medido era instrumentación de desarrollo.** Moraleja: *no
+**El 44% del tiempo medido era instrumentación de desarrollo.** Moraleja: *no
 profiles en el entorno de desarrollo con la configuración de desarrollo*. Andá a
 `RAILS_ENV=production` (o apagá `verbose_query_logs`, `server_timing` y el
 logger) antes de sacar conclusiones. Es el equivalente exacto a medir la JVM con
@@ -767,14 +875,23 @@ logger) antes de sacar conclusiones. Es el equivalente exacto a medir la JVM con
 **Zoom a un método** (real):
 
 ```
-$ bundle exec stackprof tmp/ledger.dump --method 'ActiveRecord::Associations::Preloader::Branch#grouped_records'
-  samples:    15 self (2.1%)  /     63 total (8.8%)
+$ bundle exec stackprof tmp/ledger_sin_verbose.dump \
+    --method 'ActiveRecord::Associations::Preloader::Branch#grouped_records'
+  samples:    12 self (1.5%)  /     77 total (9.8%)
   callers:
-      63  ( 100.0%)  ActiveRecord::Associations::Preloader::Branch#loaders
+      77  ( 100.0%)  ActiveRecord::Associations::Preloader::Branch#loaders
   code:
-   63    (8.8%)  |    83  |  source_records.each do |record|
-   47    (6.6%) /  5 (0.7%)  |  85  |  next if polymorphic_parent && !reflection || !record.association(association).klass
+                                  |    80  |  def grouped_records
+                                  |    82  |    polymorphic_parent = !root? && parent.polymorphic?
+   77    (9.8%)                   |    83  |    source_records.each do |record|
+    6    (0.8%) /     2   (0.3%)  |    84  |      reflection = record.class._reflect_on_association(association)
+   58    (7.4%) /     2   (0.3%)  |    85  |      next if polymorphic_parent && !reflection || !record.association(association).klass
+   10    (1.3%) /     7   (0.9%)  |    86  |      (h[reflection] ||= []) << record
 ```
+
+Las dos columnas de cada línea son `total / self`: la línea 85 se lleva 7,4% del
+perfil pero sólo 0,3% es la línea misma — el resto está adentro de
+`record.association(...)`.
 
 Te anota **línea por línea**. Esto es lo que en Java te da async-profiler con
 `--lines`.
@@ -842,10 +959,20 @@ distinción entre allocation rate y live set, pero acá la tenés en una línea.
 
 ### 6.1 El modelo
 
-Ruby maneja objetos en **slots** de tamaño fijo agrupados en **páginas**
-(`heap_allocated_pages`). El GC es **generacional** (dos generaciones: joven y
-vieja) e **incremental**, con *write barriers*. Un GC **menor** sólo recorre
-objetos jóvenes; uno **mayor** recorre todo.
+Ruby maneja objetos en **slots** agrupados en **páginas**
+(`heap_allocated_pages`). Desde Ruby 3.2 los slots ya **no** son todos del mismo
+tamaño: hay varios *size pools*, y un objeto cae en el que le entra. Medido acá:
+
+```bash
+$ bin/rails runner 'pp GC.stat_heap.transform_values { |h| h[:slot_size] }'
+{0=>40, 1=>80, 2=>160, 3=>320, 4=>640}
+```
+
+Cinco pools, de 40 a 640 bytes (*Variable Width Allocation*). Importa porque un
+`String` de 100 bytes ya no necesita un objeto extra en malloc: entra embebido
+en el slot de 160. El GC es **generacional** (dos generaciones: joven y vieja) e
+**incremental**, con *write barriers*. Un GC **menor** sólo recorre objetos
+jóvenes; uno **mayor** recorre todo.
 
 `GC.stat` en este repo, recién booteado:
 
@@ -854,10 +981,10 @@ RSS: 94 MB
 count                        35        # GCs totales
 minor_gc_count               27
 major_gc_count                8
-heap_allocated_pages        274
-heap_live_slots          263614
-heap_free_slots           26652
-total_allocated_objects  660308
+heap_allocated_pages        272
+heap_live_slots          264287
+heap_free_slots           25055
+total_allocated_objects  660294
 ```
 
 Diferencias con la JVM que un javero asume mal:
@@ -876,18 +1003,18 @@ Diferencias con la JVM que un javero asume mal:
 Medido en este repo:
 
 ```ruby
-snap("boot")                                # RSS=  94.4 MB  slots=263.666  paginas= 274
+snap("boot")                                # RSS=  94.3 MB  slots=263.394  paginas= 273
 big = 300_000.times.map { "x" * 200 }
-snap("300k strings de 200B")                # RSS= 194.1 MB  slots=631.467  paginas=1774
+snap("300k strings de 200B")                # RSS= 193.9 MB  slots=630.460  paginas=1773
 big = nil
 4.times { GC.start(full_mark: true, immediate_sweep: true) }
-snap("tras GC.start x4")                    # RSS= 190.3 MB  slots=246.743  paginas=1750
+snap("tras GC.start x4")                    # RSS= 190.1 MB  slots=246.752  paginas=1749
 GC.compact
-snap("tras GC.compact")                     # RSS= 190.3 MB  slots=246.769  paginas=1750
+snap("tras GC.compact")                     # RSS= 190.2 MB  slots=246.777  paginas=1749
 ```
 
-Liberé **todos** los objetos (los slots vivos volvieron a 246k, quedaron 360k
-slots libres) y **el RSS bajó 4 MB de 100**. Las páginas del heap siguen
+Liberé **todos** los objetos (los slots vivos volvieron a 246k, quedaron 359.933
+slots libres) y **el RSS bajó 3,8 MB de 100**. Las páginas del heap siguen
 reservadas: Ruby las guarda para la próxima vez.
 
 Esa es la explicación completa del "mi worker de Puma arranca en 200 MB y a las
@@ -916,7 +1043,8 @@ fragmentación por proceso.
 Dos soluciones, y este repo eligió la buena. `Dockerfile`:
 
 ```dockerfile
-RUN apt-get install -y libjemalloc2 && \
+# Dockerfile:19-28 (recortado)
+RUN apt-get install --no-install-recommends -y curl libjemalloc2 libvips postgresql-client && \
     ln -s /usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so
 ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so"
 ```
@@ -945,16 +1073,35 @@ que escribe en ellas. `preload_app!` en Puma hace que la app se cargue **antes**
 del fork, así todo el código y las constantes quedan compartidos.
 
 ⚠️ **`config/puma.rb` de este repo NO tiene `preload_app!`.** Con
-`WEB_CONCURRENCY > 1` cada worker carga la app entero por su cuenta. Es la línea
-que hay que agregar antes de escalar, junto con el `on_worker_boot` que
-reconecta la base (después de un fork, la conexión heredada está rota):
+`WEB_CONCURRENCY > 1` cada worker carga la app entera por su cuenta: sin
+copy-on-write, la RAM crece linealmente con los workers. Es **la** línea que hay
+que agregar antes de escalar:
 
 ```ruby
 # config/puma.rb — lo que HABRÍA que agregar para multi-worker
 preload_app!
-before_fork { ActiveRecord::Base.connection_pool.disconnect! }
-on_worker_boot { ActiveRecord::Base.establish_connection }
 ```
+
+Y nada más. La receta que vas a encontrar copiada en todos lados —
+
+```ruby
+before_fork { ActiveRecord::Base.connection_pool.disconnect! }   # ❌ innecesario
+on_worker_boot { ActiveRecord::Base.establish_connection }       # ❌ y además roto
+```
+
+— es de la era de Rails 4. Desde Rails 6 Active Record se engancha al
+`ForkTracker` de Active Support y descarta los pools heredados solo:
+
+```ruby
+# activerecord/lib/active_record/connection_adapters/pool_config.rb:83
+ActiveSupport::ForkTracker.after_fork { ActiveRecord::ConnectionAdapters::PoolConfig.discard_pools! }
+```
+
+El hijo reconecta perezosamente en su primer checkout. Y en este repo el
+`establish_connection` sería peor que inútil: sólo tocaría la base **primary**,
+dejando `cache`, `queue` y `cable` sin atender. Lo que sí va en `on_worker_boot`
+es todo lo que **no** es Active Record y no tiene su propio `ForkTracker`:
+clientes de Redis, sockets abiertos a mano, threads propios.
 
 Y acá viene lo que casi todo el mundo mide mal: **RSS cuenta las páginas
 compartidas en cada proceso**. Medido en los 6 procesos de Solid Queue que corren
@@ -962,21 +1109,27 @@ en este repo (que Solid Queue forkea de un supervisor):
 
 ```
 PID     RSS       PSS       compartida   privada
-13650   115 MB     80 MB      44 MB       70 MB   (supervisor)
-13662   101 MB     72 MB      35 MB       66 MB   (dispatcher)
-13666   100 MB     70 MB      36 MB       64 MB   (worker critical)
-13669    99 MB     69 MB      36 MB       63 MB   (worker outbox)
-13674   147 MB    123 MB      29 MB      119 MB   (worker default)
-13678   110 MB     80 MB      37 MB       73 MB   (scheduler)
+13650   113 MB     81 MB      40 MB       73 MB   (supervisor)
+13662    99 MB     70 MB      34 MB       65 MB   (dispatcher)
+13666    99 MB     69 MB      35 MB       63 MB   (worker critical)
+13669    97 MB     68 MB      35 MB       62 MB   (worker outbox)
+13674   149 MB    126 MB      28 MB      121 MB   (worker default)
+13678   108 MB     79 MB      36 MB       72 MB   (scheduler)
 -------------------------------------------------
-suma    657 MB    482 MB
+suma    665 MB    493 MB
 ```
 
-**Suma de RSS: 657 MB. Suma de PSS: 482 MB.** 175 MB son páginas compartidas
-contadas seis veces. Si dimensionás el contenedor con la suma de RSS, pedís 36%
+**Suma de RSS: 665 MB. Suma de PSS: 493 MB.** 172 MB son páginas compartidas
+contadas seis veces. Si dimensionás el contenedor con la suma de RSS, pedís 35%
 más RAM de la que hace falta. **Para dimensionar usá PSS**
 (`/proc/PID/smaps_rollup`), o mejor `memory.current` del cgroup, que es lo que
 mira el OOM killer.
+
+Ojo con la lectura fácil: acá el ahorro **no** viene de `preload_app!` (Puma no
+lo tiene, §6.4), viene de que el supervisor de Solid Queue sí forkea. Fijate
+que el worker `default` —el que efectivamente corrió jobs— tiene 121 MB privados
+contra 62-73 MB de los demás: **lo compartido se va desgastando a medida que el
+proceso trabaja y escribe en sus páginas**. El copy-on-write se paga de a poco.
 
 ### 6.5 Dimensionar workers vs threads con memoria real
 
@@ -1115,7 +1268,7 @@ un `Result.failure(:locked, …)` que el controller devuelve como 409. Ver docs/
 
 ### 7.4 Bloat, autovacuum e índices muertos
 
-El repo ya trae dos rake tasks (`lib/tasks/stock.rake:105-146`):
+El repo ya trae dos rake tasks (`lib/tasks/stock.rake:105-151`):
 
 ```bash
 bin/rails db:table_sizes      # filas vivas/muertas, tamaño, último autovacuum
@@ -1137,11 +1290,18 @@ ORDER BY n_dead_tup DESC;
 Salida real (recortada) de este repo:
 
 ```
- tabla           | n_live_tup | n_dead_tup | seq_scan | idx_scan | total
- outbox_events   |        126 |         20 |       35 |      220 | 232 kB
- products        |         15 |          9 |      161 |  1275571 | 176 kB
- api_tokens      |          4 |         11 |      134 |       75 | 160 kB
+ tabla             | n_live_tup | n_dead_tup | seq_scan | idx_scan | total
+ outbox_events     |        140 |         36 |       38 |      396 | 232 kB
+ sequence_counters |          1 |         19 |       30 |        9 |  64 kB
+ stock_items       |         48 |         19 |  1275635 |      898 | 112 kB
+ api_tokens        |          8 |         16 |      564 |       75 | 160 kB
+ products          |         15 |         15 |      635 |  1275641 | 176 kB
 ```
+
+(`sequence_counters` es el caso extremo: **una** fila viva y 19 muertas. Es una
+tabla de contadores que se actualiza sin parar; cada `UPDATE` deja una versión
+muerta. Es el patrón que hace que un `SELECT` sobre una tabla de una fila
+escanee decenas de páginas de basura si el autovacuum se queda atrás.)
 
 Tres lecturas:
 
@@ -1179,7 +1339,7 @@ SELECT sum(heap_blks_read) AS disco, sum(heap_blks_hit) AS cache,
 FROM pg_statio_user_tables;
 ```
 
-Real en este repo: `disco=76.656  cache=16.700.372  hit_ratio=99.54`.
+Real en este repo: `disco=76.656  cache=16.704.939  hit_ratio=99.54`.
 
 Con `shared_buffers = 128 MB` (verificado) y una base de pocos MB, 99.5% es
 esperable. Interpretación: **< 95% en producción = tu working set no entra en
@@ -1196,25 +1356,30 @@ SELECT checkpoints_timed, checkpoints_req,
 FROM pg_stat_bgwriter;   -- en Postgres 17+ esto se movió a pg_stat_checkpointer
 ```
 
-Real en este repo:
+Real en este repo (son contadores acumulados desde el último
+`pg_stat_reset_shared('bgwriter')`, así que sólo tienen sentido mirando el
+**delta** entre dos lecturas):
 
 ```
-checkpoints_timed | 35
-checkpoints_req   | 50     <-- MÁS que los programados
+checkpoints_timed | 63
+checkpoints_req   | 51     <-- 45% de los checkpoints son FORZADOS
 ```
 
-**`checkpoints_req > checkpoints_timed` significa que Postgres se queda sin WAL
-antes de que venza `checkpoint_timeout`** (300 s acá) y tiene que forzar un
-checkpoint. Un checkpoint forzado es una tormenta de I/O: escribe todos los
-buffers sucios de golpe y ahí es donde aparecen esos picos de latencia
+**Un `checkpoints_req` alto significa que Postgres se queda sin WAL antes de que
+venza `checkpoint_timeout`** (5 min acá, verificado con `SHOW`) y tiene que
+forzar un checkpoint. Un checkpoint forzado es una tormenta de I/O: escribe
+todos los buffers sucios de golpe y ahí es donde aparecen esos picos de latencia
 inexplicables en el p99.
 
-El arreglo es subir `max_wal_size` (acá está en 1 GB). Regla práctica: apuntá a
-que **más del 90% de los checkpoints sean `timed`**.
+Regla práctica: apuntá a que **más del 90% de los checkpoints sean `timed`**.
+Acá son el 55%, o sea que esta base está muy por debajo de lo sano — cosa
+esperable en una base de desarrollo que se cargó de golpe con seeds y
+migraciones. El arreglo es subir `max_wal_size` (acá está en 1 GB).
 
-`buffers_backend` alto (135.660 acá) significa que los procesos de backend están
-escribiendo buffers ellos mismos porque el bgwriter no da abasto — o sea, tus
-queries están pagando I/O que debería hacer un proceso de fondo.
+`buffers_backend` alto (200.100 acá, contra 65.032 de `buffers_checkpoint`)
+significa que los procesos de backend están escribiendo buffers ellos mismos
+porque el bgwriter no da abasto — o sea, tus queries están pagando I/O que
+debería hacer un proceso de fondo.
 
 ### 7.7 Los timeouts que este repo ya tiene puestos
 
@@ -1239,9 +1404,12 @@ lado que importa: si el cliente se muere, el servidor sigue ejecutando.
 
 ### 8.1 Qué hace `/up` realmente
 
-`config/routes.rb` monta `get "up" => "rails/health#show"`. El controller
-(`Rails::HealthController` de railties) es **cuatro líneas**: responde 200 con un
-HTML verde, y tiene un `rescue_from(Exception) { render_down }` que devuelve 500.
+`config/routes.rb:105` monta `get "up" => "rails/health#show"`. El controller es
+`Rails::HealthController`, que vive en railties y hereda de
+`ActionController::Base`. Todo lo que hace cabe en un párrafo: `show` responde
+200 —`<body style="background-color: green">` para HTML,
+`{"status":"up","timestamp":…}` para JSON— y un `rescue_from(Exception)` de
+primera línea devuelve lo mismo en rojo con status 500 si algo explotó.
 
 Verificado: `/up` **no toca la base**.
 
@@ -1288,9 +1456,11 @@ base de verdad. Convertiste un hipo en un incidente.
    tiene un `safelist("permitir health checks")` justo para eso, y el comentario
    explica por qué: si lo limitás, el balanceador saca la instancia y **te caés
    solo**.
-5. **Excluí `/up` del redirect a HTTPS** (`config.ssl_options` comentado en
-   `config/environments/production.rb`) y de la verificación de host
-   (`config.host_authorization`), porque el probe pega por IP y sin TLS.
+5. **Excluí `/up` del redirect a HTTPS y de la verificación de host**, porque el
+   probe pega por IP y sin TLS. Las dos líneas están en
+   `config/environments/production.rb`, **comentadas** (`config.ssl_options` en
+   la 34, `config.host_authorization` en la 89): hay que descomentarlas el día
+   que prendas `force_ssl` o `config.hosts`, no antes.
 
 Un readiness razonable para este repo (no existe todavía):
 
@@ -1425,7 +1595,8 @@ SELECT pid, now() - query_start AS dur, state, wait_event_type, left(query,100)
 FROM pg_stat_activity WHERE state <> 'idle' ORDER BY dur DESC;
 
 -- ¿alguien bloquea a alguien? (§7.3)
-SELECT bloqueada.pid, bloqueante.pid, now() - bloqueada.query_start AS espera
+SELECT bloqueada.pid AS bloqueado, bloqueante.pid AS bloqueante,
+       now() - bloqueada.query_start AS espera
 FROM pg_stat_activity bloqueada
 JOIN LATERAL unnest(pg_blocking_pids(bloqueada.pid)) AS b ON true
 JOIN pg_stat_activity bloqueante ON bloqueante.pid = b;
@@ -1490,12 +1661,12 @@ Un detalle de `bin/rails middleware` en este repo que asusta al principio:
 (`insert_after ActionDispatch::RemoteIp`) y la otra el railtie de la gema, que
 hace `app.middleware.use(Rack::Attack)` sin condición. **No duplica los
 contadores**: `Rack::Attack#call` arranca con
-`return @app.call(env) if env["rack.attack.called"]`, así que la segunda
-instancia es un no-op. Lo verifiqué con `curl`: con `logins/ip` en 5 por 20 s,
+`return @app.call(env) if !self.class.enabled || env["rack.attack.called"]` y
+setea esa clave en la línea siguiente, así que la segunda instancia es un no-op. Lo verifiqué con `curl`: con `logins/ip` en 5 por 20 s,
 el 429 llega en el intento **6**, no en el 3. Contraste útil: el `rate_limit` de
 controller **no** tiene esa protección — dos declaraciones sin `name:` distinto
 sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
-`app/controllers/api/v1/base_controller.rb:60-74`.
+`app/controllers/api/v1/base_controller.rb:59-74`.
 
 ---
 
@@ -1525,7 +1696,7 @@ sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
    *Síntoma*: OOM kill periódico, sin `OutOfMemoryError` ni stacktrace.
    *Causa*: **no es un leak**: un endpoint cargó 50.000 filas una vez y el heap
    de Ruby no devuelve páginas al SO (medido en §6.2: liberé todo y el RSS bajó
-   4 MB de 100).
+   3,8 MB de 100).
    *Arreglo*: arreglar el endpoint (`find_each`, `pluck`, keyset), jemalloc vía
    `LD_PRELOAD` (ya está en el `Dockerfile`), y reciclar workers como parche.
 
@@ -1533,21 +1704,28 @@ sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
    *Síntoma*: pedís 40% más RAM de la necesaria y no entendés por qué el cgroup
    reporta menos.
    *Causa*: RSS cuenta las páginas compartidas en **cada** proceso forkeado.
-   Medido acá: 657 MB de suma de RSS contra 482 MB de PSS.
+   Medido acá: 665 MB de suma de RSS contra 493 MB de PSS.
    *Arreglo*: PSS (`/proc/PID/smaps_rollup`) o `memory.current` del cgroup.
 
 6. **Profilar en desarrollo y optimizar lo que no existe en producción.**
-   *Síntoma*: el profiler dice que el 32% se va en `BacktraceCleaner`.
+   *Síntoma*: el profiler dice que el 32,6% se va en `Thread.each_caller_location`
+   y `BacktraceCleaner`.
    *Causa*: `verbose_query_logs` + `server_timing` de
    `config/environments/development.rb`. Con eso apagado, el mismo trabajo pasó
-   de 1337 a 715 muestras (§5.3).
+   de 1397 a 788 muestras (§5.3).
    *Arreglo*: profilar con `RAILS_ENV=production`.
 
-7. **`request_id` como query log tag revienta `pg_stat_statements`.**
-   *Síntoma*: `pg_stat_statements` se llena y deja de ser útil.
-   *Causa*: el comentario forma parte del texto de la query y cada request genera
-   una entrada nueva.
-   *Arreglo*: tags de baja cardinalidad (controller, action, job).
+7. **Leer el comentario que trae el texto de `pg_stat_statements` como si fuera
+   el de la ejecución lenta.**
+   *Síntoma*: la fila más cara de `pg_stat_statements` dice
+   `controller='reports'` y te pasás la tarde optimizando ese endpoint, cuando
+   las 200.000 ejecuciones que agrupa vienen de cinco controllers distintos.
+   *Causa*: el `queryid` se calcula sobre el árbol de parseo (los comentarios se
+   descartan), pero el **texto** que se guarda es el de la **primera** ejecución
+   que creó la entrada. Comprobado en §1.4 con `compute_query_id`.
+   *Arreglo*: para saber quién dispara qué, mirá `pg_stat_activity` (que sí
+   muestra la query en curso) o tu propio evento `process_action`; en
+   `pg_stat_statements` mirá el plan, no el comentario.
 
 8. **Alertar sobre causas en vez de síntomas.**
    *Síntoma*: 40 alertas por semana, todas silenciadas, y el incidente real pasa
@@ -1565,8 +1743,9 @@ sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
 10. **Un suscriptor de Notifications que hace I/O adentro de la request.**
     *Síntoma*: el p99 sube después de "agregar métricas".
     *Causa*: los suscriptores corren **síncronos, en el mismo thread**. Medido:
-    un suscriptor de bloque lleva `instrument` de 475 ns a 4.465 ns; uno que
-    escriba a un socket suma su latencia entera a la request.
+    un suscriptor de bloque lleva `instrument` de 0,5 µs a 4,4 µs (7,6 µs si el
+    bloque recibe un `Event`); uno que escriba a un socket suma su latencia
+    entera a la request.
     *Arreglo*: bufferear en memoria y flushear desde un thread aparte.
 
 11. **`config.log_level = :debug` "por un ratito" en producción.**
@@ -1576,12 +1755,21 @@ sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
     *Arreglo*: `RAILS_LOG_LEVEL` por instancia (ya está parametrizado en
     `config/environments/production.rb:41`) y volverlo atrás.
 
-12. **`checkpoints_req > checkpoints_timed` como picos "inexplicables" de p99.**
+12. **Checkpoints forzados como picos "inexplicables" de p99.**
     *Síntoma*: la latencia se dispara cada pocos minutos sin correlación con el
     tráfico.
     *Causa*: `max_wal_size` chico fuerza checkpoints, que son tormentas de I/O.
-    Medido acá: 50 forzados contra 35 programados.
+    Medido acá: 51 forzados contra 63 programados, o sea 45% de forzados.
     *Arreglo*: subir `max_wal_size` hasta que > 90% sean `timed`.
+
+13. **Alertar sobre el heartbeat de los workers con el umbral equivocado.**
+    *Síntoma*: la guardia recibe "worker muerto" varias veces por hora y los
+    workers están perfectamente vivos.
+    *Causa*: `SolidQueue.process_heartbeat_interval` **es** 60 s, así que un
+    worker sano pasa casi todo el tiempo con un `last_heartbeat_at` de entre 0 y
+    59 segundos. Alertar con "> 60 s" es alertar sobre el latido normal.
+    *Arreglo*: usar `SolidQueue.process_alive_threshold` (5 minutos), que es el
+    umbral con el que la propia gema da un proceso por muerto.
 
 ---
 
@@ -1596,8 +1784,9 @@ usaría para emitir una línea estructurada por request desde
 alertar sobre eso es la detección de N+1 más barata que existe.
 *Trade-off*: los suscriptores corren **síncronos en el mismo thread**, así que
 uno que haga I/O suma su latencia a la request. Medido: `instrument` sin
-suscriptores cuesta ~475 ns; con un suscriptor de bloque, ~4,5 µs. Instrumentar
-es casi gratis; escuchar no.
+suscriptores cuesta ~500 ns; con un suscriptor de bloque, ~4,4 µs (~7,6 µs si el
+bloque pide el objeto `Event`, que mide CPU, allocations y GC). Instrumentar es
+casi gratis; escuchar no.
 *Dónde se rompe la analogía con Java*: no es Micrometer. Micrometer **es** un
 registro de métricas con histogramas y exportadores; Notifications te da eventos
 crudos y la agregación es tuya.
@@ -1633,7 +1822,7 @@ corto, cache de 2-5 s e histéresis.
 Casi nunca. El GC de Ruby libera **slots**, pero **no devuelve páginas al SO**.
 Lo medí en este repo: asigné 300k strings (RSS de 94 a 194 MB), las liberé todas
 y forcé cuatro GC completos más `GC.compact` — los slots vivos volvieron a
-246.000 y el RSS bajó a 190 MB. O sea: el worker queda del tamaño de su peor
+246.752 y el RSS bajó a 190 MB. O sea: el worker queda del tamaño de su peor
 momento. La causa habitual es una request patológica que cargó demasiadas filas.
 Se ataca en tres frentes: arreglar la request (`find_each`, `pluck`, keyset),
 jemalloc por `LD_PRELOAD` (que este repo ya tiene en el `Dockerfile`) o
@@ -1645,8 +1834,8 @@ reciclo. Sirve como red, no como solución.
 Workers ≈ núcleos, porque el GVL hace que un proceso use como máximo un núcleo
 para Ruby; threads ~5, porque el GVL se libera durante el I/O pero pasado ese
 punto la latencia empeora. La memoria se calcula con **PSS, no RSS**: en este
-repo los 6 procesos de Solid Queue suman 657 MB de RSS pero 482 MB de PSS —
-175 MB son páginas compartidas contadas seis veces. Y la restricción que ata
+repo los 6 procesos de Solid Queue suman 665 MB de RSS pero 493 MB de PSS —
+172 MB son páginas compartidas contadas seis veces. Y la restricción que ata
 primero en una app Rails 8 no suele ser CPU ni RAM: es el **pool de conexiones**,
 porque son `workers × threads × 4 bases` contra `max_connections`.
 *Trade-off*: más workers = más throughput y más RAM; más threads = más
@@ -1667,7 +1856,8 @@ existe el burn rate multi-ventana: es el punto medio.
 
 **7. "¿Qué medirías del promedio de latencia?"**
 Nada: el promedio miente siempre para el mismo lado. Con 99 requests de 10 ms y
-una de 5 s, el promedio da 59 ms y suena bien, pero el p99 es 5 segundos. Y los
+una de 5 s, el promedio da 59,9 ms y suena bien, pero el peor 1% son 5 segundos
+enteros. Y los
 percentiles **no se promedian entre instancias**: necesitás histogramas
 agregables. Además hay que separar latencia de éxitos y de errores, porque un 500
 que responde en 3 ms te baja el p99 y te esconde que el servicio se cae.

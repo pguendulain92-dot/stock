@@ -9,9 +9,9 @@ tiempo congelado, HTTP externo, cobertura, tests flakey, velocidad, un ciclo
 red-green-refactor sobre una regla de stock de verdad, y qué corre el CI.
 
 Todos los números de este documento salieron de correr la suite en esta máquina
-(Ruby 3.3.6, Rails 8.1.3.1, PostgreSQL 16, RSpec 8): **325 ejemplos, 0 fallas,
-15,4 s**. Cada ruta que se cita existe; si algo no está implementado en el repo
-lo digo explícitamente en vez de inventarlo.
+(Ruby 3.3.6, Rails 8.1.3.1, PostgreSQL 16.13, rspec-rails 8.0.4 sobre rspec-core
+3.13.6): **338 ejemplos, 0 fallas, ~16 s**. Cada ruta que se cita existe; si algo
+no está implementado en el repo lo digo explícitamente en vez de inventarlo.
 
 Está escrito para vos, que venís de JUnit 5 + Mockito + AssertJ + Testcontainers.
 Cada sección marca dónde la analogía con Java **se rompe**, porque ahí es donde
@@ -36,6 +36,7 @@ la gente pierde el tiempo.
 | Serializer | `spec/serializers/serializers_spec.rb` | contrato del JSON |
 | Form object | `spec/forms/stock_transfer_form_spec.rb` | validación del input |
 | Request (HTTP real) | `spec/requests/api/v1/stock_operations_spec.rb` | 401/403/404/422, idempotencia |
+| Smoke de rutas | `spec/requests/api/v1/endpoint_coverage_spec.rb:99` | recorre TODAS las rutas de la API buscando 5xx |
 | Rate limiting | `spec/requests/api/v1/rate_limiting_spec.rb` | las dos capas |
 | Job | `spec/jobs/outbox_publish_pending_job_spec.rb` | `have_enqueued_job`, poison message |
 | Sistema (browser) | `spec/system/transfer_with_js_spec.rb` | Capybara + Chromium headless |
@@ -43,6 +44,8 @@ la gente pierde el tiempo.
 | N+1 | `spec/support/bullet.rb:20` | `Bullet.raise = true` |
 | Helper de threads | `spec/support/concurrency.rb:25` | `run_concurrently` |
 | Driver del browser | `spec/support/capybara.rb:104` | `rack_test` vs `cuprite` |
+| HTTP externo bloqueado | `spec/support/webmock.rb:25` | `disable_net_connect!(allow_localhost: true)` |
+| Cassettes de VCR | `spec/support/vcr.rb:28` | `hook_into :webmock`, filtrado de secretos |
 | CI | `.github/workflows/ci.yml:92` | job `test` con servicios Postgres/Redis |
 
 ---
@@ -55,7 +58,7 @@ en el `Gemfile`). No es una cuestión de gusto: son dos filosofías.
 | | Minitest | RSpec |
 |---|---|---|
 | Viene con Rails | ✅ | ❌ (una gema más) |
-| Tamaño | ~2.000 líneas | ~20.000 líneas + rspec-expectations + rspec-mocks |
+| Tamaño (medido en las gemas instaladas) | ~5.000 líneas | ~29.000: rspec-core 14.300 + rspec-expectations 8.000 + rspec-mocks 7.000 |
 | Sintaxis | `assert_equal a, b` / `test "..." do` | `expect(a).to eq(b)` / `it "..." do` |
 | Estructura | clases y métodos Ruby comunes | DSL anidable (`describe` / `context`) |
 | Setup perezoso | no (asignás en `setup`) | `let` memorizado y perezoso |
@@ -66,10 +69,10 @@ en el `Gemfile`). No es una cuestión de gusto: son dos filosofías.
 
 **Por qué RSpec acá, concretamente:**
 
-1. **`let` perezoso.** En `spec/services/stock/receive_spec.rb` hay siete `let`
-   (`user`, `product`, `warehouse`, `recorder`…) y cada ejemplo materializa sólo
-   los que toca. En Minitest lo escribís en `setup` y se crea todo siempre, o
-   armás métodos memorizados a mano. Con 57 ejemplos de servicio eso se nota.
+1. **`let` perezoso.** En `spec/services/stock/receive_spec.rb:14-21` hay cuatro
+   `let` (`user`, `product`, `warehouse`, `recorder`) y cada ejemplo materializa
+   sólo los que toca. En Minitest lo escribís en `setup` y se crea todo siempre,
+   o armás métodos memorizados a mano. Con 57 ejemplos de servicio eso se nota.
 2. **Metadata.** `:concurrency`, `:n_plus_one`, `js: true` no son comentarios:
    son *tags* que disparan hooks globales (desactivar transacciones, prender
    Bullet, cambiar de driver de browser). Minitest no tiene un equivalente
@@ -189,7 +192,7 @@ Cuándo va cada uno:
 > de la clase de test por método** (`PER_METHOD` es el default), así que los
 > campos ya vienen limpios. RSpec también instancia un `ExampleGroup` nuevo por
 > ejemplo, así que la garantía es la misma — pero **el estado global no se
-> resetea solo** (ver §9.4).
+> resetea solo** (ver §9.3).
 
 ### 2.4 `before` / `after` / `around`
 
@@ -332,20 +335,23 @@ Lo que la suite tiene de verdad, medido con `rspec --dry-run` por carpeta:
 
 | Carpeta | Ejemplos | % | Tiempo | Qué cubre |
 |---|---:|---:|---:|---|
-| `spec/models` | 92 | 28 % | ~2,0 s | validaciones, scopes, constraints, Value Objects |
-| `spec/services` | 57 | 18 % | 3,6 s | **reglas de negocio** |
-| `spec/requests` | 39 | 12 % | 3,8 s | contrato HTTP, auth, idempotencia, rate limit |
-| `spec/policies` | 33 | 10 % | 0,56 s | matriz de autorización |
-| `spec/queries` | 28 | 9 % | ~0,9 s | query objects, N+1, keyset pagination |
-| `spec/lib` | 18 | 6 % | ~0,1 s | `Result` (unitario puro) |
-| `spec/jobs` | 18 | 6 % | ~0,4 s | outbox, jobs de mantenimiento |
-| `spec/serializers` | 11 | 3 % | ~0,1 s | contrato del JSON |
-| `spec/system` | 11 | 3 % | 4,8 s | browser real |
-| `spec/forms` | 10 | 3 % | ~0,3 s | validación de input |
-| `spec/integration` | 8 | 2 % | 2,3 s | concurrencia con threads |
-| **Total** | **325** | | **15,4 s** | |
+| `spec/models` | 92 | 27 % | ~1,2 s | validaciones, scopes, constraints, Value Objects |
+| `spec/services` | 57 | 17 % | ~3,5 s | **reglas de negocio** |
+| `spec/requests` | 52 | 15 % | ~4,8 s | contrato HTTP, auth, idempotencia, rate limit |
+| `spec/policies` | 33 | 10 % | 0,57 s | matriz de autorización |
+| `spec/queries` | 28 | 8 % | ~1,3 s | query objects, N+1, keyset pagination |
+| `spec/lib` | 18 | 5 % | 0,13 s | `Result` (unitario puro) |
+| `spec/jobs` | 18 | 5 % | ~0,7 s | outbox, jobs de mantenimiento |
+| `spec/serializers` | 11 | 3 % | ~0,4 s | contrato del JSON |
+| `spec/system` | 11 | 3 % | ~4,6 s | browser real |
+| `spec/forms` | 10 | 3 % | ~0,5 s | validación de input |
+| `spec/integration` | 8 | 2 % | ~2,0 s | concurrencia con threads |
+| **Total** | **338** | | **16,1 s** | |
 
-Leelo así: **el 3 % de los ejemplos (los 11 de sistema) se lleva el 31 % del
+(Los tiempos por carpeta se midieron corriendo cada una por separado, así que
+suman algo más que la corrida completa; los porcentajes redondean a 98 %.)
+
+Leelo así: **el 3 % de los ejemplos (los 11 de sistema) se lleva casi el 30 % del
 tiempo**. Eso no es un problema — es el precio correcto por cubrir Turbo +
 Stimulus + Chromium. Lo que sí sería un problema es tener 60 system tests
 probando reglas de negocio que un spec de servicio cubre 20 veces más rápido.
@@ -419,10 +425,10 @@ En Ruby es al revés de lo que la intuición dice: **`equal` es identidad**.
 
 **Detalle honesto**: estos specs requieren `rails_helper`, no `spec_helper`,
 porque las clases viven bajo `app/` y las autocarga Zeitwerk. Está comentado en
-`spec/lib/result_spec.rb:3-7`. Correrlos solos igual bootea Rails (1,6 s de
-carga), pero la *ejecución* es de 0,068 s para los 18 ejemplos de Value Objects.
-Si quisieras el boot de 50 ms, tendrías que mover `Result` a `lib/` y requerirlo
-a mano.
+`spec/lib/result_spec.rb:3-7`. Correrlos solos igual bootea Rails (~1,7 s de
+carga), pero la *ejecución* es de 0,13 s para los 18 ejemplos de `spec/lib` y de
+0,12 s para los 19 de `spec/models/value_objects`. Si quisieras el boot de 50 ms,
+tendrías que mover `Result` a `lib/` y requerirlo a mano.
 
 ### 4.2 De modelo, con shoulda-matchers
 
@@ -723,8 +729,9 @@ En AssertJ sería `assertThat(msg).contains("línea 2", "NO-EXISTE")`.
 
 ### 4.8 De request: la API end-to-end sobre HTTP
 
-39 ejemplos en `spec/requests/`. Ejercitan **router + middlewares + auth +
-controller + service + base + serializer**, sin browser.
+52 ejemplos en `spec/requests/` (18 de operaciones de stock, 13 de órdenes de
+compra, 12 de reservas, 8 de rate limiting y 1 de smoke). Ejercitan **router +
+middlewares + auth + controller + service + base + serializer**, sin browser.
 
 ```ruby
 it "el reintento devuelve la MISMA respuesta y no aplica dos veces" do
@@ -742,6 +749,16 @@ end
 
 Y el que prueba que las claves de idempotencia están **scopeadas por usuario**
 (si no, un cliente envenena la cache de otro).
+
+**El ejemplo más rentable de toda la carpeta es uno solo**, en
+`spec/requests/api/v1/endpoint_coverage_spec.rb:99`: recorre
+`Rails.application.routes.routes`, filtra las que empiezan con `/api/v1/`, las
+ejecuta todas con un token de admin y falla si alguna devuelve 5xx. No verifica
+lógica —para eso están los otros specs—, verifica que ninguna ruta reviente.
+Existe por un bug real: `GET /api/v1/reservations` tiraba 500 para cualquier
+request porque faltaba `StockReservationPolicy`, y ningún test ejecutaba esa
+acción. Se actualiza solo: si mañana agregás un endpoint, aparece en la lista sin
+que nadie tenga que acordarse.
 
 **Punto de precisión sobre el alcance**: un request spec de Rails levanta el
 `ActionDispatch::Integration::Session`, que llama a la aplicación Rack **completa,
@@ -829,7 +846,7 @@ end
 
 ### 4.10 De sistema: Capybara con Chromium headless
 
-11 ejemplos en `spec/system/`, 4,8 s. Toda la configuración está en
+11 ejemplos en `spec/system/`, ~4,6 s. Toda la configuración está en
 `spec/support/capybara.rb`, que es el archivo más comentado de la suite porque
 es donde más gente se traba.
 
@@ -844,23 +861,22 @@ end
 
 | Driver | Browser | JS | Velocidad medida acá |
 |---|---|---|---|
-| `:rack_test` | no hay, parsea HTML | ❌ | 8 ejemplos en 1,4 s |
-| `:cuprite` | Chromium via CDP | ✅ | 3 ejemplos en 2,8 s (0,93 s c/u) |
+| `:rack_test` | no hay, parsea HTML | ❌ | 8 ejemplos en ~1,5 s |
+| `:cuprite` | Chromium via CDP | ✅ | 3 ejemplos en ~3,2 s (~1,1 s c/u) |
 | `:selenium` | Chrome via chromedriver | ✅ | no se usa (ver abajo) |
 
 **Por qué cuprite y no selenium**: Selenium habla W3C WebDriver y necesita el
 binario `chromedriver`, cuya versión **mayor** tiene que coincidir con la del
-Chrome instalado. En este entorno hay Chromium 141 y ChromeDriver 147, así que
-Selenium directamente no arranca. Cuprite habla Chrome DevTools Protocol directo
-y elimina el problema de raíz. Es, además, la causa número uno de "el CI se
-rompió solo" en cualquier proyecto: Chrome se autoactualiza y el driver queda
-viejo.
+Chrome instalado. Acá hay Chromium 141.0.7390 y ChromeDriver 147.0.7727, así que
+Selenium directamente no arranca — y ése es el "el CI se rompió solo" número uno
+en cualquier proyecto, porque Chrome se autoactualiza y el driver queda viejo.
+Cuprite habla Chrome DevTools Protocol directo y elimina el problema de raíz.
 
 **La trampa grande de Rails 8**, documentada en `spec/support/capybara.rb:32-55`:
 `driven_by :cuprite` **re-registra el driver**, pisando cualquier
 `Capybara.register_driver(:cuprite)` que hayas escrito. En Rails 8,
-`ActionDispatch::SystemTesting::Driver#registerable?` incluye `:cuprite`. El
-síntoma es desconcertante:
+`ActionDispatch::SystemTesting::Driver#registerable?` devuelve true para
+`[:selenium, :cuprite, :rack_test, :playwright]`. El síntoma es desconcertante:
 
 ```text
 Browser did not produce websocket url within 10 seconds
@@ -898,13 +914,13 @@ end
 > **Java.** Es Selenium/Playwright con `@SpringBootTest(webEnvironment = RANDOM_PORT)`.
 > La diferencia dolorosa: en Spring, un test así con `@Transactional` **no
 > revierte**, porque el servidor corre en otro thread con otra conexión. En Rails
-> pasa exactamente lo mismo (§5.2), y por eso Rails 5+ hace que los system tests
+> pasa exactamente lo mismo (§7.2), y por eso Rails 5+ hace que los system tests
 > compartan la conexión entre el thread del test y el del servidor. Lo mismo que
 > ya sabés, con otro nombre.
 
 ### 4.11 De concurrencia: threads reales, conexiones separadas
 
-8 ejemplos en `spec/integration/concurrency_spec.rb`, 2,3 s. Son los tests que
+8 ejemplos en `spec/integration/concurrency_spec.rb`, ~2 s. Son los tests que
 separan un sistema de stock que funciona de uno que vende 14 unidades de las 10
 que tiene.
 
@@ -963,9 +979,13 @@ it "NUNCA deja el stock en negativo y sólo prosperan los que caben" do
 end
 ```
 
-Y el de deadlocks cruzados: dos transferencias que tocan los mismos dos productos
-en orden inverso. Sin `ORDER BY id` en el `SELECT ... FOR UPDATE`
-(`app/services/stock/apply_movement.rb:102`), eso es un deadlock garantizado.
+Y el de deadlocks cruzados (`spec/integration/concurrency_spec.rb:146`): dos
+transferencias que tocan los mismos dos productos en orden inverso. El bloqueo
+ordenado vive en `app/services/stock/transfers/dispatch.rb:99-101`
+(`.where(...).order(:id).lock` → `SELECT ... FOR UPDATE ORDER BY id`). Sin ese
+`order(:id)`, eso es un deadlock garantizado. Ojo con no confundirlo con
+`ApplyMovement#lock_stock_item!` (`app/services/stock/apply_movement.rb:102-104`),
+que bloquea **una sola fila** y por eso no necesita orden.
 
 **Por qué esto necesita `use_transactional_tests = false`**: la transacción del
 ejemplo nunca commitea, y un thread nuevo con otra conexión **no ve** datos de
@@ -1089,30 +1109,40 @@ request lo incrementa dos veces y el límite de 20 corta en 10.
 ### 5.1 Factories, traits, secuencias, asociaciones
 
 ```ruby
-# spec/factories/users.rb
+# spec/factories/users.rb:18-35
 factory :user do
   sequence(:email_address) { |n| "user#{n}@stock.test" }
   name { Faker::Name.name }
   password { "password123" }
   role { "operator" }
+  active { true }
 
   trait(:admin)    { role { "admin" } }
   trait(:manager)  { role { "manager" } }
+  trait(:operator) { role { "operator" } }
   trait(:viewer)   { role { "viewer" } }
   trait(:inactive) { active { false } }
 end
 ```
 
 ```ruby
-# spec/factories/stock.rb
+# spec/factories/stock.rb:4-21
 factory :stock_item do
   association :product        # crea el producto asociado si no se lo pasás
   association :warehouse
   quantity_on_hand { 100 }
+  quantity_reserved { 0 }
+  reorder_point { 10 }
+  reorder_quantity { 50 }
 
+  trait(:empty) { quantity_on_hand { 0 } }
   trait(:low) do
     quantity_on_hand { 5 }
     reorder_point { 20 }
+  end
+  trait(:with_reservations) do
+    quantity_on_hand { 100 }
+    quantity_reserved { 40 }
   end
 end
 ```
@@ -1121,7 +1151,7 @@ Puntos finos que están en el repo y que se preguntan:
 
 - **`sequence` en vez de Faker para lo único.** Con `Faker::Internet.email` a
   secas, tarde o temprano dos emails colisionan y tenés un flakey imposible de
-  reproducir. Está comentado en `spec/factories/users.rb:20-22`.
+  reproducir. Está comentado en `spec/factories/users.rb:19-22`.
 - **Todo es un bloque.** `quantity_on_hand { 100 }` y no `quantity_on_hand 100`.
   El bloque se evalúa en el momento de construir, así que `expires_at { 30.minutes.from_now }`
   se calcula por objeto, no al cargar el archivo.
@@ -1184,9 +1214,11 @@ create_list(:outbox_event, n)              # spec/jobs/outbox_publish_pending_jo
 | Variaciones | duplicar filas | `trait` | métodos `withX()` (builder) |
 
 El comentario de `spec/factories/users.rb:3-16` lo resume: **factories por
-defecto, `build_stubbed` siempre que puedas**. Este repo no tiene ni un fixture
-(`spec/fixtures` ni siquiera existe, aunque `rails_helper.rb:35` declare el path
-por convención).
+defecto, `build_stubbed` siempre que puedas**. Este repo no tiene ni un fixture:
+`spec/fixtures/` existe (`rails_helper.rb:35` declara ese path, que es la
+convención por defecto) pero adentro sólo está `vcr_cassettes/.keep`, el
+directorio de cassettes que configura `spec/support/vcr.rb:29`. Ni un `.yml` de
+fixtures.
 
 > **Java.** FactoryBot ≈ Object Mother + Test Data Builder en una sola cosa, con
 > dos ventajas que en Java hay que escribir a mano: (1) las **asociaciones se
@@ -1199,13 +1231,18 @@ por convención).
 ### 5.4 El lint de factories, y un bug real que encontré escribiendo esto
 
 ```ruby
-# spec/support/factory_bot.rb:11-14
+# spec/support/factory_bot.rb:10-15 (tal cual está hoy)
 config.before(:suite) do
   if ENV["LINT_FACTORIES"]
+    DatabaseCleanerStub = nil   # <- línea muerta: database_cleaner no está en el proyecto
     FactoryBot.lint(traits: true)
   end
 end
 ```
+
+Esa constante `DatabaseCleanerStub` no hace nada y se puede borrar; la dejo a la
+vista porque el resto del documento cita el archivo y no quiero que el código
+pegado difiera del real.
 
 `FactoryBot.lint` construye **todas** las factories y verifica que produzcan
 objetos válidos. Con `traits: true`, además construye cada trait por separado. El
@@ -1231,17 +1268,18 @@ Lo interesante es que **esos traits no están escritos en ningún lado**. En
 `:expired_soon` y `:already_expired`. ¿De dónde salen `committed`, `released`,
 `expired`?
 
-De **`FactoryBot.automatically_define_enum_traits`**, que en factory_bot 6 viene
-en `true` por defecto: por cada `enum` de ActiveRecord, FactoryBot inyecta un
-trait con el nombre de cada valor, en tiempo de compilación de la factory. Lo
-verifiqué forzando el compile:
+De **`FactoryBot.automatically_define_enum_traits`**, que en factory_bot 6.6.0
+(la versión del `Gemfile.lock`) viene en `true` por defecto: por cada `enum` de
+ActiveRecord, FactoryBot inyecta un trait con el nombre de cada valor, en tiempo
+de compilación de la factory. Lo verifiqué forzando el compile:
 
 ```ruby
 FactoryBot.factories.find(:stock_reservation).tap(&:compile).defined_traits.map(&:name)
 # => ["already_expired", "committed", "expired", "expired_soon", "held", "released"]
 ```
 
-Y `StockReservation` declara `enum :status, STATUSES.index_by(&:itself), validate: true`
+Y `StockReservation` declara
+`enum :status, STATUSES.index_by(&:itself), validate: true, prefix: :status`
 en `app/models/stock_reservation.rb:22`. El trait auto-generado pone
 `status: "committed"` **y nada más**, así que viola el CHECK
 `stock_reservations_committed_at_present`, que exige `committed_at` no nulo. El
@@ -1354,7 +1392,7 @@ La regla: **no mockees lo que no te pertenece; mockeá en los bordes.**
 |---|---|---|
 | ActiveRecord / Postgres | **No** | La base está a 1 ms y es lo que puede fallar de verdad |
 | Otro service tuyo | **No** (salvo aislar un fallo) | Perdés la integración, que es lo valioso |
-| Un HTTP externo | **Sí** | WebMock (§8) |
+| Un HTTP externo | **Sí** | WebMock (§9.1) |
 | El reloj | **Sí**, o `travel_to` | Determinismo |
 | Un broker de mensajes | **Sí** | `Outbox::Publisher::NoopAdapter` |
 | Una race condition imposible de provocar | **Sí**, con cuidado | Ver abajo |
@@ -1401,18 +1439,27 @@ config.use_transactional_fixtures = true
 ```
 
 Cada ejemplo corre dentro de una transacción que se revierte al terminar. El
-rollback es O(1); truncar tablas es O(filas). Con 325 ejemplos y ~9.400 queries
-por corrida, la diferencia es de segundos.
+rollback es O(1); truncar tablas es O(filas). Con 338 ejemplos y ~6.700 queries
+reales por corrida (~10.400 eventos `sql.active_record` si contás también
+`SCHEMA` y `TRANSACTION`), la diferencia es de segundos.
 
 Cómo funciona por dentro: Rails abre una transacción antes del ejemplo y hace
-`ROLLBACK` después. Las transacciones que abra tu código adentro se convierten en
-**savepoints** (`SAVEPOINT active_record_1`), no en transacciones nuevas. Eso
-tiene tres consecuencias prácticas:
+`ROLLBACK` después. Las transacciones que abra tu código adentro se implementan
+como **savepoints** (`SAVEPOINT active_record_1`), no como transacciones nuevas
+del motor. Tres consecuencias prácticas, y la primera es la que más gente tiene
+al revés:
 
-1. Los callbacks `after_commit` **no se disparan** por defecto (Rails 7.1+ los
-   ejecuta si usás `test_transaction` correctamente, pero conviene no depender
-   de ellos en tests). Este repo usa `ActiveRecord.after_all_transactions_commit`
-   en `app/services/outbox/recorder.rb`, que sí funciona en test.
+1. Los callbacks `after_commit` **sí se disparan** — es la creencia equivocada
+   más repetida de esta sección. Rails abre la transacción del ejemplo con
+   `joinable: false`, así que la transacción que abre tu código no se fusiona con
+   ella: es una frontera de commit real (implementada como savepoint) y al
+   liberarse corren `after_commit` y `ActiveRecord.after_all_transactions_commit`
+   —lo verifiqué con las dos en esta suite—. Lo que **no** hay es durabilidad: el
+   rollback del final borra todo igual, y otra conexión no ve nada. La creencia
+   viene de Rails 4, donde efectivamente no corrían y existía la gema
+   `test_after_commit`; desde Rails 5 está resuelto. Este repo usa
+   `ActiveRecord.after_all_transactions_commit` en
+   `app/services/outbox/recorder.rb:47`.
 2. Un `raise ActiveRecord::Rollback` en una transacción anidada **no revierte la
    de afuera** — es la trampa que documenta `app/services/application_service.rb:36-44`,
    y por eso el repo usa una excepción propia (`BusinessRuleViolation`).
@@ -1468,7 +1515,7 @@ La infraestructura está: `config/database.yml:95` usa
 `parallel_tests` y de `rails test:prepare`. **La gema `parallel_tests` no está
 instalada**, así que hoy la suite corre en un solo proceso.
 
-Con 15,4 s de reloj no hace falta. El cálculo para decidir cuándo sí: paralelizar
+Con 16 s de reloj no hace falta. El cálculo para decidir cuándo sí: paralelizar
 tiene un costo fijo de N boots de Rails (1,9 s cada uno acá) más N bases que
 crear. Con 4 procesos eso son ~8 s de overhead: sólo conviene cuando la suite
 pasa de ~60 s.
@@ -1582,25 +1629,37 @@ expect(page).to have_css("[data-transfer-lines-target='container'] > div", count
 
 ### 9.1 WebMock y VCR
 
-Las dos gemas están declaradas en el `Gemfile` (`webmock ~> 3.24`, `vcr ~> 6.3`)
-y resueltas en el lock (3.26.4 y 6.4.0). **Todavía no hay ningún spec que las
-use ni un `require "webmock/rspec"` en `spec/support/`**, porque esta app no
-llama a ningún servicio externo: el `Outbox::Publisher` se prueba con un
-`NoopAdapter` real, que es mejor que un stub de HTTP. Lo digo explícito para que
-no busques un archivo que no existe.
+Las dos gemas están en el `Gemfile` (`webmock ~> 3.24`, `vcr ~> 6.3`, resueltas
+en el lock a 3.26.4 y 6.4.0) y **están cableadas**: `spec/support/webmock.rb` y
+`spec/support/vcr.rb` los carga `rails_helper` con el glob de `spec/support/`.
+Lo que todavía no existe es un solo spec que las use, porque esta app no llama a
+ningún servicio externo: el `Outbox::Publisher` se prueba con un `NoopAdapter`
+real, que es mejor que un stub de HTTP. O sea: la red ya está cerrada, falta la
+integración que la justifique.
 
-Así se conectarían el día que haya una integración (por ejemplo, mandar la orden
-de compra al ERP del proveedor):
+El bloqueo es esto (`spec/support/webmock.rb:3` y `:25-29`):
 
 ```ruby
-# spec/support/webmock.rb
 require "webmock/rspec"
-WebMock.disable_net_connect!(allow_localhost: true)   # localhost: para Capybara/Puma
+
+WebMock.disable_net_connect!(
+  allow_localhost: true,                  # Capybara levanta Puma en 127.0.0.1
+  allow: [ "127.0.0.1", "localhost" ]     # y el CDP de Chromium habla por ahí
+)
 ```
 
-Esa línea es la que da el valor real: **si un test intenta salir a internet,
-falla**. Sin eso, la suite depende de la red y de un tercero, y se vuelve flakey
-por razones que no controlás.
+Ahí está el valor real: **si un test intenta salir a internet, falla**. Sin eso,
+la suite depende de la red y de un tercero, y se vuelve flakey por razones que no
+controlás. Lo comprobé pidiendo `https://example.com` dentro de un ejemplo: la
+request no sale.
+
+**Detalle que confunde al debuggear**: como `spec/support/vcr.rb:30` hace
+`config.hook_into :webmock`, VCR se pone *encima* de WebMock, y una request no
+stubbeada levanta `VCR::Errors::UnhandledHTTPRequestError`, **no**
+`WebMock::NetConnectNotAllowedError`. Si buscás el nombre equivocado en el
+mensaje de error, perdés diez minutos.
+
+Con la red cerrada, el stub explícito sigue funcionando igual:
 
 ```ruby
 stub_request(:post, "https://erp.proveedor.com/orders")
@@ -1610,39 +1669,48 @@ stub_request(:post, "https://erp.proveedor.com/orders")
 ```
 
 VCR va un paso más allá: graba la interacción real una vez en un YAML
-("cassette") y la reproduce después.
+("cassette") y la reproduce después. La config real
+(`spec/support/vcr.rb:28-49`), con lo que importa:
 
 ```ruby
-# spec/support/vcr.rb
-VCR.configure do |c|
-  c.cassette_library_dir = "spec/cassettes"
-  c.hook_into :webmock
-  c.configure_rspec_metadata!                      # habilita `:vcr` como tag
+VCR.configure do |config|
+  config.cassette_library_dir = Rails.root.join("spec/fixtures/vcr_cassettes").to_s
+  config.hook_into :webmock
+  config.configure_rspec_metadata!   # habilita `it "...", :vcr do`
+  config.ignore_localhost = true     # nunca grabar el server de Capybara
 
   # FILTRADO DE SECRETOS: sin esto, commiteás tu API key en un YAML.
-  c.filter_sensitive_data("<ERP_TOKEN>") { ENV["ERP_TOKEN"] }
-  c.filter_sensitive_data("<AUTH>") { |i| i.request.headers["Authorization"]&.first }
+  config.filter_sensitive_data("<AUTHORIZATION>") { |i| i.request.headers["Authorization"]&.first }
+  config.filter_sensitive_data("<API_KEY>") { ENV.fetch("EXTERNAL_API_KEY", nil) }
 
-  c.default_cassette_options = {
-    record: :once,                                  # graba si no existe, si no reproduce
-    match_requests_on: [ :method, :uri, :body ]
+  config.default_cassette_options = {
+    record: :once,                       # graba si no existe; si existe, sólo reproduce
+    match_requests_on: %i[method uri],
+    allow_playback_repeats: true
   }
-end
-
-it "manda la orden al ERP", :vcr do
-  # el cassette se llama solo, derivado del nombre del ejemplo
 end
 ```
 
-El filtrado de secretos no es opcional: VCR graba **headers y body completos**,
-incluida la `Authorization`. Es una de las formas más comunes de filtrar
-credenciales a un repo público.
+Hoy `spec/fixtures/vcr_cassettes/` tiene sólo un `.keep`: ningún ejemplo está
+marcado con `:vcr` todavía.
+
+El filtrado no es opcional: VCR graba **headers y body completos**, incluida la
+`Authorization`, y el YAML queda adentro de `spec/`, donde nadie lo mira.
+
+`match_requests_on: %i[method uri]` es el default de este repo y tiene una
+consecuencia: si tu API manda datos distintos en cada llamada (timestamps,
+nonces) y necesitás discriminar por body, hay que agregar `:body` y normalizarlo,
+o el cassette matchea de más.
 
 Cuándo cada uno: **WebMock** cuando vos definís la respuesta (casos de error,
 timeouts, 500); **VCR** cuando la respuesta real es compleja y no querés
 escribirla a mano. El riesgo de VCR es que el cassette envejece y tu test valida
 un contrato que el proveedor ya cambió — mitigalo re-grabando periódicamente
 (`record: :all` en una corrida manual).
+
+Y hay un tercer tag propio, `:external_http` (`spec/support/webmock.rb:34-36`):
+los ejemplos marcados así se **saltean** salvo que corras con `ALLOW_NET=1`.
+Deberían ser cero; el tag existe para poder auditar los que no lo son.
 
 > **Java.** WebMock ≈ WireMock con stubs programáticos; VCR ≈ WireMock en modo
 > *record & playback* (`--proxy-all` + `--record-mappings`). La diferencia
@@ -1654,7 +1722,7 @@ un contrato que el proveedor ya cambió — mitigalo re-grabando periódicamente
 ### 9.2 Cobertura con SimpleCov
 
 ```ruby
-# spec/spec_helper.rb:9-26 — TIENE que ir antes que cualquier código de la app
+# spec/spec_helper.rb:8-26 — TIENE que ir antes que cualquier código de la app
 require "simplecov"
 SimpleCov.start "rails" do
   enable_coverage :branch
@@ -1673,9 +1741,9 @@ en la primera línea de `spec_helper.rb`, que a su vez está en `.rspec` como
 Corriendo `COVERAGE=1 bundle exec rspec` en esta máquina:
 
 ```text
-Line coverage:   1659 / 2098 (79,07 %)
-Branch coverage:  311 / 543  (57,27 %)
-Finished in 20,63 seconds        # contra 15,41 s sin cobertura: +34 %
+Line coverage:   1862 / 2105 (88,45 %)
+Branch coverage:  346 / 547  (63,25 %)
+Finished in 21,4 seconds         # contra 16,1 s sin cobertura: +33 %
 ```
 
 **Line vs branch**, con un ejemplo del repo:
@@ -1687,9 +1755,9 @@ return Result.failure(:invalid_quantity, "...") unless @quantity.positive?
 
 Un solo test con `quantity: 10` marca esa **línea** como cubierta. Pero la rama
 "quantity no positiva" nunca se ejecutó. Con `enable_coverage :branch`, SimpleCov
-te muestra que falta. Por eso la diferencia entre 79 % de línea y 57 % de rama es
-información, no ruido: **te está diciendo que hay 232 caminos condicionales sin
-probar**.
+te muestra que falta. Por eso la diferencia entre 88 % de línea y 63 % de rama es
+información, no ruido: **te está diciendo que hay 201 caminos condicionales sin
+probar** (547 − 346).
 
 **Por qué el 100 % no es la meta**, y el umbral está en 70/45:
 
@@ -1756,48 +1824,50 @@ Medido acá, con `PROFILE=1 bundle exec rspec` (que activa
 `config.profile_examples = 10`, `spec_helper.rb:47`):
 
 ```text
-Top 10 más lentos: 5,65 s = 36,7 % del tiempo total
-  1,43 s  spec/system/transfer_with_js_spec.rb:49   (transferencia completa con Chromium)
-  0,88 s  spec/requests/api/v1/rate_limiting_spec.rb:98  (400 requests a /up)
-  0,68 s  spec/system/transfer_with_js_spec.rb:36
+Top 10 más lentos: 6,41 s = 34,8 % del tiempo total
+  1,52 s  spec/system/transfer_with_js_spec.rb:49        (transferencia completa con Chromium)
+  0,96 s  spec/system/transfer_with_js_spec.rb:83
+  0,74 s  spec/requests/api/v1/endpoint_coverage_spec.rb:99  (recorre todas las rutas)
+  0,69 s  spec/system/transfer_with_js_spec.rb:36
+  0,65 s  spec/requests/api/v1/rate_limiting_spec.rb:98  (400 requests a /up)
   ...
-Finished in 15,41 seconds (files took 1,89 seconds to load)
+Finished in 16,09 seconds (files took 1,85 seconds to load)
 ```
 
 Los cinco costos, en orden de impacto:
 
-1. **Boot de Rails: 1,89 s.** Es fijo por proceso. Con `bootsnap` (está en el
+1. **Boot de Rails: ~1,9 s.** Es fijo por proceso. Con `bootsnap` (está en el
    `Gemfile`) ya está optimizado. En CI, `config.eager_load = ENV["CI"].present?`
    (`config/environments/test.rb:16`) lo empeora a propósito, para detectar
    errores de autoload que en desarrollo no aparecen. Es el trade-off correcto.
-2. **Los system tests: 4,8 s por 11 ejemplos.** Chromium arranca una vez y se
+2. **Los system tests: ~4,6 s por 11 ejemplos.** Chromium arranca una vez y se
    reusa, pero cada `visit` es un round-trip real.
-3. **`create` de FactoryBot.** ~9.400 queries en toda la corrida. Cada `create`
-   evitable son 2,8 ms (§5.2).
+3. **`create` de FactoryBot.** ~6.700 queries en toda la corrida. Cada `create`
+   evitable son ~2,8 ms (§5.2).
 4. **bcrypt.** Ver abajo.
-5. **SimpleCov: +34 %** (15,41 s → 20,63 s). Por eso está detrás de
+5. **SimpleCov: +33 %** (16,1 s → 21,4 s). Por eso está detrás de
    `if ENV["COVERAGE"]` y sólo se activa en CI.
 
 **El costo de bcrypt, con números medidos en esta máquina:**
 
 ```ruby
-BCrypt::Password.create("x", cost: 4)   # 1,1 ms      <- lo que usa el entorno test
-BCrypt::Password.create("x", cost: 12)  # 233,5 ms    <- lo que usa producción
-# ratio: 214x
+BCrypt::Password.create("x", cost: 4)   # 1,2 ms      <- lo que usa el entorno test
+BCrypt::Password.create("x", cost: 12)  # 243 ms      <- lo que usa producción
+# ratio: ~200x
 ```
 
 Rails setea `ActiveModel::SecurePassword.min_cost = true` en el entorno de test
 (lo verifiqué: `min_cost` es `true`, y `BCrypt::Engine.cost` global es 12). Eso
-baja el cost a 4.
+baja el cost a `BCrypt::Engine::MIN_COST`, que es 4.
 
-La suite hace **158 `INSERT INTO users`** (lo conté instrumentando
+La suite hace **171 `INSERT INTO users`** (lo conté instrumentando
 `sql.active_record` en una corrida completa). La cuenta:
 
-- Con cost 4: 158 × 1,1 ms ≈ **0,17 s**.
-- Con cost 12: 158 × 233,5 ms ≈ **36,9 s**.
+- Con cost 4: 171 × 1,2 ms ≈ **0,2 s**.
+- Con cost 12: 171 × 243 ms ≈ **41,5 s**.
 
-O sea que sin `min_cost`, esta suite pasaría de 15,4 s a más de 52 s: **3,4 veces
-más lenta, y el 71 % del tiempo sería hashear passwords**. Es la optimización
+O sea que sin `min_cost`, esta suite pasaría de 16 s a casi 60 s: **más del
+triple, y el 70 % del tiempo sería hashear passwords**. Es la optimización
 más rentable de cualquier suite Rails, y viene gratis. El bug clásico es
 sobreescribirla con `config.active_model.secure_password_min_cost = false` o
 setear `BCrypt::Engine.cost` en un initializer sin condicionarlo por entorno.
@@ -1812,7 +1882,7 @@ Cómo medir, en orden de utilidad:
 
 ```bash
 PROFILE=1 bundle exec rspec              # top 10 de ejemplos y de grupos
-bundle exec rspec --dry-run              # ¿cuántos ejemplos hay? (325)
+bundle exec rspec --dry-run              # ¿cuántos ejemplos hay? (338)
 bundle exec rspec spec/services          # tiempo por capa
 ```
 
@@ -1821,8 +1891,9 @@ bundle exec rspec spec/services          # tiempo por capa
 ## 10. TDD en la práctica sobre este dominio
 
 El ciclo sobre una regla real: **"no se puede egresar stock que está reservado
-para otro"**. Es la regla que hoy vive en `app/services/stock/apply_movement.rb:124`
-y que prueba `spec/services/stock/issue_spec.rb:35`.
+para otro"**. Es la regla que hoy vive en
+`app/services/stock/apply_movement.rb:122-127` y que prueba
+`spec/services/stock/issue_spec.rb:35`.
 
 ### Rojo
 
@@ -1864,7 +1935,7 @@ def validate!(item)
   new_on_hand  = item.quantity_on_hand + quantity
   new_reserved = item.quantity_reserved + reserved_delta
 
-  # ... (la regla de stock físico ya existía, línea 111)
+  # ... (la regla de stock físico ya existía, líneas 110-115)
 
   # LA invariante del dominio: no podés comprometer más de lo que tenés.
   if new_reserved > new_on_hand
@@ -1891,12 +1962,15 @@ tiene y que sólo son seguros con el test escrito:
 2. **Devolver `details` accionables** (`available:`, `requested:`) para que la API
    pueda responder un 422 útil. Esto se probó primero acá y después, una sola
    vez, en `spec/requests/api/v1/stock_operations_spec.rb`.
-3. **Confirmar que la transacción revierte**, con un test que sólo se puede
-   escribir después:
+3. **Confirmar que la transacción revierte**, con una aserción que sólo se puede
+   escribir después (`spec/services/stock/issue_spec.rb:28-33`):
 
 ```ruby
-it "no modifica nada cuando falla" do
-  expect { issue(500) }.not_to change { item.reload.quantity_on_hand }
+it "rechaza sacar más de lo que hay" do
+  result = issue(500)
+  expect(result.error.code).to eq(:insufficient_stock)
+  expect(result.error.details).to include(requested: 500)
+  expect(item.reload.quantity_on_hand).to eq(100)   # intacto
 end
 ```
 
@@ -2089,9 +2163,9 @@ Arreglo: primera línea de `spec/spec_helper.rb`, y `spec_helper` cargado desde
 `.rspec` con `--require spec_helper`.
 
 **8. La suite tarda 3 veces lo que debería y nadie sabe por qué.**
-Síntoma: 52 s en vez de 15 s.
-Causa típica: bcrypt con cost de producción en test (medido acá: 233,5 ms vs 1,1
-ms por hash, 214×; con 158 usuarios creados son 37 s de puro hash). Suele
+Síntoma: casi 60 s en vez de 16 s.
+Causa típica: bcrypt con cost de producción en test (medido acá: 243 ms vs 1,2
+ms por hash, ~200×; con 171 usuarios creados son 41 s de puro hash). Suele
 aparecer por un initializer que setea `BCrypt::Engine.cost` sin condicionar por
 entorno.
 Arreglo: dejar que Rails maneje `ActiveModel::SecurePassword.min_cost` (es `true`
@@ -2118,13 +2192,23 @@ Causa: el archivo no está en `spec/requests/`, así que
 `infer_spec_type_from_file_location!` no le puso `type: :request`.
 Arreglo: movelo, o declará `RSpec.describe "...", type: :request` explícito.
 
-**12. Un `after_commit` que no se dispara en los tests y sí en producción.**
-Síntoma: el test verifica que se encoló un job y no se encoló.
-Causa: con transactional fixtures las transacciones de tu código son
-**savepoints**, no transacciones de nivel superior.
-Arreglo: usar `ActiveRecord.after_all_transactions_commit` (es lo que hace
-`app/services/outbox/recorder.rb`) o `enqueue_after_transaction_commit` de Active
-Job, que sí funcionan en test.
+**12. Un job encolado adentro de una transacción se procesa antes del `COMMIT` —
+o después de un `ROLLBACK`.**
+Síntoma: el worker levanta el job y no encuentra la fila; o corre un job de una
+operación que se revirtió.
+Causa: con Sidekiq, `perform_later` escribe en Redis en el acto, sin esperar la
+transacción.
+Arreglo: `self.enqueue_after_transaction_commit = true` **en la clase del job**
+(o en `ApplicationJob`). Cuidado con la trampa: en Rails 8.1 el railtie de Active
+Job **excluye a propósito** esa clave de la configuración global
+(`active_job/railtie.rb`, comentario "This config can't be applied globally"),
+así que `config.active_job.enqueue_after_transaction_commit` en un initializer no
+tiene efecto. En este repo está seteada así en
+`config/initializers/sidekiq.rb:74`, y lo verifiqué: hoy
+`ActiveJob::Base.enqueue_after_transaction_commit` es `false`. Y para lo que no
+se puede perder, esto no alcanza: va el patrón outbox
+(`app/services/outbox/recorder.rb:47`, con
+`ActiveRecord.after_all_transactions_commit`).
 
 ---
 
@@ -2134,10 +2218,10 @@ Job, que sí funcionan en test.
 
 > Minitest viene con Rails, es chico y es Ruby común: para una gema o un servicio
 > simple lo elijo sin dudar. Para una app de dominio uso RSpec por tres cosas
-> concretas: `let` perezoso (con siete dependencias por grupo, materializar sólo
-> lo que el ejemplo usa importa), metadata como `:concurrency` o `js: true` que
-> dispara hooks globales sin heredar de nada, y que la salida con
-> `--format documentation` es la especificación del negocio leíble.
+> concretas: `let` perezoso (con cuatro o cinco dependencias por grupo,
+> materializar sólo lo que el ejemplo usa importa), metadata como `:concurrency`
+> o `js: true` que dispara hooks globales sin heredar de nada, y que la salida
+> con `--format documentation` es la especificación del negocio leíble.
 >
 > El costo real es el DSL: RSpec tiene diez veces más código que Minitest y es
 > facilísimo escribir specs ilegibles con `shared_examples` anidados. Mi regla es
@@ -2146,10 +2230,10 @@ Job, que sí funcionan en test.
 
 **"¿Cómo se distribuyen tus tests? ¿Pirámide?"**
 
-> Pirámide aplanada, más cerca del "trofeo". En esta suite el 18 % son specs de
-> servicio y ahí está la lógica de negocio; el 12 % son request specs que prueban
+> Pirámide aplanada, más cerca del "trofeo". En esta suite el 17 % son specs de
+> servicio y ahí está la lógica de negocio; el 15 % son request specs que prueban
 > sólo el contrato HTTP, sin repetir casos de negocio; y sólo el 3 % son system
-> tests, que se llevan el 31 % del tiempo. Ésa es la proporción que quiero.
+> tests, que se llevan casi el 30 % del tiempo. Ésa es la proporción que quiero.
 >
 > La razón de que en Rails la pirámide se aplane es que **el contexto se bootea
 > una sola vez y no hay `@DirtiesContext`**: un test contra Postgres real tarda 60
@@ -2214,7 +2298,7 @@ Job, que sí funcionan en test.
 **"¿Qué cobertura buscás?"**
 
 > Ninguna en particular como número. Los umbrales de esta suite están en 70 % de
-> línea y 45 % de rama, y hoy está en 79 % / 57 %. Poner 100 % obliga a escribir
+> línea y 45 % de rama, y hoy está en 88 % / 63 %. Poner 100 % obliga a escribir
 > tests basura para tapar `attr_reader`s, y esos tests después hay que
 > mantenerlos. Además la cobertura mide qué se **ejecutó**, no qué se **verificó**:
 > un spec que llama al método sin ninguna aserción da 100 % y cero valor.
@@ -2222,8 +2306,8 @@ Job, que sí funcionan en test.
 > Lo que sí miro: la tendencia entre PRs, la cobertura del grupo `Services` por
 > separado —para que el promedio no se diluya con vistas y helpers—, los archivos
 > en 0 % (casi siempre es código muerto) y la **cobertura de rama** en los
-> servicios. La brecha entre 79 % de línea y 57 % de rama me está diciendo que hay
-> 232 caminos condicionales sin probar, y ésos son los `unless` de error que
+> servicios. La brecha entre 88 % de línea y 63 % de rama me está diciendo que hay
+> 201 caminos condicionales sin probar, y ésos son los `unless` de error que
 > aparecen en producción.
 
 **"¿Cómo hacés rápida una suite Rails?"**
@@ -2232,15 +2316,15 @@ Job, que sí funcionan en test.
 > acá es caro.
 >
 > Los cuatro costos reales, en orden: los system tests (acá el 3 % de los
-> ejemplos se lleva el 31 % del tiempo — y está bien, mientras sean pocos y bien
-> elegidos), los `create` de FactoryBot (`build_stubbed` es 5-6× más barato, y en
+> ejemplos se lleva casi el 30 % del tiempo — y está bien, mientras sean pocos
+> y bien elegidos), los `create` de FactoryBot (`build_stubbed` es 5-6× más barato, y en
 > los specs de policy eso significa 33 ejemplos en medio segundo sin tocar la
-> base), bcrypt, y SimpleCov (+34 %, por eso va detrás de una variable de entorno
+> base), bcrypt, y SimpleCov (+33 %, por eso va detrás de una variable de entorno
 > y sólo corre en CI).
 >
 > Lo de bcrypt es el ejemplo que más me gusta porque es aritmética: cost 12 son
-> 233 ms por hash y cost 4 son 1,1 ms. Esta suite crea 158 usuarios, así que sin
-> `min_cost` pasaría de 15 s a más de 52, con el 71 % del tiempo hasheando
+> 243 ms por hash y cost 4 son 1,2 ms. Esta suite crea 171 usuarios, así que sin
+> `min_cost` pasaría de 16 s a casi 60, con el 70 % del tiempo hasheando
 > passwords. Rails lo maneja solo en test; el bug aparece cuando alguien setea
 > `BCrypt::Engine.cost` en un initializer sin condicionar por entorno.
 >

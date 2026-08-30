@@ -85,7 +85,8 @@ Y el factor VI merece un ⚠️ grande en este repo: `config.active_storage.serv
 :local` con `config/storage.yml` apuntando a `Rails.root.join("storage")`. Eso
 está bien para desarrollo, pero en un contenedor significa que **los archivos
 subidos desaparecen en el próximo deploy**. El arreglo es un volumen persistente
-(en Kamal, `volumes: ["app_storage:/rails/storage"]`) o, mejor, S3.
+(el `config/deploy.yml` de este repo ya declara
+`volumes: ["stock_storage:/rails/storage"]`) o, mejor, S3.
 
 ---
 
@@ -126,13 +127,13 @@ Valores tomados de los tres archivos del repo:
 | `log_level` | `debug` | `debug` | `ENV["RAILS_LOG_LEVEL"]` o `info` |
 | `public_file_server.headers` | `max-age=2.days` sólo con cache on | `max-age=3600` | `max-age=1.year` |
 | `active_record.migration_error` | `:page_load` | — | — |
-| `active_record.attributes_for_inspect` | todos | todos | `[:id]` |
-| `report_deprecations` | log | stderr | `false` |
+| `active_record.attributes_for_inspect` | `:all` | `:all` | `[:id]` |
+| deprecaciones | `active_support.deprecation = :log` | `= :stderr` | `report_deprecations = false` |
 | `silence_healthcheck_path` | — | — | `/up` |
 | `force_ssl` | — | — | **comentado** (`production.rb:31`) |
-| `hosts` | localhost | — | **comentado** (`production.rb:83`) |
+| `hosts` | `.localhost`, `.test` y cualquier IP | — | **comentado** (`production.rb:83`) |
 
-Cuatro cosas de esa tabla que hay que poder explicar:
+Cinco cosas de esa tabla que hay que poder explicar:
 
 **`eager_load`.** En dev, Rails carga las clases *lazy* vía Zeitwerk: la primera
 vez que nombrás `Stock::ApplyMovement`, el autoloader busca
@@ -150,6 +151,12 @@ los campos en una entidad JPA.
 
 **`silence_healthcheck_path = "/up"`.** El balanceador pega a `/up` cada uno o dos
 segundos. Sin esto, el 90% de tus logs son healthchecks.
+
+**Las deprecaciones son dos opciones distintas y se confunden todo el tiempo.**
+`config.active_support.deprecation` elige el *comportamiento* (`:log` en dev,
+`:stderr` en test, y podés poner `:raise` para que una deprecación rompa el
+build). `config.active_support.report_deprecations = false` (`production.rb:47`)
+es otra cosa: apaga el reporte entero. No son intercambiables.
 
 **`force_ssl` comentado.** Está así porque el generador de Rails lo deja
 comentado, y este repo no lo tocó. En un deploy real hay que decidir: si
@@ -222,10 +229,12 @@ $ ls -la config/credentials.yml.enc config/master.key
 -rw------- 1 root root  32 config/master.key
 ```
 
-`credentials.yml.enc` es un YAML cifrado con **AES-256-GCM**, y la clave de 32
-bytes hexadecimales vive en `config/master.key`. El `.enc` **se commitea**; la
-`.key` **nunca** (`/config/*.key` está en `.gitignore`, y también en
-`.dockerignore:14-15`, así que ni siquiera entra a la imagen).
+`credentials.yml.enc` es un YAML cifrado con **AES-128-GCM**. Ojo con esto porque
+casi todo el mundo dice "AES-256": `ActiveSupport::EncryptedFile::CIPHER` es
+literalmente `"aes-128-gcm"`, y la clave son **32 caracteres hexadecimales** —o
+sea 16 bytes, 128 bits— que viven en `config/master.key`. El `.enc` **se
+commitea**; la `.key` **nunca** (`/config/*.key` está en `.gitignore`, y también
+en `.dockerignore:14-15`, así que ni siquiera entra a la imagen).
 
 Contenido real de este repo:
 
@@ -354,7 +363,7 @@ build, sólo en el runtime.
 
 ## 4. El `Dockerfile` de Rails 8, bloque por bloque
 
-El archivo tiene 78 líneas y hace más de lo que parece. Lo recorro entero.
+El archivo tiene 77 líneas y hace más de lo que parece. Lo recorro entero.
 
 ### Bloque 1 — la etapa `base` (líneas 11-28)
 
@@ -565,13 +574,46 @@ En una API pública eso es un vector de DoS trivial. Ponele un número.
 
 ### 6.1 Estado real en este repo
 
-Seamos precisos: **este repo tiene la gema Kamal en el `Gemfile` (línea 231,
-`kamal 2.12.0`, `require: false`) pero NO tiene `config/deploy.yml`.** O sea,
-nunca se corrió `kamal init`. El `.dockerignore:42-44` ya ignora
-`/config/deploy*.yml` y `/.kamal` a la espera de que existan.
+La gema está en el `Gemfile:231` (`kamal 2.12.0`, `require: false`) y la
+configuración **existe y es válida**:
 
-Lo que sigue es cómo se configuraría, con el template que la gema 2.12.0 genera de
-verdad (`kamal-2.12.0/lib/kamal/cli/templates/deploy.yml`), no una invención.
+```bash
+$ ls config/deploy.yml .kamal/
+config/deploy.yml
+
+.kamal/:
+hooks
+secrets
+
+$ bundle exec kamal config
+---
+:roles:
+- job
+- web
+:hosts:
+- 192.168.0.2
+- 192.168.0.1
+:primary_host: 192.168.0.1
+:version: 7a036ef0bfe149583e0060146b43e30faed66acd
+:repository: tu-usuario/stock
+...
+```
+
+Tres detalles del estado real que hay que tener presentes:
+
+- `config/deploy.yml` **está commiteado**; `.kamal/secrets` **no** (`.gitignore:49`).
+  Eso es lo correcto: la config es pública, los secretos no.
+- `.kamal/hooks/` sólo tiene los `*.sample` que genera `kamal init`. Kamal busca
+  el archivo con el nombre exacto (`hook_exists?` hace
+  `File.join(hooks_path, "pre-deploy")`, sin sufijo), así que **hoy no corre
+  ningún hook**. Renombrar `pre-deploy.sample` a `pre-deploy` y hacerlo
+  ejecutable es todo lo que hace falta para activarlo.
+- Las IPs (`192.168.0.1`/`.2`), el `image:` y el `host:` del proxy son
+  placeholders. La config parsea y valida, pero un `kamal deploy` contra esos
+  valores no llega a ningún lado.
+
+Lo que falta para deployar de verdad: reemplazar esos placeholders y **descomentar
+algo en `.kamal/secrets`**, que hoy está entero comentado (§6.3).
 
 ### 6.2 Qué es
 
@@ -582,90 +624,129 @@ proxy reverso (`kamal-proxy`, otro contenedor) para que el tráfico apunte al
 contenedor nuevo.
 
 ```yaml
-# config/deploy.yml — la forma que tendría acá (basado en el template de kamal 2.12.0)
+# config/deploy.yml — el archivo REAL de este repo (recortado; los comentarios
+# largos y el bloque `accessories` comentado quedan afuera).
 service: stock
-image: tu-usuario/stock
 
+# Con Docker Hub alcanza el nombre; con GHCR o ECR va la URL completa.
+image: <%= ENV.fetch("KAMAL_IMAGE", "tu-usuario/stock") %>
+
+# Servidores agrupados por ROL. Separar `web` de `job` es LA decisión de
+# arquitectura de este archivo: perfiles de recursos y de escalado distintos.
 servers:
   web:
     - 192.168.0.1
   job:
     hosts:
       - 192.168.0.2
-    cmd: bin/jobs           # <- el worker de Solid Queue de este repo
+    # `cmd` sobreescribe el CMD del Dockerfile: MISMA IMAGEN, distinto proceso.
+    cmd: bin/jobs
 
 proxy:
   ssl: true
-  host: stock.example.com
-  # app_port: 80            # el contenedor expone 80 (Thruster)
-  # healthcheck:
-  #   path: /up
-  #   interval: 1
-  #   timeout: 5
+  host: stock.tu-dominio.test
+  healthcheck:
+    path: /up
+    interval: 3
+    timeout: 5
 
+# La password sale de .kamal/secrets, NUNCA de acá.
 registry:
-  server: ghcr.io
-  username: tu-usuario
+  username: <%= ENV.fetch("KAMAL_REGISTRY_USER", "tu-usuario") %>
   password:
-    - KAMAL_REGISTRY_PASSWORD    # se resuelve desde .kamal/secrets
+    - KAMAL_REGISTRY_PASSWORD
 
 builder:
   arch: amd64
+  cache:
+    type: registry
 
+# `clear` queda en el archivo; `secret` sólo nombra la variable y el valor sale
+# de .kamal/secrets.
 env:
   clear:
+    RAILS_ENV: production
     RAILS_MAX_THREADS: 5
     WEB_CONCURRENCY: 2
-    SOLID_QUEUE_IN_PUMA: ""      # explícitamente vacío: workers aparte
+    SOLID_QUEUE_IN_PUMA: false   # ⚠️ ver §7.4: esto NO hace lo que parece
+    QUEUE_ADAPTER: solid_queue
+    OUTBOX_ADAPTER: webhook
   secret:
     - RAILS_MASTER_KEY
     - DATABASE_URL
+    - OUTBOX_WEBHOOK_URL
     - OUTBOX_WEBHOOK_SECRET
 
+# `bin/kamal <alias>`: mismo contenedor, sesión interactiva.
+aliases:
+  console: app exec --interactive --reuse "bin/rails console"
+  shell: app exec --interactive --reuse "bash"
+  logs: app logs -f
+  dbc: app exec --interactive --reuse "bin/rails dbconsole"
+  migrate: app exec --reuse "bin/rails db:migrate"
+  reconcile: app exec --reuse "bin/rails stock:reconcile"   # lib/tasks/stock.rake
+
+# El contenedor es EFÍMERO: lo que no esté en un volumen se pierde en el deploy.
 volumes:
-  - "stock_storage:/rails/storage"   # Active Storage :local necesita esto
+  - "stock_storage:/rails/storage"
 
-asset_path: /rails/public/assets     # ver §9
-
-accessories:
-  db:
-    image: postgres:16
-    host: 192.168.0.2
-    port: 5432
-    env:
-      secret:
-        - POSTGRES_PASSWORD
-    directories:
-      - data:/var/lib/postgresql/data
-  redis:
-    image: valkey/valkey:8
-    host: 192.168.0.2
-    directories:
-      - data:/data
+# Asset bridging entre versiones — ver §9.4.
+asset_path: /rails/public/assets
 ```
+
+Dos observaciones sobre este archivo concreto:
+
+- **`accessories` está comentado**, y es lo correcto para producción: un Postgres
+  en un contenedor gestionado por Kamal no tiene backups automáticos ni failover
+  (§6.8).
+- **`SOLID_QUEUE_IN_PUMA: false` no apaga nada.** Es la trampa más cara del
+  archivo y la desarmo en §7.4.
 
 ### 6.3 Secretos
 
-Los secretos **no van en `deploy.yml`**: van en `.kamal/secrets`, que es un
-archivo de shell que Kamal evalúa. El template real de la gema es explícito:
+Los secretos **no van en `deploy.yml`**: van en `.kamal/secrets`. No es un script
+de shell: Kamal lo parsea con **Dotenv** (`Kamal::Secrets#secrets` hace
+`::Dotenv.parse`), con una extensión propia
+(`Kamal::Secrets::Dotenv::InlineCommandSubstitution`) que sí ejecuta los `$(...)`.
+De ahí salen los nombres que `deploy.yml` declara bajo `registry/password`,
+`env/secret`, `builder/secrets` y `accessories/*/env/secret`. La primera línea del
+archivo lo dice en mayúsculas: *"DO NOT ENTER RAW CREDENTIALS HERE! This file
+needs to be safe for git."*
+
+⚠️ **En este repo el archivo existe pero está entero comentado.** Con cuatro
+variables declaradas como `secret` en `deploy.yml` y nada que las resuelva, el
+deploy corta con:
+
+```text
+Kamal::ConfigurationError: Secret 'RAILS_MASTER_KEY' not found in .kamal/secrets
+```
+
+Hay que descomentar una de las tres formas:
 
 ```bash
-# .kamal/secrets — "DO NOT ENTER RAW CREDENTIALS HERE! This file needs to be safe for git."
+# .kamal/secrets
 
-# Opción 1: desde el entorno
+# Opción 1: desde el entorno (lo que usás en el CI: GitHub Actions inyecta el secret)
 KAMAL_REGISTRY_PASSWORD=$KAMAL_REGISTRY_PASSWORD
 
 # Opción 2: vía comando
 RAILS_MASTER_KEY=$(cat config/master.key)
 
-# Opción 3: vía adapters (1Password, Bitwarden, LastPass, Doppler, AWS Secrets Manager...)
+# Opción 3: vía adapters. Kamal 2.12.0 trae 1Password, Bitwarden (y Bitwarden
+# Secrets Manager), LastPass, Doppler, Enpass, Passbolt, AWS Secrets Manager y
+# GCP Secret Manager — están en kamal-2.12.0/lib/kamal/secrets/adapters/.
 SECRETS=$(kamal secrets fetch --adapter 1password --account mi-cuenta \
           --from MiVault/MiItem KAMAL_REGISTRY_PASSWORD RAILS_MASTER_KEY)
 RAILS_MASTER_KEY=$(kamal secrets extract RAILS_MASTER_KEY $SECRETS)
 ```
 
-Con destinos (`kamal deploy -d staging`) hay `.kamal/secrets-common` y
-`.kamal/secrets.staging`.
+La opción 2 es cómoda y tiene una trampa: `cat config/master.key` sólo funciona
+desde una máquina que tenga el archivo. En el CI no lo tenés (está gitignoreado),
+así que ahí va sí o sí la opción 1 o la 3.
+
+Con destinos (`kamal deploy -d staging`) hay `.kamal/secrets-common` para lo
+compartido y `.kamal/secrets.staging` para lo específico; `.kamal/secrets` se usa
+sólo cuando no elegís destino.
 
 ### 6.4 El deploy, paso a paso
 
@@ -674,7 +755,8 @@ servidor, `docker pull` → arranca el contenedor nuevo **en paralelo al viejo**
 espera el healthcheck → le dice a `kamal-proxy` que corte el tráfico al viejo y lo
 mande al nuevo → drena el viejo → lo mata.
 
-Los defaults reales de Kamal 2.12.0 (`lib/kamal/configuration.rb:232-241`):
+Los defaults reales de Kamal 2.12.0 (`lib/kamal/configuration.rb:232-241` para
+los tres timeouts, `268-273` para los dos paths):
 
 | Opción | Default | Qué controla |
 |---|---|---|
@@ -694,7 +776,8 @@ Comandos que se usan en el día a día:
 kamal setup                    # primera vez: instala docker, arranca accessories
 kamal deploy                   # build + push + rollout
 kamal deploy -d staging        # a otro destino
-kamal redeploy                 # sin rebuild, sólo redeploy de la imagen actual
+kamal redeploy                 # deploy SIN bootstrapping/proxy/prune. OJO: igual
+                               # buildea y pushea; para saltear eso, -P/--skip-push
 kamal rollback <version>       # vuelve a un SHA anterior (§6.6)
 kamal app logs -f              # tail
 kamal app logs -r job -f       # sólo el rol job
@@ -707,24 +790,52 @@ kamal details                  # qué está corriendo dónde
 
 ### 6.5 Healthchecks
 
-`proxy.healthcheck.path` es lo que pega `kamal-proxy`, y por defecto apunta a
-`/up`, que en este repo está en `config/routes.rb:105`:
+`proxy.healthcheck.path` es lo que pega `kamal-proxy`. Kamal sólo le pasa la
+opción si la declarás (`configuration/proxy.rb:80`); si no, manda el default de
+`kamal-proxy`, que es `/up`. En este repo está declarado explícitamente:
+
+```yaml
+# config/deploy.yml
+proxy:
+  healthcheck:
+    path: /up
+    interval: 3
+    timeout: 5
+```
+
+Y esa ruta sale de `config/routes.rb:105`:
 
 ```ruby
 get "up" => "rails/health#show", as: :rails_health_check
 ```
 
 **Acá hay una trampa importante y es material de entrevista.** Ese endpoint viene
-de `Rails::HealthController` y su implementación completa es:
+de `Rails::HealthController`, y su núcleo es esto
+(`railties-8.1.3.1/lib/rails/health_controller.rb:37-57`):
 
 ```ruby
 class HealthController < ActionController::Base
   rescue_from(Exception) { render_down }
+
   def show
-    render_up      # renderiza un HTML verde, 200
+    render_up
   end
+
+  private
+    def render_up
+      respond_to do |format|
+        format.html { render html: html_status(color: "green") }         # 200
+        format.json { render json: { status: "up", timestamp: ... } }    # 200
+      end
+    end
+    # render_down hace lo mismo en rojo, con status: 500
 end
 ```
+
+O sea: **lo único que puede hacerlo fallar es que el propio controller levante una
+excepción**. Si la app booteó, devuelve 200. Detalle útil para un balanceador que
+prefiere JSON: el endpoint negocia contenido, así que
+`curl -H "Accept: application/json" /up` te da `{"status":"up",...}`.
 
 Y el propio comentario del código fuente de Rails 8.1 lo dice: *"This endpoint
 does not reflect the status of all of your application's dependencies, such as the
@@ -929,6 +1040,68 @@ por el mismo GVL y las mismas conexiones que las requests HTTP, un job pesado te
 sube la latencia p99 del web, y no podés escalarlos por separado. Si usás roles de
 Kamal (`web` y `job`), esta variable tiene que quedar **sin definir** en el rol
 web.
+
+**La trampa: `if ENV["X"]` no es `if ENV["X"] == "true"`.**
+
+Mirá otra vez la condición: `if ENV["SOLID_QUEUE_IN_PUMA"]`. En Ruby **lo único
+falsy es `nil` y `false`**. Un `ENV[...]` devuelve siempre un `String` o `nil`, y
+todo `String` es verdadero — incluidos `"false"` y `""`:
+
+```ruby
+$ ruby -e 'ENV["X"]="false"; puts ENV["X"] ? "TRUTHY" : "falsy"'
+TRUTHY
+$ ruby -e 'ENV["Y"]="";      puts ENV["Y"] ? "TRUTHY" : "falsy"'
+TRUTHY
+```
+
+Y ahora el `config/deploy.yml` de este repo, rol `web`:
+
+```yaml
+env:
+  clear:
+    SOLID_QUEUE_IN_PUMA: false
+```
+
+Kamal serializa `clear` con `--env CLAVE=valor`, así que el contenedor arranca con
+`SOLID_QUEUE_IN_PUMA=false`, Puma lee el string `"false"`, lo evalúa como
+verdadero y **carga el plugin igual**. Resultado: el supervisor de Solid Queue
+corre adentro de los contenedores `web` *además* de en el rol `job`. Los mismos
+jobs los toman dos flotas distintas, las conexiones se duplican (§7.2) y la
+latencia del web se ensucia con trabajo de background — el escenario exacto que la
+línea pretendía evitar.
+
+Lo verificás sin desplegar nada:
+
+```bash
+$ bundle exec ruby -e 'require "kamal"
+  c = Kamal::Configuration.create_from(config_file: Pathname.new("config/deploy.yml"))
+  puts c.role(:web).env("192.168.0.1").clear.inspect'
+{"RAILS_ENV"=>"production", ..., "SOLID_QUEUE_IN_PUMA"=>false, ...}
+```
+
+**El arreglo correcto es sacar la clave del bloque `clear`**, no ponerla en
+`false`: una variable de entorno no tiene forma de decir "no". La alternativa, si
+querés dejarla documentada en el YAML, es que `config/puma.rb` interprete el
+valor:
+
+```ruby
+plugin :solid_queue if %w[1 true].include?(ENV["SOLID_QUEUE_IN_PUMA"].to_s.downcase)
+```
+
+⚠️ Tiene que ser Ruby pelado. `config/puma.rb` lo evalúa **Puma**, antes de que
+exista la app: ahí `ActiveModel::Type::Boolean` (el cast que usarías dentro de
+Rails) todavía no está cargado y te tira `NameError` en el arranque del
+contenedor.
+
+```bash
+$ bundle exec ruby -e 'puts defined?(ActiveModel::Type::Boolean).inspect'
+nil
+```
+
+Es la clase entera de bugs de "flags booleanos por ENV", y aparece en cualquier
+código que haga `if ENV["FEATURE_X"]`. Si venís de Java, es lo contrario de
+`Boolean.parseBoolean(System.getenv("X"))`, que ante `"false"` devuelve `false` y
+ante cualquier basura también.
 
 ---
 
@@ -1250,9 +1423,25 @@ Señales:
 |---|---|
 | `SIGTERM` | **stop graceful**: deja de aceptar conexiones nuevas, termina las en vuelo, sale |
 | `SIGINT` | igual que TERM (es el Ctrl-C) |
-| `SIGUSR2` | **hot restart**: reinicia el master entero. Hay una ventana de ~1-3 s sin servicio |
-| `SIGUSR1` | **phased restart**: reinicia los workers de a uno. Sin ventana |
-| `SIGHUP` | reabre los logs |
+| `SIGUSR2` | **hot restart**: reinicia el master entero. El socket de escucha se conserva, así que las conexiones **se encolan** unos segundos en vez de rechazarse — es un pico de latencia, no un corte |
+| `SIGUSR1` | **phased restart**: reinicia los workers de a uno. Sin pico |
+| `SIGHUP` | reabre los logs **sólo si configuraste `stdout_redirect`**; si no, **para Puma** |
+
+⚠️ Esa última fila importa acá: `config/puma.rb` de este repo **no** declara
+`stdout_redirect` (loguea a STDOUT, que es lo correcto en un contenedor). O sea
+que en este repo un `SIGHUP` no reabre nada: **apaga el servidor**. Está en el
+código de Puma:
+
+```ruby
+# puma-8.0.2/lib/puma/launcher.rb:467-473
+Signal.trap "SIGHUP" do
+  if @runner.redirected_io?
+    @runner.redirect_io
+  else
+    stop
+  end
+end
+```
 
 **Y acá está la trampa que casi nadie sabe:** el phased restart **no está
 disponible si `preload_app` está activo**. Puma lo dice en el log del arranque en
@@ -1301,7 +1490,7 @@ segundos Docker manda `SIGKILL` y cortás requests a lo bruto.
 ### 10.3 Jobs en vuelo
 
 Solid Queue maneja las señales así
-(`solid_queue-1.7.0/lib/solid_queue/supervisor/signals.rb:42-46`):
+(`solid_queue-1.7.0/lib/solid_queue/supervisor/signals.rb:40-51`):
 
 | Señal | Comportamiento |
 |---|---|
@@ -1368,6 +1557,7 @@ SolidQueue.shutdown_timeout = 25.seconds   # menor que el SIGKILL del orquestado
 [ ] drain_timeout > request p99
 [ ] shutdown_timeout de Solid Queue > job p99
 [ ] asset_path configurado (bridge de assets)
+[ ] Ningún flag booleano pasado por ENV como "false" (§7.4)
 [ ] El healthcheck no está detrás de force_ssl sin exclusión
 [ ] Sabés cómo hacer rollback y probaste que funciona
 ```
@@ -1410,7 +1600,7 @@ $ time pg_dump -Fc -d stock_development -f /tmp/stock.dump
 real    0m0.143s
 
 $ ls -lh /tmp/stock.dump
--rw-r--r-- 1 root root 102K /tmp/stock.dump
+-rw-r--r-- 1 root root 103K /tmp/stock.dump
 ```
 
 `-Fc` (formato custom) es lo que querés casi siempre: comprimido, y permite
@@ -1425,7 +1615,7 @@ $ pg_restore -d stock_restore_test --no-owner /tmp/stock.dump
 $ psql -d stock_restore_test -c "select count(*) from stock_movements;"
  count
 -------
-   106
+   109
 
 $ psql -d stock_restore_test -c "select column_name, is_generated, generation_expression
     from information_schema.columns
@@ -1435,7 +1625,7 @@ $ psql -d stock_restore_test -c "select column_name, is_generated, generation_ex
  quantity_available | ALWAYS       | (quantity_on_hand - quantity_reserved)
 ```
 
-Los 106 movimientos volvieron y —el punto importante— **la columna generada volvió
+Los 109 movimientos volvieron y —el punto importante— **la columna generada volvió
 como columna generada**, no como una columna común con valores copiados. Si eso no
 funcionara, la invariante `quantity_available = on_hand - reserved` dejaría de
 mantenerse sola y nadie se enteraría hasta que los números no cerraran.
@@ -1544,8 +1734,9 @@ end
    como artifact, pero **no falla** si baja. Un umbral mínimo lo hace útil.
 6. **`concurrency: cancel-in-progress`.** Hoy cada push a un PR arranca los cuatro
    jobs completos sin cancelar los anteriores.
-7. **Deploy automático desde `main`** con `kamal deploy`, una vez que exista
-   `config/deploy.yml`.
+7. **Deploy automático desde `main`** con `kamal deploy`. `config/deploy.yml` ya
+   existe y valida; lo que falta es el step del workflow y el
+   `KAMAL_REGISTRY_PASSWORD` como secret del repo (§6.3, opción 1).
 
 ---
 
@@ -1625,7 +1816,7 @@ SELECT count(*) FROM solid_queue_failed_executions;
    la más tonta.
 2. **¿Están vivos pero no avanzan?** Mirá si hay un job "poison" que reintenta en
    loop. `Outbox::PublishPendingJob` ya está blindado contra esto: el `rescue`
-   por evento (`app/jobs/outbox/publish_pending_job.rb:48-56`) marca el evento
+   por evento (`app/jobs/outbox/publish_pending_job.rb:50-57`) marca el evento
    fallido y sigue con los demás, en vez de dejar que uno solo tape la cola.
 3. **¿Están vivos y avanzan, pero llega más de lo que sale?** Es capacidad. Subí
    `processes:` de esa cola en `config/queue.yml` y redeployá el rol `job`. Ojo con
@@ -1746,6 +1937,8 @@ hace 30 segundos es un pico normal; 3 pendientes de hace 4 horas es un incidente
 | 502 durante el rollout | el proxy mandó `SIGTERM` antes de cortar el tráfico, o `exec` faltante en el entrypoint y la señal no llegó a Puma | respetar el orden (cortar tráfico → TERM → drenar); `exec "${@}"` |
 | Archivos subidos que desaparecen | `active_storage.service = :local` en `production.rb:25`, disco efímero del contenedor | volumen persistente, o S3 |
 | Un job "cron" corre N veces | crontab replicado en N máquinas | `config/recurring.yml` de Solid Queue (elige líder con lock) |
+| Los workers procesan cada job dos veces y el web tiene latencia rara | `SOLID_QUEUE_IN_PUMA: false` en `env.clear` de `deploy.yml`: `"false"` es un string **truthy**, así que `config/puma.rb:38` carga el plugin igual (§7.4) | borrar la clave del bloque `clear`, no ponerla en `false` |
+| El deploy aborta al resolver los secretos | `.kamal/secrets` existe pero está entero comentado, y `deploy.yml` declara 4 variables como `secret` | descomentar una de las tres opciones de §6.3 |
 | El outbox "publica" pero no llega nada | `OUTBOX_ADAPTER` sin setear ⇒ `log`, que marca los eventos como publicados | setear `OUTBOX_ADAPTER=webhook` y alertar sobre `OutboxEvent.stuck` |
 | Migración que tumba el sitio antes de empezar | un `ALTER` esperando un lock encola a todos los `SELECT` detrás suyo | `StrongMigrations.lock_timeout = 10.seconds` (ya está); `CONCURRENTLY` para índices |
 | El restore falla en la primera línea | `CREATE EXTENSION citext` necesita superusuario; sin `citext` no se crea ni la tabla `products` | probar el restore periódicamente con el usuario real |

@@ -235,9 +235,10 @@ conexiones de servidor distintas**. De ahí salen todos los problemas:
   statement_timeout = '15s'`, que se aplica del lado del servidor.
 * **`LISTEN`/`NOTIFY`, cursores `WITH HOLD`, tablas temporales,
   `SET LOCAL` fuera de transacción**: todo lo que dependa de que la sesión sea
-  tuya. Este repo no se ve afectado por `LISTEN/NOTIFY` porque Solid Cable
-  **hace polling** (`config/cable.yml`, `polling_interval: 0.1.seconds`), no
-  LISTEN/NOTIFY como el adapter `postgresql` clásico de Action Cable.
+  tuya. Este repo no se ve afectado por `LISTEN/NOTIFY` porque en producción usa
+  Solid Cable, que **hace polling** (`config/cable.yml:11-17`,
+  `polling_interval: 0.1.seconds`), no LISTEN/NOTIFY como el adapter
+  `postgresql` clásico de Action Cable.
 
 ---
 
@@ -252,9 +253,12 @@ Queue tiene un patrón de INSERT/DELETE brutal — dos cosas que ensucian el vac
 y las estadísticas de tu base de dominio. Además podés tirar la base de cache sin
 pensarlo.
 
-Cada base tiene su propio directorio de migraciones (`migrations_paths:`) y su
-propio schema (`db/cache_schema.rb`, `db/queue_schema.rb`, `db/cable_schema.rb`),
-y `db:version` te contesta por cada una:
+Cada base declara su propio directorio de migraciones (`migrations_paths:`) y
+tiene su propio schema (`db/cache_schema.rb`, `db/queue_schema.rb`,
+`db/cable_schema.rb`). En este repo esos directorios **no existen**: los engines
+Solid publican el schema ya armado, `db:prepare` lo carga con `schema:load` y por
+eso las tres bases de infraestructura están en la versión `1`. `db:version` te
+contesta por cada una:
 
 ```bash
 $ bin/rails db:version
@@ -510,23 +514,23 @@ re-ejecutables, no migraciones.
 una migración que en producción tomaría un lock peligroso, y te imprime la
 versión segura.
 
-No hay initializer en este repo, así que corre con los defaults. Si lo generás
-(`bin/rails g strong_migrations:install`) obtenés esto —vale la pena leerlo
-porque documenta las decisiones—:
+El repo tiene su initializer, y vale la pena leerlo porque cada línea es una
+decisión (`config/initializers/strong_migrations.rb:49-64`):
 
 ```ruby
 StrongMigrations.start_after = 20260830161300
+StrongMigrations.target_version = ENV.fetch("PG_TARGET_VERSION", 16)
 StrongMigrations.lock_timeout = 10.seconds
 StrongMigrations.statement_timeout = 1.hour
-StrongMigrations.auto_analyze = true
-# StrongMigrations.target_version = "16"
-# StrongMigrations.safe_by_default = true
+StrongMigrations.lock_timeout_limit = 10.seconds
 ```
 
-### 5.1 El problema real no es tu lock: es la COLA de locks
+Lo que **no** está puesto queda en los defaults del gem
+(`strong_migrations-2.8.0/lib/strong_migrations.rb:35-44`): `auto_analyze`,
+`safe_by_default`, `remove_invalid_indexes` y `check_down` son todos `false`, y
+`lock_timeout_retries` es `0`.
 
-Esto es lo que hay que entender antes que cualquier receta, y es lo que separa
-una respuesta de entrevista mediocre de una buena.
+### 5.1 El problema real no es tu lock: es la COLA de locks
 
 Postgres tiene una cola de locks **FIFO y no reordenable**. Cuando pedís un
 `ACCESS EXCLUSIVE` (que es lo que toma casi todo `ALTER TABLE`):
@@ -546,26 +550,23 @@ bloquea a todos los que llegan detrás.
 De ahí salen las dos reglas de oro:
 
 1. **`lock_timeout` bajo, siempre.** Si en 10 s no conseguiste el lock, abortá y
-   reintentá. Preferís una migración que falla a una app caída. Está puesto en
-   `config/database.yml:54` (10 s) y `strong_migrations` lo vuelve a poner por
-   migración.
-2. **Reintento con backoff**, porque una migración que aborta por `lock_timeout`
-   no es un error: es el mecanismo funcionando.
+   reintentá. Está puesto dos veces: en la sesión (`config/database.yml:54`) y
+   por migración (`config/initializers/strong_migrations.rb:60`).
+2. **Reintento**, porque una migración que aborta por `lock_timeout` no es un
+   error: es el mecanismo funcionando.
+
+Y acá va el detalle que se equivoca casi siempre: **el reintento no se puede
+escribir con un `rescue` adentro de la migración**. Un `lock_timeout` aborta la
+transacción entera, así que la sentencia siguiente muere con
+`PG::InFailedSqlTransaction`; hay que rehacer la transacción completa. Por eso
+el reintento lo pone el gem, envolviendo al migrator
+(`strong_migrations-2.8.0/lib/strong_migrations/migrator.rb:16-19`, con el
+comentario "retry migration since the entire transaction needs to be rerun"):
 
 ```ruby
-class AddSomethingSafely < ActiveRecord::Migration[8.1]
-  def change
-    5.times do |i|
-      begin
-        add_column :products, :something, :string
-        break
-      rescue ActiveRecord::LockWaitTimeout
-        raise if i == 4
-        sleep 2**i
-      end
-    end
-  end
-end
+# config/initializers/strong_migrations.rb — no están puestas hoy (default 0 y 10 s)
+StrongMigrations.lock_timeout_retries = 3
+StrongMigrations.lock_timeout_retry_delay = 10.seconds
 ```
 
 Y una advertencia que casi nadie sabe: **`statement_timeout` NO limita la espera
@@ -658,8 +659,9 @@ Tres cosas que hay que saber y que se preguntan:
    DROP INDEX CONCURRENTLY index_que_quedo_invalido;
    ```
 
-   `strong_migrations` tiene `remove_invalid_indexes = true` para que la
-   siguiente corrida los limpie sola.
+   `strong_migrations` puede limpiarlos en la corrida siguiente, pero es
+   **opt-in**: `StrongMigrations.remove_invalid_indexes = true` (el default es
+   `false`, `strong_migrations-2.8.0/lib/strong_migrations.rb:44`).
 
 Lo mismo para borrar: `remove_index :tabla, column: :x, algorithm: :concurrently`.
 
@@ -688,13 +690,25 @@ end
 
 # Migración 2 (después del backfill): validar. Escanea, pero NO bloquea escrituras.
 class ValidateBinLocationNotNull < ActiveRecord::Migration[8.1]
-  def change
+  def up      # `up`, no `change`: validate_check_constraint no es reversible
     validate_check_constraint :stock_items, name: "stock_items_bin_location_null"
     change_column_null :stock_items, :bin_location, false   # ahora es instantáneo
-    remove_check_constraint :stock_items, name: "stock_items_bin_location_null"
+    remove_check_constraint :stock_items, "bin_location IS NOT NULL",
+                            name: "stock_items_bin_location_null"
+  end
+
+  def down
+    change_column_null :stock_items, :bin_location, true
   end
 end
 ```
+
+Detalle que muerde en el rollback: `validate_check_constraint` y
+`validate_foreign_key` **no están** en la lista de comandos que el
+`CommandRecorder` sabe invertir
+(`activerecord-8.1.3.1/lib/active_record/migration/command_recorder.rb:50-64`).
+Si los ponés dentro de un `change`, el `db:rollback` muere con
+`ActiveRecord::IrreversibleMigration`.
 
 Y **nunca** `change_column_null :tabla, :col, false, "valor_default"`: esa forma
 dispara un `UPDATE` de la tabla entera en una sola sentencia.
@@ -779,9 +793,13 @@ representar (§6.2).
 
 ```ruby
 safety_assured { execute "..." }   # "yo sé lo que hago, en esta operación"
+
+# Los dos siguientes YA están puestos en config/initializers/strong_migrations.rb:
 StrongMigrations.start_after = 20260830161300   # las migraciones viejas no se revisan
-StrongMigrations.target_version = "16"          # revisar contra la versión de PRODUCCIÓN,
-                                                # no contra la que tenés en la laptop
+StrongMigrations.target_version = 16            # revisar contra la versión de PRODUCCIÓN,
+                                                # no contra la de tu laptop
+
+# Este NO está puesto (default false):
 StrongMigrations.safe_by_default = true         # add_index pasa a ser CONCURRENTLY solo
 ```
 
@@ -803,7 +821,7 @@ gem no te iba a avisar.
 | `change_column_null false` | bloquea lecturas y escrituras | CHECK `NOT VALID` → `validate` → `SET NOT NULL` |
 | `add_foreign_key` | bloquea escrituras en **dos** tablas | `validate: false` → `validate_foreign_key` |
 | `add_check_constraint` | bloquea lecturas y escrituras | `validate: false` → `validate_check_constraint` |
-| `add_unique_constraint` | crea un índice único bloqueante | índice único `CONCURRENTLY` → usarlo para la constraint |
+| `add_unique_constraint` | crea un índice único bloqueante | índice único `CONCURRENTLY` → `add_unique_constraint tabla, using_index: nombre` |
 | `remove_column` | breve, pero rompe el código viejo | `ignored_columns` un deploy antes |
 | `rename_column` / `rename_table` | breve, pero rompe el código viejo | expand–contract |
 | `execute "..."` | lo que vos escribas | `safety_assured`, y pensalo dos veces |
@@ -826,7 +844,7 @@ Mirando `db/schema.rb` de este repo, el dumper de Rails 8.1 captura:
 | Índices parciales | `where: "(revoked_at IS NULL)"` (`db/schema.rb:34`) |
 | Índices con `opclass` y `using` | `opclass: :gin_trgm_ops, using: :gin` (`db/schema.rb:127`) |
 | Índices con orden | `order: { occurred_at: :desc, id: :desc }` (`db/schema.rb:240`) |
-| CHECK constraints | los 5 de `stock_items` (`db/schema.rb:214-218`) |
+| CHECK constraints | los 5 de `stock_items` (`db/schema.rb:213-217`) |
 | Columnas generadas | `t.virtual "quantity_available", ... stored: true` (`db/schema.rb:203`) |
 | Arrays | `t.string "scopes", default: [], array: true` (`db/schema.rb:27`) |
 | Tipos PG (`citext`, `jsonb`, `uuid`) | `t.citext "sku"` (`db/schema.rb:120`) |
@@ -1085,8 +1103,8 @@ opciones válidas:
 
 Este repo elige **`bigint` de centavos + Value Object**
 (`app/models/value_objects/money.rb`, expuesto con la macro `has_money` de
-`app/models/concerns/has_money.rb`), que es lo que hace Stripe. `bigint` aguanta
-~92 billones de centavos.
+`app/models/concerns/has_money.rb`), que es lo que hace Stripe. `bigint` llega
+hasta 2⁶³−1 ≈ 9,2 × 10¹⁸ centavos: no te vas a quedar corto.
 
 `decimal` igual aparece donde la fracción es física y no monetaria:
 `products.weight_grams` es `decimal(12,3)` — miligramos exactos.
@@ -1135,18 +1153,21 @@ si.save!
 si.reload
 puts "despues del reload: #{si.quantity_available}"'
 
-changed: {"quantity_available"=>[105, 999]}
-UPDATE "stock_items" SET "updated_at" = '...', "lock_version" = 13
-  WHERE "stock_items"."id" = 1 AND "stock_items"."lock_version" = 12
-despues del reload: 105
+changed: {"quantity_available"=>[132, 999]}
+readonly_attributes: []
+UPDATE "stock_items" SET "updated_at" = '...', "lock_version" = 30
+  WHERE "stock_items"."id" = 1 AND "stock_items"."lock_version" = 29
+despues del reload: 132
 ```
 
-Tres cosas para leer despacio:
+Tres cosas:
 
 1. El dirty tracking **registra** el cambio (`changes` lo muestra).
 2. La columna generada **no aparece en el UPDATE**: la asignación se descarta en
-   silencio. No hay excepción, no hay warning. `StockItem.readonly_attributes`
-   devuelve `[]`.
+   silencio. No hay excepción, no hay warning, y —esto es lo que confunde—
+   `StockItem.readonly_attributes` devuelve `[]`: el filtro no pasa por ahí sino
+   por `attributes_for_update`, que descarta toda columna con `virtual?`
+   (`activerecord-8.1.3.1/lib/active_record/attribute_methods.rb:508-515`).
 3. **Pero el UPDATE se emite igual**, y bumpea `lock_version` y `updated_at`. O
    sea: asignar a una columna generada no hace nada útil y sí invalida el
    optimistic lock de otro proceso.
@@ -1197,8 +1218,7 @@ entre entornos y no lo podés borrar de forma reproducible.
 
 ### 8.2 Índices únicos parciales
 
-El truco que más impresiona en una entrevista y que **no se puede expresar con
-validaciones de Rails**:
+Lo que **no se puede expresar con validaciones de Rails**:
 
 ```ruby
 # db/migrate/20260830160500_create_product_suppliers.rb:33
@@ -1210,7 +1230,8 @@ add_index :product_suppliers, :product_id,
 "Como mucho un proveedor preferido por producto". Con una validación de Rails
 necesitarías un `validates_uniqueness_of ... conditions:` y aun así tendría la
 race condition de §9. Con el índice parcial, Postgres lo garantiza y encima el
-índice sólo contiene las filas `preferred` (15 entradas en vez de 200.000).
+índice sólo contiene las filas `preferred`: una por producto, contra las N filas
+por producto que tendría un índice sobre la tabla entera.
 
 El mismo patrón para la idempotencia:
 
@@ -1291,9 +1312,6 @@ como prefijo izquierdo.
 
 ## 9. Validaciones vs constraints: la carrera de `validates_uniqueness_of`
 
-Este es el ejemplo que hay que tener listo para la entrevista, porque separa a
-quien leyó la guía de Rails de quien sufrió producción.
-
 `app/models/stock_item.rb:36` tiene:
 
 ```ruby
@@ -1364,13 +1382,41 @@ end
 `find_or_create_by!` tiene exactamente la misma race condition y **no** la
 rescata: por eso no se usa.
 
-Un detalle que se pregunta: si estás **dentro** de una transacción y comés el
-`RecordNotUnique`, la transacción ya está abortada
-(`PG::InFailedSqlTransaction` en la siguiente sentencia). El rescate sólo
-funciona si la inserción está en su propio `SAVEPOINT`
-(`transaction(requires_new: true)`) o si no hay transacción externa. En
-`find_or_provision!` se llama desde `ItemResolver`, fuera de la transacción del
-service.
+Un detalle que se pregunta, y que acá muerde: **si estás dentro de una
+transacción y comés el `RecordNotUnique`, la transacción ya está abortada.**
+Postgres marca la transacción como fallida y la sentencia siguiente muere con
+`PG::InFailedSqlTransaction`. Verificado:
+
+```bash
+$ bin/rails runner '
+si = StockItem.first
+dup = StockItem.new(product_id: si.product_id, warehouse_id: si.warehouse_id)
+ActiveRecord::Base.transaction do
+  begin; dup.save!(validate: false); rescue ActiveRecord::RecordNotUnique; puts "rescatado"; end
+  begin; puts "sigue viva? #{StockItem.count}"; rescue => e; puts "abortada: #{e.class}"; end
+  raise ActiveRecord::Rollback
+end'
+
+rescatado
+abortada: ActiveRecord::StatementInvalid
+```
+
+El rescate sólo funciona si la inserción tiene su propio **SAVEPOINT**
+(`transaction(requires_new: true)`) o si no hay transacción externa —
+un `transaction` anidado sin `requires_new:` se fusiona con el de afuera y no
+abre savepoint.
+
+Y acá está el matiz honesto sobre este repo: `find_or_provision!` **sí se llama
+adentro de la transacción** del service (`app/services/stock/receive.rb:32-33`
+lo invoca vía `ItemResolver` dentro de `transactional do`, y lo mismo hacen
+`app/services/stock/transfers/dispatch.rb:62` y
+`app/services/purchasing/receive_order.rb:47`). O sea que el `rescue` de
+`find_or_provision!` sólo cubre el caso sin transacción externa; bajo la carrera
+real, el `find_by!` del rescate se va a comer un `PG::InFailedSqlTransaction`.
+El arreglo es envolver el `create!` en `transaction(requires_new: true)`. En la
+práctica casi nunca se ve, porque la validación de unicidad de
+`app/models/stock_item.rb:36` corta antes con `RecordInvalid` — pero "casi
+nunca" es exactamente la definición de la race condition de esta sección.
 
 La misma lógica aplica a los CHECK: las validaciones de `StockMovement`
 (`app/models/stock_movement.rb:35`) duplican a propósito el CHECK de la
@@ -1414,8 +1460,9 @@ TRANSACTION  COMMIT
 
 Dos cosas que salen sólo de correrlo:
 
-* **El `BEGIN` se emite *lazy*, justo antes del INSERT.** Rails 7.2+ no manda el
-  `BEGIN` hasta que hay una sentencia que lo necesita. Si tu `before_validation`
+* **El `BEGIN` se emite *lazy*, justo antes del INSERT.** Rails no manda el
+  `BEGIN` hasta que hay una sentencia que lo necesite (`lazy_transactions`,
+  activadas por defecto en el adapter de Postgres). Si tu `before_validation`
   hace una query, esa query **sí** abre la transacción y queda adentro.
 * **`around_save` (post) corre antes que `after_save`.** El orden completo es:
   `after_create` → cierre del `around_save` → `after_save`.
@@ -1509,11 +1556,16 @@ a la regla del párrafo anterior.)
 
    (En Rails 4.2 estas excepciones se tragaban y se logueaban; desde Rails 5
    propagan. Si el efecto puede fallar, va en un job, no en el callback.)
-3. **`after_commit` no corre en tests con transactional fixtures**… bueno, sí
-   corre desde Rails 5 gracias a `test_framework` y los savepoints, pero el
-   `after_commit` de una transacción anidada con `requires_new: true` se dispara
-   sólo cuando commitea la **transacción externa**. Los savepoints no tienen
-   commit propio.
+3. **Los savepoints no disparan `after_commit`.** El `after_commit` de una
+   transacción anidada con `requires_new: true` se ejecuta recién cuando
+   commitea la **transacción externa**: un savepoint no tiene COMMIT propio. El
+   corolario es la vieja pregunta de "¿por qué en los tests sí corre, si toda la
+   suite está envuelta en una transacción?": porque esa transacción envolvente
+   se abre con `joinable: false`, y Rails usa justamente eso para decidir
+   —`run_commit_callbacks = !current_transaction.joinable?`,
+   `activerecord-8.1.3.1/lib/active_record/connection_adapters/abstract/transaction.rb:529`—
+   que la transacción de tu código, aunque sea un savepoint, tiene que correr
+   los callbacks de commit.
 
 ### 10.4 Por qué los callbacks con efectos son una trampa de diseño
 
@@ -1631,27 +1683,44 @@ Product#product_suppliers -> inverse_of: :product   (opciones: [:dependent])
 StockItem#product         -> inverse_of: nil        (opciones: [])
 ```
 
-Y lo que **rompe** la detección automática, también verificado:
+El algoritmo está en `activerecord-8.1.3.1/lib/active_record/reflection.rb:770-816`
+y es más tonto de lo que parece: toma el nombre de **tu** clase, lo pasa a
+singular con guiones bajos (`StockItem` → `:stock_item`) y busca una asociación
+con **ese** nombre exacto en la otra clase. Como `Product` declara
+`has_many :stock_items` (plural), no la encuentra, y `automatically_invert_plural_associations`
+está en `false` por defecto (verificado en la consola), así que ni siquiera
+prueba el plural. Ese —y no el macro— es el motivo de que `StockItem#product`
+dé `nil`: `belongs_to` **sí** puede deducir el inverso cuando el nombre
+singular existe del otro lado. Verificado:
 
 ```bash
 $ bin/rails runner '
-class Probe2 < ApplicationRecord
-  self.table_name = "products"
-  has_many :stock_items, foreign_key: :product_id
-end
-puts Probe2.reflect_on_association(:stock_items).inverse_of.inspect'
+Object.const_set(:Depot3, Class.new(ApplicationRecord) { self.table_name = "warehouses" })
+Object.const_set(:Slot3,  Class.new(ApplicationRecord) { self.table_name = "stock_items" })
+Slot3.belongs_to :depot3
+Depot3.has_one :slot3
+puts Slot3.reflect_on_association(:depot3).inverse_of&.name.inspect'
 
-nil
+:slot3
+```
+
+Lo que **rompe** la detección, según el mismo código
+(`can_find_inverse_of_automatically?`, reflection.rb:812-816), es
+`inverse_of: false`, `through:`, `foreign_key:`, las polimórficas y los scopes
+del lado inverso. `class_name:` **no** la rompe. También verificado:
+
+```ruby
+Depot.has_many :slots, class_name: "Slot"                                 # -> :depot
+Depot2.has_many :slot2s, class_name: "Slot2", foreign_key: :warehouse_id  # -> nil
 ```
 
 **Basta con pasar `foreign_key:` para que Rails deje de deducir el inverso.** Por
 eso las asociaciones con nombre no convencional del repo lo declaran a mano:
 
 ```ruby
-# app/models/user.rb:19
+# app/models/user.rb:18-19
 has_many :requested_transfers, class_name: "StockTransfer",
-         foreign_key: :requested_by_id, dependent: :restrict_with_error,
-         inverse_of: :requested_by
+         foreign_key: :requested_by_id, dependent: :restrict_with_error, inverse_of: :requested_by
 
 # app/models/category.rb:7
 has_many :children, class_name: "Category", foreign_key: :parent_id,
@@ -1659,24 +1728,37 @@ has_many :children, class_name: "Category", foreign_key: :parent_id,
 ```
 
 Regla operativa: **si pasás `foreign_key:`, `as:` o `through:`, pasá también
-`inverse_of:`.** Con `class_name:` solo, Rails todavía lo deduce (lo confirma
-`PurchaseOrder#lines`), pero declararlo no cuesta nada.
-
-Nota: `belongs_to` **nunca** obtiene inverso automático (por eso
-`StockItem#product` da `nil`); se resuelve desde el lado del `has_many`.
+`inverse_of:`.** Con `class_name:` solo Rails todavía lo deduce, pero declararlo
+no cuesta nada — es lo que hacen `PurchaseOrder#lines` y
+`PurchaseOrderLine#purchase_order` (`app/models/purchase_order_line.rb:6`), que
+declaran el par explícito en vez de depender de la convención de nombres.
 
 ### 11.5 `dependent:` — los valores y lo que cuestan
 
-Valores válidos en Rails 8.1 (los saqué del código del builder):
+Valores válidos en Rails 8.1, sacados de `valid_dependent_options` en
+`activerecord-8.1.3.1/lib/active_record/associations/builder/{has_many,has_one,belongs_to}.rb:17-19`.
+Ojo con la asimetría de nombres, que es un error clásico de tipeo:
 
 | Valor | `has_many` | `has_one` | `belongs_to` | Qué hace |
 |---|:--:|:--:|:--:|---|
 | `:destroy` | ✅ | ✅ | ✅ | carga cada hijo e invoca sus callbacks. **N queries** |
-| `:delete_all` / `:delete` | ✅ | ✅ | ✅ | un solo `DELETE`. **Sin callbacks** |
-| `:nullify` | ✅ | ✅ | — | un `UPDATE ... SET fk = NULL` |
-| `:restrict_with_error` | ✅ | ✅ | — | agrega un error de validación si hay hijos |
-| `:restrict_with_exception` | ✅ | ✅ | — | levanta `DeleteRestrictionError` |
+| `:delete_all` | ✅ | ❌ | ❌ | un solo `DELETE`. **Sin callbacks** |
+| `:delete` | ❌ | ✅ | ✅ | el `DELETE` del único registro asociado. **Sin callbacks** |
+| `:nullify` | ✅ | ✅ | ❌ | un `UPDATE ... SET fk = NULL` |
+| `:restrict_with_error` | ✅ | ✅ | ❌ | agrega un error de validación si hay hijos |
+| `:restrict_with_exception` | ✅ | ✅ | ❌ | levanta `DeleteRestrictionError` |
 | `:destroy_async` | ✅ | ✅ | ✅ | encola un job que destruye los hijos |
+
+Un `dependent:` inválido para ese macro no es un warning: revienta al cargar la
+clase. Verificado:
+
+```
+has_many dependent: :delete    -> ArgumentError: The :dependent option must be one of
+  [:destroy, :delete_all, :nullify, :restrict_with_error, :restrict_with_exception,
+   :destroy_async], but is :delete
+belongs_to dependent: :nullify -> ArgumentError: The :dependent option must be one of
+  [:destroy, :delete, :destroy_async], but is :nullify
+```
 
 Lo que hay que saber:
 
@@ -1686,7 +1768,8 @@ Lo que hay que saber:
   minutos.
 * `:delete_all` es un solo `DELETE`, pero **se saltea los callbacks de los
   hijos**: si los nietos dependían de esos callbacks, quedan huérfanos. Sólo es
-  seguro si además tenés `ON DELETE CASCADE` en la base.
+  seguro si además tenés `ON DELETE CASCADE` en la base. (En `has_one` y
+  `belongs_to` el valor equivalente se llama `:delete`, no `:delete_all`.)
 * `:destroy_async` mueve el problema a un job. Necesita que la FK **no** sea
   `RESTRICT` (o el padre no se puede borrar hasta que el job termine): es útil,
   pero hay que pensarlo con la FK.
@@ -1792,42 +1875,60 @@ $ printf 'select count(*) from products;\n' | bin/rails dbconsole --database=pri
 
 ### 12.3 `EXPLAIN`
 
-Desde Rails, sobre cualquier relación:
+Desde Rails, sobre cualquier relación. Dos trampas antes del ejemplo:
+
+⚠️ **`explain` no devuelve un String.** Desde Rails 7.1 devuelve un
+`ActiveRecord::Relation::ExplainProxy`, que sólo arma el plan cuando le pedís
+`inspect` (o cuando lo evaluás en la consola, que hace lo mismo). En un
+`bin/rails runner`, `puts relation.explain(...)` te imprime
+`#<ActiveRecord::Relation::ExplainProxy:0x…>` y nada más: hay que cerrar con
+`.inspect`.
+
+⚠️ **Las opciones son símbolos posicionales, no un hash.**
+`explain(:analyze, :verbose)` funciona porque el adapter hace
+`"EXPLAIN (#{options.join(", ").upcase})"`
+(`activerecord-8.1.3.1/.../postgresql/database_statements.rb:96-100`). Con un
+hash, ese `join` interpola el `inspect` del hash. El helper
+`ApplicationRecord.explain_analyze` (`app/models/application_record.rb:44-46`)
+usa la forma con hash y **está roto hoy**; verificado:
 
 ```bash
-$ bin/rails runner 'puts Product.kept.active.order(:name).limit(5).explain(:analyze, :verbose)'
+$ bin/rails runner 'ApplicationRecord.explain_analyze(Product.kept.limit(1)).inspect'
+
+ActiveRecord::StatementInvalid: PG::SyntaxError: ERROR:  syntax error at or near "{"
+LINE 1: EXPLAIN ({:ANALYZE=>TRUE, :VERBOSE=>TRUE}) SELECT "products"...
+```
+
+Usá `.explain(:analyze, :verbose).inspect` directo sobre la relación hasta que
+se corrija:
+
+```bash
+$ bin/rails runner 'puts Product.kept.active.order(:name).limit(5).explain(:analyze, :verbose).inspect'
 
 EXPLAIN (ANALYZE, VERBOSE) SELECT "products".* FROM "products"
  WHERE "products"."discarded_at" IS NULL AND "products"."active" = TRUE
  ORDER BY "products"."name" ASC LIMIT 5
                                        QUERY PLAN
 ------------------------------------------------------------------------------------------
- Limit  (cost=8.17..8.17 rows=1 width=301) (actual time=0.044..0.046 rows=5 loops=1)
-   ->  Sort  (cost=8.17..8.17 rows=1 width=301) (actual time=0.043..0.044 rows=5 loops=1)
+ Limit  (cost=1.40..1.41 rows=5 width=168) (actual time=0.026..0.027 rows=5 loops=1)
+   ->  Sort  (cost=1.40..1.44 rows=15 width=168) (actual time=0.025..0.025 rows=5 loops=1)
          Sort Key: products.name
          Sort Method: top-N heapsort  Memory: 27kB
-         ->  Index Scan using index_products_active_by_category on public.products
-             (cost=0.14..8.16 rows=1 width=301) (actual time=0.012..0.017 rows=15 loops=1)
- Planning Time: 0.112 ms
- Execution Time: 0.066 ms
+         ->  Seq Scan on public.products  (cost=0.00..1.15 rows=15 width=168)
+             (actual time=0.009..0.012 rows=15 loops=1)
+               Filter: ((products.discarded_at IS NULL) AND products.active)
+ Planning Time: 0.099 ms
+ Execution Time: 0.044 ms
 ```
 
-Ahí se ve funcionando el índice **parcial compuesto**
-`index_products_active_by_category` (`where: "discarded_at IS NULL AND active"`).
-
-⚠️ **Cuidado con la firma**: en Rails 7.1+ las opciones de `explain` son
-**símbolos posicionales**, no un hash. `explain(:analyze, :verbose)` funciona;
-`explain(analyze: true)` genera `EXPLAIN ({:ANALYZE=>TRUE}) SELECT …` y Postgres
-lo rechaza con `PG::SyntaxError`. El helper
-`ApplicationRecord.explain_analyze` (`app/models/application_record.rb:44`) usa la
-forma con hash y por lo tanto **está roto hoy**; usá `.explain(:analyze, :verbose)`
-directo sobre la relación hasta que se corrija.
+Y ahí está la lección más útil del plan: **el índice parcial
+`index_products_active_by_category` existe (`db/schema.rb:125`) y el planner no
+lo usa.**
 
 Y el recordatorio de siempre: **`ANALYZE` ejecuta la query de verdad**. Sobre un
 `UPDATE` o un `DELETE`, hacelo dentro de una transacción con rollback.
 
-Un `EXPLAIN` sobre la base de desarrollo miente por tamaño. Con 48 filas en
-`stock_items`, el planner elige Seq Scan aunque exista el índice parcial:
+Pasa lo mismo con `stock_items` y su índice parcial de reposición:
 
 ```bash
 $ psql -d stock_development -c "EXPLAIN SELECT * FROM stock_items
@@ -1837,9 +1938,10 @@ $ psql -d stock_development -c "EXPLAIN SELECT * FROM stock_items
 ```
 
 **No es un bug del índice: es el planner haciendo lo correcto.** Leer 48 filas
-secuencialmente es más barato que ir al índice y volver a la tabla. Si vas a
-juzgar un plan, hacelo contra un dataset con volumen parecido al de producción y
-con `ANALYZE` corrido.
+secuencialmente sale más barato que ir al índice y volver a la tabla. **Un
+`EXPLAIN` sobre la base de desarrollo miente por tamaño**: si vas a juzgar un
+plan, hacelo contra un dataset con volumen parecido al de producción y con
+`ANALYZE` corrido.
 
 ### 12.4 Logs de queries en desarrollo
 
@@ -1865,6 +1967,7 @@ mejor herramienta que hay para cazar N+1 y queries huérfanas.
 | `PG::ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a transaction block` | `algorithm: :concurrently` sin `disable_ddl_transaction!` | agregar `disable_ddl_transaction!` |
 | Un índice que existe pero el planner nunca usa | Quedó `INVALID` de un `CONCURRENTLY` que falló | `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` y `DROP INDEX CONCURRENTLY` |
 | `PG::UndefinedColumn: column products.barcode does not exist` durante un deploy | Se borró la columna sin `ignored_columns` un deploy antes; los procesos viejos tienen el schema cacheado | §5.6, y mientras tanto, reiniciar los procesos viejos |
+| `PG::InFailedSqlTransaction: current transaction is aborted` después de un `rescue` | Se rescató una `RecordNotUnique` (o cualquier error de Postgres) **dentro** de una transacción: ya está abortada | envolver el INSERT en `transaction(requires_new: true)` para que el rollback llegue sólo hasta el savepoint (§9) |
 | Dos filas para el mismo (producto, depósito) y el stock que "no cierra" | `validates uniqueness` sin índice único: la carrera de §9 | índice `UNIQUE` + `rescue RecordNotUnique` |
 | `PG::UniqueViolation` al marcar un proveedor como preferido | El índice único parcial `index_one_preferred_supplier_per_product` | desmarcar el anterior en la misma transacción (`app/models/product_supplier.rb:21`) |
 | El total de la orden no coincide con las líneas | Alguien usó `update_column`/`update_all` sobre las líneas: no dispara callbacks | recalcular con `recalculate_totals!`; o `reset_counters` si fuera `counter_cache` |

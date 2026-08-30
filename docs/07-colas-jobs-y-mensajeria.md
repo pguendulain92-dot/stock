@@ -24,13 +24,15 @@ broker es intercambiable.
 
 ```ruby
 # app/jobs/stock/expire_reservations_job.rb
-class ExpireReservationsJob < ApplicationJob
-  queue_as :maintenance
+module Stock
+  class ExpireReservationsJob < ApplicationJob
+    queue_as :maintenance
 
-  def perform(limit: 5_000)
-    result = ExpireReservations.call(limit:)
-    Rails.logger.info(event: "reservations.expired", **result.value)
-    result.value
+    def perform(limit: 5_000)
+      result = ExpireReservations.call(limit:)
+      Rails.logger.info(event: "reservations.expired", **result.value)
+      result.value
+    end
   end
 end
 ```
@@ -114,7 +116,7 @@ persistencia: mismo problema, misma gente sorprendida en producción.
 Es deliberado: en test los jobs se acumulan en un array y los inspeccionás.
 
 ```ruby
-# spec/jobs/outbox_publish_pending_job_spec.rb
+# spec/jobs/outbox_publish_pending_job_spec.rb:69
 expect { described_class.perform_now(batch_size: 3) }
   .to have_enqueued_job(described_class)
 ```
@@ -149,6 +151,12 @@ producción el prefijo es `nil` y todo coincide. Es un desajuste inofensivo acá
 pero si copiás este patrón a staging con workers dedicados sin `*`, la cola se
 queda quieta y no hay ningún error: simplemente nadie la mira.
 
+Ojo con el "arreglo" instintivo: `QueueSelector` soporta comodines, pero **sólo
+como sufijo** (`prefixed_name?(queue) = queue.ends_with?("*")`). `staging_*`
+funciona y toma todas las colas de staging; `*outbox` no matchea nada. Para
+tener un worker dedicado a `outbox` en un entorno con prefijo hay que nombrar la
+cola completa (`staging_outbox`) o no ponerle prefijo fuera de producción.
+
 ---
 
 ## 3. Solid Queue por dentro
@@ -157,14 +165,21 @@ Solid Queue no es "una tabla con jobs". Son 13 tablas más las dos de Rails. Est
 es lo que hay realmente en la base `stock_development_queue`:
 
 ```console
-$ psql -d stock_development_queue -c "\dt"
- solid_queue_batch_executions      solid_queue_pauses
- solid_queue_batches               solid_queue_processes
- solid_queue_blocked_executions    solid_queue_ready_executions
- solid_queue_claimed_executions    solid_queue_recurring_executions
- solid_queue_failed_executions     solid_queue_recurring_tasks
- solid_queue_jobs                  solid_queue_scheduled_executions
-                                   solid_queue_semaphores
+$ psql -d stock_development_queue -tAc \
+    "SELECT tablename FROM pg_tables WHERE tablename LIKE 'solid_queue%' ORDER BY 1"
+solid_queue_batch_executions
+solid_queue_batches
+solid_queue_blocked_executions
+solid_queue_claimed_executions
+solid_queue_failed_executions
+solid_queue_jobs
+solid_queue_pauses
+solid_queue_processes
+solid_queue_ready_executions
+solid_queue_recurring_executions
+solid_queue_recurring_tasks
+solid_queue_scheduled_executions
+solid_queue_semaphores
 ```
 
 El esquema completo está versionado en `db/queue_schema.rb`.
@@ -237,15 +252,52 @@ $ psql -d stock_development_queue -c "SELECT kind, pid, supervisor_id, last_hear
  Scheduler        | 13678 |             1 | 2026-08-30 17:48:43.076611+00
 ```
 
-Ese heartbeat es lo que permite **recuperar jobs de un worker muerto**: si un
-proceso deja de latir, el supervisor lo poda y devuelve sus
-`claimed_executions` a `ready_executions`. Sidekiq OSS no tiene esto (§4.3).
+Qué hace cada uno:
 
 - **Dispatcher**: mueve `scheduled_executions` vencidas a `ready_executions`, en
   lotes de `batch_size`. También corre el mantenimiento de concurrencia.
 - **Worker**: hace polling sobre `ready_executions`, reclama y ejecuta.
 - **Scheduler**: encola los recurring tasks.
 - **Supervisor**: forkea, vigila heartbeats, maneja señales de shutdown.
+
+#### Qué pasa con los jobs de un worker que se muere
+
+Ese heartbeat es lo que permite **no perder los jobs de un worker muerto**, y acá
+hay que ser preciso porque casi todo el mundo lo cuenta mal. Hay dos caminos y
+**no terminan en el mismo lugar**:
+
+- **Baja ordenada** (`SIGTERM`, el proceso se deregistra solo): al destruirse la
+  fila de `solid_queue_processes` corre `after_destroy :release_all_claimed_executions`,
+  que hace `job.dispatch_bypassing_concurrency_limits` — o sea, los jobs
+  **vuelven a `ready_executions`** y otro worker los toma. Reintento automático.
+- **Muerte abrupta** (`SIGKILL`, OOM, se cae la instancia): el supervisor poda el
+  proceso cuando se le vence el heartbeat —late cada
+  `process_heartbeat_interval` (60 s) y se lo da por muerto pasado
+  `process_alive_threshold` (5 min)— y sus `claimed_executions` van a
+  **`failed_executions`**, no a `ready`:
+
+  ```ruby
+  # solid_queue-1.7.0/app/models/solid_queue/process/prunable.rb:24
+  def prune
+    error = Processes::ProcessPrunedError.new(last_heartbeat_at)
+    fail_all_claimed_executions_with(error)
+    deregister(pruned: true)
+  end
+  ```
+
+  Lo mismo si el supervisor reapea un fork que murió (`ProcessExitError`) o si al
+  arrancar encuentra `claimed_executions` sin proceso dueño (`ProcessMissingError`,
+  `ClaimedExecution.orphaned`).
+
+La diferencia importa en producción: **un `SIGKILL` con jobs en vuelo no los
+pierde, pero tampoco los reintenta solo.** Quedan en `failed_executions` con el
+error `ProcessPrunedError` y los reintentás vos desde Mission Control (o con
+`SolidQueue::FailedExecution#retry`). Eso es a propósito: la gema no sabe si el
+job es idempotente, así que te obliga a decidir. Sidekiq OSS, en cambio, en ese
+mismo escenario **pierde el job y no queda rastro** (§4.3).
+
+Corolario operativo: alertá sobre `solid_queue_failed_executions`. Después de un
+OOM kill, ahí están los jobs que no corrieron y nadie los va a levantar por vos.
 
 ### 3.3 `FOR UPDATE SKIP LOCKED`: la primitiva
 
@@ -290,10 +342,23 @@ estándar; en Hibernate tenés que bajar a `@QueryHints` con
 Dónde está en el código de Solid Queue:
 
 ```ruby
-# solid_queue-1.7.0/app/models/solid_queue/record.rb
+# solid_queue-1.7.0/app/models/solid_queue/record.rb:13
 def non_blocking_lock
-  lock(Arel.sql("FOR UPDATE SKIP LOCKED"))
+  if SolidQueue.use_skip_locked
+    lock(Arel.sql("FOR UPDATE SKIP LOCKED"))
+  else
+    lock
+  end
 end
+```
+
+El `if` es una válvula de escape para backends sin `SKIP LOCKED` (MySQL < 8).
+`SolidQueue.use_skip_locked` es un `mattr_accessor` con default `true`
+(`solid_queue-1.7.0/lib/solid_queue.rb:29`), verificado en este repo:
+
+```console
+$ bin/rails runner 'puts SolidQueue.use_skip_locked.inspect'
+true
 ```
 
 Y en este repo lo usamos igual para el outbox:
@@ -348,17 +413,38 @@ de queries que casi siempre devuelven 0 filas. Es barato porque el índice es
 chico y las filas están en shared buffers, pero **no es gratis**: si ponés
 `polling_interval: 0.01` con 20 procesos son 2000 QPS de puro ruido.
 
-Detalle de implementación: cuando el poll devuelve trabajo, el dispatcher
-**no duerme** —vuelve a pollear inmediatamente— así que bajo carga la latencia
-efectiva es mucho menor que el intervalo:
+Detalle de implementación: `polling_interval` es el techo, no el ritmo fijo, y
+**dispatcher y worker lo aplican distinto**.
+
+El dispatcher, si el lote trajo trabajo, no duerme nada:
 
 ```ruby
-# solid_queue-1.7.0/lib/solid_queue/dispatcher.rb
+# solid_queue-1.7.0/lib/solid_queue/dispatcher.rb:36
 def poll
   batch = dispatch_next_batch
   batch.zero? ? polling_interval : 0.seconds
 end
 ```
+
+El worker hace algo más astuto: duerme `polling_interval` sólo si su pool de
+threads está ocioso; si está saturado se duerme **10 minutos**, porque no tiene
+sentido reclamar jobs que no puede ejecutar. Lo despierta el propio pool cuando
+se libera un thread (`on_idle: -> { wake_up }`, y el sleep es
+`interruptible_sleep`):
+
+```ruby
+# solid_queue-1.7.0/lib/solid_queue/worker.rb:35
+def poll
+  claim_executions.then do |executions|
+    executions.each { |execution| pool.post(execution) }
+    pool.idle? ? polling_interval : 10.minutes
+  end
+end
+```
+
+O sea que bajo carga el worker no hace polling ciego: se maneja por eventos del
+pool. El `polling_interval` sólo gobierna el caso "no hay nada que hacer", que
+es justamente el que define la latencia de arranque de un job.
 
 Sidekiq no tiene este trade-off porque `BRPOP` es *bloqueante*: el worker se
 duerme en Redis y Redis lo despierta. Esa es la diferencia arquitectónica de
@@ -368,10 +454,10 @@ fondo entre los dos (§4.1).
 
 `solid_queue_semaphores` implementa "no más de N de este job a la vez", que es lo
 que en Java resolvés con un `Semaphore` o con `@ConcurrencyLimit`. Se declara
-por job:
+por job; ninguno de este repo lo usa todavía, así se declararía:
 
 ```ruby
-class SyncSupplierCatalogJob < ApplicationJob
+class SyncSupplierCatalogJob < ApplicationJob   # ejemplo, no está en el repo
   # No más de 2 sincronizaciones simultáneas POR PROVEEDOR.
   limits_concurrency to: 2, key: ->(supplier_id) { supplier_id }, duration: 5.minutes
 
@@ -379,20 +465,36 @@ class SyncSupplierCatalogJob < ApplicationJob
 end
 ```
 
-El mecanismo, leído del código de la gema — y ojo con el orden, porque no es el
-que uno supone: **el semáforo se toma al ENCOLAR, no al ejecutar**.
+La firma real es
+`limits_concurrency(key:, to: 1, group:, duration:, on_conflict: :block)`
+(`solid_queue-1.7.0/lib/active_job/concurrency_controls.rb:20`). `on_conflict:`
+acepta `:block` (default, encola bloqueado) o `:discard` (tira el job).
 
-1. `perform_later` intenta `Semaphore.wait`: un `INSERT ... ON CONFLICT DO
-   NOTHING` con `value: limit - 1`, o un `UPDATE ... SET value = value - 1
-   WHERE value > 0`. Las dos operaciones son atómicas a nivel Postgres, sin
-   lock explícito.
+El mecanismo, leído del código de la gema — y ojo con el orden, porque no es el
+que uno supone: **el semáforo se toma al DESPACHAR, no al ejecutar**. Para un
+`perform_later` normal eso es el momento del encolado; para un job programado,
+el momento en que el dispatcher lo vence (`Job#dispatch`,
+`app/models/solid_queue/job/executable.rb:71`).
+
+1. `Semaphore.wait` primero hace `Semaphore.lock.find_by(key:)` — que es un
+   `SELECT ... FOR UPDATE` de verdad, **con lock explícito**. Si la fila existe
+   y `value > 0`, decrementa (`UPDATE ... SET value = value - 1 WHERE value > 0`).
+   Si no existe, va por `INSERT ... ON CONFLICT DO NOTHING` con
+   `value: limit - 1`, y si el insert lo gana otro, reintenta el decremento.
 2. Si consigue cupo, el job va directo a `ready_executions`. Si no, va a
    `blocked_executions` con un `expires_at`.
-3. Al terminar el job (bien o mal), `signal` incrementa el semáforo y mueve un
-   bloqueado de `blocked` a `ready`.
+3. Al terminar el job (bien o mal), `ClaimedExecution` llama
+   `job.unblock_next_blocked_job`: incrementa el semáforo y mueve **un**
+   bloqueado de `blocked` a `ready`
+   (`app/models/solid_queue/claimed_execution.rb:116`).
 4. El `concurrency_maintenance_interval` del dispatcher (600 s en
    `config/queue.yml`) barre semáforos vencidos y libera jobs que quedaron
    bloqueados porque el que tenía el cupo murió sin hacer `signal`.
+
+⚠️ Consecuencia del punto 3 que el README de la gema marca explícitamente: los
+bloqueados se liberan **por prioridad, ignorando el orden de colas del worker**.
+Si mezclás un grupo de concurrencia entre varias colas, el orden que declaraste
+en `config/queue.yml` no manda en el desbloqueo.
 
 **El `duration` importa**: si un worker muere sin hacer `signal`, el cupo queda
 tomado hasta que expire. Ese barrido es la red de seguridad, no un detalle.
@@ -554,11 +656,20 @@ deduplica:
 
 ```ruby
 # sidekiq-8.1.7/lib/sidekiq/capsule.rb:67
-[weight.to_i, 1].max.times { memo << name }
+[weight.to_i, 1].max.times do
+  memo << name
+end
 
-# sidekiq-8.1.7/lib/sidekiq/fetch.rb:80
-permute = @queues.shuffle
-permute.uniq!
+# sidekiq-8.1.7/lib/sidekiq/fetch.rb:79
+def queues_cmd
+  if @strictly_ordered_queues
+    @queues
+  else
+    permute = @queues.shuffle
+    permute.uniq!
+    permute
+  end
+end
 ```
 
 `BRPOP` con varias claves devuelve la primera que tenga datos, así que el orden
@@ -600,9 +711,12 @@ ese job **no está en ningún lado**: se perdió. `bulk_requeue` sólo cubre el
 shutdown **ordenado** (`SIGTERM` con timeout).
 
 Sidekiq Pro resuelve esto con `super_fetch` (usa `RPOPLPUSH` a una lista
-privada por proceso y la recupera al arrancar). Solid Queue lo resuelve gratis:
-el job sigue en `claimed_executions` con su `process_id`, y cuando el heartbeat
-del proceso muere, el supervisor lo devuelve a `ready_executions`.
+privada por proceso y la recupera al arrancar). Solid Queue lo resuelve gratis y
+sin ack explícito: el job sigue siendo una fila en `claimed_executions` con su
+`process_id`, así que **existe en la base pase lo que pase**. Cuando se vence el
+heartbeat, el supervisor lo pasa a `failed_executions` con `ProcessPrunedError`
+(§3.2). No es reintento automático —eso sólo pasa en una baja ordenada— pero es
+la diferencia entre "está acá, decidí qué hacer" y "no está en ningún lado".
 
 ### 4.4 Reintentos y Dead set
 
@@ -622,19 +736,28 @@ excepción en perform
 El backoff de Sidekiq 8:
 
 ```ruby
-# sidekiq-8.1.7/lib/sidekiq/job_retry.rb
-delay  = (count**4) + 15
+# sidekiq-8.1.7/lib/sidekiq/job_retry.rb:238  (delay_for)
+delay = (count**4) + 15
+
+# sidekiq-8.1.7/lib/sidekiq/job_retry.rb:202  (attempt_retry)
 jitter = rand(10 * (count + 1))
 retry_at = Time.now.to_f + delay + jitter
 ```
 
-Con `:max_retries: 10` (nuestro `config/sidekiq.yml`) el último reintento cae a
-las ~2,8 horas del primer fallo. Con el default de 25 la ventana total es de
-~21 días.
+`count` arranca en **0** para el primer reintento (`msg["retry_count"] = 0`), así
+que la primera espera es `0⁴ + 15` = 15 s, no 16.
+
+Sumando las esperas: con `:max_retries: 10` (nuestro `config/sidekiq.yml`) los
+10 reintentos son `15 + 16 + 31 + 96 + 271 + 640 + 1311 + 2416 + 4111 + 6576`
+= **15.483 s ≈ 4,3 horas** desde el primer fallo hasta el último reintento (más
+el jitter, ~275 s promedio). Con el default de 25 la ventana total es de
+**~20 días** (1.763.395 s).
 
 Agotados los reintentos, el job va al **Dead set**: un sorted set de Redis con
-capacidad acotada (`dead_max_jobs: 10_000`, `dead_timeout_in_seconds: 6 meses`
-por defecto). Es la dead letter queue: lo inspeccionás y lo reintentás a mano
+capacidad acotada (`dead_max_jobs: 10_000` y
+`dead_timeout_in_seconds: 180 * 24 * 60 * 60`, o sea 180 días, en
+`sidekiq-8.1.7/lib/sidekiq/config.rb:35`). Es la dead letter queue: lo
+inspeccionás y lo reintentás a mano
 desde el dashboard. Nuestro `death_handler` deja el registro estructurado:
 
 ```ruby
@@ -645,7 +768,7 @@ config.death_handlers << lambda do |job, exception|
 end
 ```
 
-⚠️ El Dead set **se poda**: pasados los 10.000 jobs o los 6 meses, los más
+⚠️ El Dead set **se poda**: pasados los 10.000 jobs o los 180 días, los más
 viejos se borran. No es un archivo permanente. Si un job muerto representa
 dinero, el `death_handler` tiene que persistirlo en tu base, no confiar en
 Redis.
@@ -682,12 +805,12 @@ Vale lo mismo para los `threads:` de `config/queue.yml`. Dos límites duros:
 | | **Solid Queue** | **Sidekiq** (OSS) | **GoodJob** | **Que** | **SQS** |
 |---|---|---|---|---|---|
 | Store | Postgres (base aparte) | Redis | Postgres | Postgres | servicio AWS |
-| Primitiva | polling + `SKIP LOCKED` | `BRPOP` | `LISTEN/NOTIFY` + polling + `SKIP LOCKED` | advisory locks + `SKIP LOCKED` | long polling HTTP |
+| Primitiva | polling + `SKIP LOCKED` | `BRPOP` | `LISTEN/NOTIFY` + polling + advisory locks | advisory locks de Postgres | long polling HTTP |
 | Latencia típica | 0,1–1 s | ~1 ms | ~10 ms | ~10 ms | 10–100 ms |
 | Throughput | miles/s | decenas de miles/s | miles/s | miles/s | ~ilimitado (con costo) |
 | Durabilidad | ACID | según AOF/RDB + fetch sin ack | ACID | ACID | replicada, gestionada |
 | Encolar dentro de tu transacción | sólo si comparte base (§9) | ❌ | ✅ | ✅ | ❌ |
-| Recuperación de worker muerto | ✅ heartbeat | ❌ (Pro sí) | ✅ | ✅ | ✅ (visibility timeout) |
+| Recuperación de worker muerto | ✅ heartbeat, pero a `failed_executions` (§3.2) | ❌ (Pro sí) | ✅ | ✅ | ✅ (visibility timeout) |
 | Cron integrado | ✅ `recurring.yml` | ❌ (Enterprise sí) | ✅ | ❌ | ✅ EventBridge |
 | Concurrencia limitada | ✅ semáforos | ❌ (Enterprise sí) | ✅ | ❌ | ❌ |
 | Dashboard | Mission Control | Sidekiq Web | propio | — | consola AWS |
@@ -765,9 +888,15 @@ Las colas garantizan **at-least-once**. Nunca exactly-once. El caso canónico:
 ```text
 worker: ejecuta el job (manda el mail / descuenta stock)  ✅
 worker: muere antes de marcar el job como terminado       💥
-supervisor: ve el heartbeat muerto → devuelve el job a ready
-worker 2: ejecuta el job de nuevo                          ← mail duplicado
+      · baja ordenada (SIGTERM) → el job vuelve a ready
+      · SIGKILL/OOM             → el job va a failed_executions (§3.2)
+alguien (otro worker, o vos desde Mission Control) lo corre de nuevo
+                                                           ← mail duplicado
 ```
+
+El camino cambia según cómo murió, pero **el resultado posible es el mismo**: la
+segunda ejecución existe. Con Sidekiq es más directo todavía, porque el
+reintento es automático siempre.
 
 No hay forma de eliminar esa ventana sin una transacción distribuida entre tu
 worker y el efecto externo. Lo que sí podés es hacer que la segunda ejecución
@@ -825,7 +954,11 @@ retry_on ActiveRecord::Deadlocked,               wait: :polynomially_longer, att
 retry_on ActiveRecord::LockWaitTimeout,          wait: :polynomially_longer, attempts: 5
 retry_on ActiveRecord::ConnectionNotEstablished, wait: :polynomially_longer, attempts: 5
 
-discard_on ActiveJob::DeserializationError { ... }
+# ...y en :63
+discard_on ActiveJob::DeserializationError do |job, error|
+  Rails.logger.warn(event: "job.discarded", job: job.class.name,
+                    reason: "registro inexistente", error: error.message)
+end
 ```
 
 La regla es simple de decir y difícil de aplicar: **`retry_on` para errores
@@ -898,7 +1031,17 @@ No hay número mágico, hay una pregunta: **¿cuánto tiempo tolera el negocio q
 esto no pase?** De ahí sale el número.
 
 - Un webhook a un socio que puede estar caído medio día → reintentos que sumen
-  ~12–24 h (con `:polynomially_longer` son ~8 intentos).
+  ~12–24 h. Con `:polynomially_longer` eso es `attempts: 13` a `14`, no 8: el
+  polinomio arranca lentísimo y la ventana total se estira recién al final.
+  Sumando `n⁴ + 2`:
+
+  | `attempts` | Reintentos | Ventana total |
+  |---|---|---|
+  | 5 (nuestro default) | 4 | 6 min |
+  | 8 | 7 | 1,3 h |
+  | 10 | 9 | 4,3 h |
+  | 12 | 11 | 11,1 h |
+  | 14 | 13 | 24,8 h |
 - Un job que toca la base propia → 3–5. Si a los 5 intentos tu propia base
   sigue mal, el problema no lo arregla la cola.
 - Algo que el usuario está esperando → 1 o 2 y un mensaje de error. Reintentar
@@ -1088,16 +1231,18 @@ Cuatro decisiones que hay que poder justificar:
   $ psql -d stock_development -c "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM outbox_events
       WHERE published_at IS NULL AND attempts < 10 ORDER BY id LIMIT 200 FOR UPDATE SKIP LOCKED"
 
-   Limit  (cost=0.12..4.48 rows=1) (actual time=0.015..0.015 rows=0 loops=1)
+   Limit  (cost=0.12..4.48 rows=1) (actual time=0.016..0.016 rows=0 loops=1)
      Buffers: shared hit=1
-     ->  LockRows
+     ->  LockRows  (cost=0.12..4.48 rows=1) (actual time=0.015..0.015 rows=0 loops=1)
            ->  Index Scan using index_outbox_events_unpublished on outbox_events
                  Filter: ((published_at IS NULL) AND (attempts < 10))
-   Execution Time: 0.056 ms
+                 Buffers: shared hit=1
+   Execution Time: 0.062 ms
   ```
 
-  Un `Index Scan` con **1 buffer** sobre una tabla con 107 eventos, y sigue
-  siendo 1 buffer con 107 millones: el índice sólo contiene lo pendiente.
+  Un `Index Scan` con **1 buffer** sobre una tabla con 126 eventos (todos
+  publicados, así que el índice parcial está vacío), y sigue siendo 1 buffer con
+  126 millones: el índice sólo contiene lo pendiente.
 - **`(aggregate_type, aggregate_id, id)`**: reconstruir el stream de un agregado
   (debugging, event sourcing liviano, "¿qué le pasó a este item?").
 - **`created_at` sin `updated_at`**: es un log. Lo único que se actualiza es
@@ -1143,7 +1288,7 @@ Y como el lote es chico, hace falta un mecanismo para drenar rápido después de
 un pico: si el lote se llenó, **el job se re-encola a sí mismo** en vez de
 esperar al próximo tick del scheduler. Es un bucle con freno: procesa mientras
 haya trabajo, y se apaga solo cuando el lote deja de llenarse. Testeado en los
-dos sentidos (`spec/jobs/outbox_publish_pending_job_spec.rb:68`).
+dos sentidos (`spec/jobs/outbox_publish_pending_job_spec.rb:69` y `:76`).
 
 **Cómo elegir `BATCH_SIZE`**: `tiempo_del_lote = batch_size × latencia_del_publish`.
 Con un webhook de 50 ms y lote de 200, cada lote son 10 segundos — demasiado
@@ -1360,8 +1505,27 @@ Del CHANGELOG de `activejob-8.1.3.1`:
 > `:never`, `:always` and `:default`.
 > Remove deprecated `Rails.application.config.active_job.enqueue_after_transaction_commit`.
 
-Ahora es un `class_attribute` booleano por job (default `false`), así que se
-configura en `ApplicationJob`, no en un initializer. La lección general:
+Ahora es un `class_attribute` booleano **por job**, con default `false`
+(`activejob-8.1.3.1/lib/active_job/enqueuing.rb:53`), así que se configura en
+`ApplicationJob`, no en un initializer.
+
+Y el no-op es deliberado, no un olvido. El railtie que copia `config.active_job.*`
+a los accessors **excluye esta clave a propósito**:
+
+```ruby
+# activejob-8.1.3.1/lib/active_job/railtie.rb:60
+options = options.except(
+  :log_query_tags_around_perform,
+  :custom_serializers,
+  # This config can't be applied globally, so we need to remove otherwise
+  # it will be applied to `ActiveJob::Base`.
+  :enqueue_after_transaction_commit
+)
+```
+
+Y el otro camino (`config.after_initialize`) sólo aplica la opción
+`if ActiveJob.respond_to?(k)`, que acá da `false`. Por los dos lados la línea
+del initializer se descarta en silencio. La lección general:
 **una opción de configuración que "no toma" casi siempre es un problema de orden
 de boot o de una API removida; verificalo leyendo el valor efectivo, no el
 initializer.**
@@ -1392,12 +1556,14 @@ $ bin/rails runner '
   puts "antes=#{before} despues=#{SolidQueue::Job.count}"'
 
 rollback por: boom
-antes=59 despues=60      ← el job quedó encolado PESE al rollback
+antes=366 despues=367    ← el job quedó encolado PESE al rollback
 ```
 
-Con `ApplicationJob.enqueue_after_transaction_commit = true` el mismo script da
-`antes=62 despues=62`: no se encola. La corrección son dos líneas en
-`app/jobs/application_job.rb`; el diagnóstico es lo que vale.
+Con `ApplicationJob.enqueue_after_transaction_commit = true` al principio del
+mismo script el resultado es `antes=379 despues=379`: no se encola. (Los
+absolutos varían porque hay un worker corriendo; lo que importa es el delta.) La
+corrección son dos líneas en `app/jobs/application_job.rb`; el diagnóstico es lo
+que vale.
 
 Moraleja: **"Solid Queue es transaccional" es cierto sólo con base compartida.**
 Si separás bases (que es el default de Rails 8 y lo correcto para no
@@ -1481,7 +1647,8 @@ está igual, no optimices el job — agregá workers.
 | Latencia de cola | `min(created_at)` de `solid_queue_ready_executions` | > 10× `polling_interval` de esa cola, 5 min sostenido |
 | Profundidad | `count(*)` de `ready_executions` por cola | **la derivada**, no el valor: creciendo 5 min seguidos |
 | Jobs fallados | `solid_queue_failed_executions` | cualquier fila nueva en `critical` u `outbox` |
-| Workers vivos | `solid_queue_processes.last_heartbeat_at` | ninguno late hace > 1 min |
+| Workers vivos | `solid_queue_processes.last_heartbeat_at` | ninguno late hace > 2 min (el latido es cada 60 s: `process_heartbeat_interval`) |
+| Jobs huérfanos por muerte abrupta | `failed_executions` con `ProcessPrunedError` | cualquier fila: son jobs que **nadie va a reintentar solo** (§3.2) |
 | **Outbox atrasado** | `OutboxEvent.pending.count` | > 1000, o el más viejo con > 5 min |
 | **Outbox stuck** | `OutboxEvent.stuck.count` | **> 0 siempre**: es trabajo perdido |
 | Recurring tasks | `solid_queue_recurring_executions` | no hay fila para el último tick esperado |
@@ -1687,8 +1854,13 @@ Sidekiq si necesitás latencia de milisegundos (usa `BRPOP` bloqueante contra el
 polling de Solid Queue) o decenas de miles de jobs por segundo. *El trade-off*:
 Sidekiq te suma Redis —otra pieza que monitorear, y por default no es durable—
 y en la versión OSS el fetch no tiene ack, así que un `SIGKILL` con un job en
-vuelo lo pierde. Solid Queue lo recupera vía heartbeat. Umbral práctico: por
-debajo de ~10k jobs/min, Solid Queue y te ahorrás medio stack.
+vuelo lo pierde y no queda rastro. En Solid Queue ese job es una fila en
+`claimed_executions`: cuando se vence el heartbeat el supervisor la mueve a
+`failed_executions` con `ProcessPrunedError`. Es el matiz que separa una
+respuesta buena de una repetida de memoria: **no es reintento automático, es
+"no se pierde y lo ves"** — el reintento automático sólo ocurre en la baja
+ordenada. Umbral práctico: por debajo de ~10k jobs/min, Solid Queue y te
+ahorrás medio stack.
 
 **"Explicame `FOR UPDATE SKIP LOCKED`."**
 `FOR UPDATE` toma lock exclusivo de las filas que devuelve el `SELECT`;

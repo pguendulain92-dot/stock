@@ -7,8 +7,9 @@ grupos, `require: false`— porque ahí es donde un javero traduce mal desde Mav
 
 Todos los números salen de correr los comandos contra este repo (Ruby 3.3.6, Rails 8.1.3.1,
 Bundler 4.0.9, PostgreSQL 16.13). Cuando una medición contradice lo que dice el comentario
-del código, lo digo: hay **dos casos en este repo** donde la sabiduría popular no aguanta la
-medición, y los dos están marcados. Los comentarios del `Gemfile` y de `config/` son la
+del código, lo digo: hay **tres lugares en este repo** donde lo que se afirma no aguanta la
+medición —`oj` (§17), el comentario del `Gemfile` sobre el `COUNT(*)` de pagy (§18) y la
+config de `bullet` en test (§27)—, y los tres están marcados. Los comentarios del `Gemfile` y de `config/` son la
 fuente de verdad del *por qué*; este documento agrega el *cómo se comprueba*.
 
 ---
@@ -20,20 +21,20 @@ Todo medido acá adentro, no copiado de un blog:
 | Medición | Valor | Cómo se obtuvo |
 |---|---|---|
 | Gemas instaladas (resueltas) | **155** | `bundle list \| grep -c '^  \*'` |
-| Dependencias directas en el `Gemfile` | **47** | sección `DEPENDENCIES` de `Gemfile.lock` |
+| Dependencias directas en el `Gemfile` | **46** | sección `DEPENDENCIES` de `Gemfile.lock` |
 | Boot sin bootsnap | **2.39 s** | `time DISABLE_BOOTSNAP=1 bin/rails runner nil` |
 | Boot con bootsnap caliente | **1.23 s** | `time bin/rails runner nil` |
 | Primer boot con bootsnap (cache frío) | **3.23 s** | idem, tras borrar `tmp/cache/bootsnap` |
 | Tamaño del cache de bootsnap | **16 MB** | `du -sh tmp/cache/bootsnap` |
 | Archivos cargados al bootear (dev) | **2137** | `$LOADED_FEATURES.size` |
 | RSS de un proceso booteado (dev) | **94 MB** | `/proc/self/status` |
-| Costo de cargar rubocop + brakeman | **+26 MB, +404 archivos** | `require` a mano y medir |
+| Costo de cargar rubocop + brakeman | **+16 MB, +404 archivos** | `require` a mano y medir |
 | Un hash de bcrypt (cost 12) | **233 ms** | `Benchmark.realtime` |
-| Suite de RuboCop | 176 archivos, 2 ofensas | `bin/rubocop` |
-| Brakeman | 19 controllers, 22 models, 0 warnings, 1.5 s | `bin/brakeman --quiet` |
+| Suite de RuboCop | 188 archivos, 0 ofensas | `bin/rubocop` |
+| Brakeman | 20 controllers, 22 models, 0 warnings, 1.5 s | `bin/brakeman --quiet` |
 | bundler-audit | 1237 advisories, 0 vulnerabilidades | `bin/bundler-audit check` |
 
-Guardá el `+26 MB / +404 archivos`: es la justificación entera de `require: false`, y es la
+Guardá el `+16 MB / +404 archivos`: es la justificación entera de `require: false`, y es la
 respuesta que te van a pedir en la entrevista.
 
 ---
@@ -101,7 +102,7 @@ dependencias transitivas, nadie las declaró, y por eso no tienen restricción p
 ```text
 GEM / specs      -> el grafo resuelto completo, con las dependencias de cada gema
 PLATFORMS        -> para qué arquitecturas está resuelto este lock
-DEPENDENCIES     -> lo que vos pediste (las 47 líneas del Gemfile)
+DEPENDENCIES     -> lo que vos pediste (las 46 líneas del Gemfile)
 CHECKSUMS        -> sha256 de cada .gem                       <- integridad de supply chain
 RUBY VERSION     -> ruby 3.3.6
 BUNDLED WITH     -> 4.0.9
@@ -203,10 +204,10 @@ Lo medí:
 ```ruby
 before = rss; f0 = $LOADED_FEATURES.size
 require "rubocop"; require "brakeman"
-# => +26 MB de RSS, +404 archivos
+# => +16 MB de RSS, +404 archivos
 ```
 
-26 MB **por proceso**. Con 4 workers de Puma más 3 procesos de Solid Queue son ~180 MB de
+16 MB **por proceso**. Con 4 workers de Puma más 3 procesos de Solid Queue son ~110 MB de
 RAM tirados para cargar dos herramientas de línea de comandos que jamás corren dentro de la
 app. Y en tiempo de boot, 404 archivos más para resolver, leer y evaluar en cada arranque —
 que en desarrollo pagás en cada reinicio.
@@ -218,7 +219,7 @@ qué no cargar.
 
 Casos donde `require: false` es obligatorio y no opcional:
 - herramientas CLI (rubocop, brakeman, bundler-audit, kamal, thruster);
-- gemas que tienen que cargarse **antes** que Rails (`bootsnap`, que carga
+- gemas que tienen que cargarse **antes** que Rails (`bootsnap`, al que carga a mano
   `config/boot.rb:4`, antes que `config/application.rb`);
 - gemas que se cargan a mano y condicionalmente.
 
@@ -296,7 +297,7 @@ Pero hay dos formas de instalarlas, y la diferencia es la que decide si tu Docke
 20 segundos o 6 minutos. Mirá las rutas reales:
 
 ```bash
-$ bundle list --paths | grep -E "pg-|nokogiri-|puma-|oj-|bcrypt-|thruster"
+$ bundle list --paths | grep -E "pg-|nokogiri-|puma-|oj-|bcrypt-|thruster|tailwindcss-ruby"
 .../gems/bcrypt-3.1.22                        <- compilada desde fuente
 .../gems/oj-3.17.6                            <- compilada desde fuente
 .../gems/puma-8.0.2                           <- compilada desde fuente
@@ -346,8 +347,8 @@ diga "el build sólo falla en el runner de ARM", esto es lo primero que mirás.
 El criterio que usamos, en orden. Si falla el primero, no seguís:
 
 1. **¿Lo escribís en 50 líneas y las entendés todas?** Entonces escribilo. La regla vale
-   sobre todo para "helpers" de una función. Una gema son 155 nodos más en tu grafo, un
-   changelog más que seguir, y un CVE potencial más.
+   sobre todo para "helpers" de una función. Una gema es un nodo más en un grafo que acá ya
+   tiene 155, un changelog más que seguir y un CVE potencial más.
 2. **¿Está mantenida?** Último release en los últimos 12 meses, issues respondidos, y
    —crítico en Ruby— **compatible con la última minor de Rails**. Una gema que monkeypatchea
    ActiveRecord y no se actualizó desde Rails 7.0 te bloquea el upgrade del framework entero.
@@ -378,8 +379,8 @@ límite. Todo lo demás pasa.
 gem "rails", "~> 8.1.3", ">= 8.1.3.1"
 ```
 
-Es un meta-gem: no tiene código propio, sólo declara sus ocho componentes en versión exacta
-(`= 8.1.3.1`). En el lock:
+Es un meta-gem: no tiene código propio, sólo declara sus doce componentes en versión exacta
+(`= 8.1.3.1`), más una dependencia sobre el propio `bundler`. En el lock:
 
 ```text
 rails (8.1.3.1)
@@ -390,7 +391,7 @@ rails (8.1.3.1)
 Es un BOM de Maven, pero con las versiones clavadas en `=` en vez de gestionadas. Por eso no
 podés subir sólo ActiveRecord: los doce se mueven juntos.
 
-Y podés no cargarlos todos. `config/application.rb:4-15` elige los frameworks a mano:
+Y podés no cargarlos todos. `config/application.rb:5-15` elige los frameworks a mano:
 
 ```ruby
 require "active_model/railtie"
@@ -409,7 +410,7 @@ require "action_cable/engine"
 Tres cosas están comentadas a propósito. Action Mailbox y Action Text no se usan (menos
 código cargado, menos tablas, menos superficie). Y `rails/test_unit/railtie` está apagado
 porque usamos RSpec: sin eso, `bin/rails test` no existe y los generadores no crean
-archivos de Minitest. Es la decisión de §19 hecha explícita en el boot.
+archivos de Minitest. Es la decisión de §20 hecha explícita en el boot.
 
 ## 3. `puma` — y en qué NO es Tomcat
 
@@ -439,8 +440,8 @@ nucleos: 4
 secuencial 8 hashes: 1.87 s
 en 8 threads:        0.49 s   -> speedup 3.82x   (bcrypt LIBERA el GVL)
 
-ruby puro CPU-bound (sumar 3M veces):
-secuencial 1.13 s / en threads 1.15 s -> speedup 0.98x   (NO hay paralelismo)
+ruby puro CPU-bound (8 tandas de 3M sumas, las mismas 8 unidades de trabajo):
+secuencial 1.14 s / en 8 threads 1.18 s -> speedup 0.97x   (NO hay paralelismo)
 ```
 
 Ahí tenés todo el modelo en dos mediciones. `bcrypt`, que es una extensión C que suelta el
@@ -470,7 +471,9 @@ pidfile ENV["PIDFILE"] if ENV["PIDFILE"]
 Notá lo que **no** está: no hay `workers` ni `preload_app!`. Rails 8 los sacó del generador
 por defecto, y es una decisión deliberada: la mayoría de los despliegues modernos corren un
 proceso por contenedor y escalan agregando contenedores, que es más simple de operar y de
-observar. `WEB_CONCURRENCY` sigue funcionando si lo definís.
+observar. `WEB_CONCURRENCY` sigue funcionando igual sin escribir nada: Puma lo lee solo
+(`puma-8.0.2/lib/puma/configuration.rb:248`), y acepta `auto` para levantar un worker por
+core.
 
 `threads 3, 3` con mínimo igual al máximo es intencional: un pool elástico agrega latencia
 al crear threads bajo carga y complica dimensionar el pool de la base.
@@ -533,7 +536,7 @@ los workers nuevos levantarían el código viejo. Puma directamente lo rechaza.
 
 O sea que elegís: **preload_app! (menos RAM, boot más rápido) o phased restart (deploy sin
 downtime)**. No las dos. La salida moderna, y la que usa este repo, es no elegir: deploy azul-verde
-a nivel de contenedor con Kamal (§29), donde el proxy corta el tráfico al contenedor viejo
+a nivel de contenedor con Kamal (§30), donde el proxy corta el tráfico al contenedor viejo
 recién cuando el nuevo pasa el health check. El problema se resuelve una capa más arriba.
 
 Comparación honesta con Java: Tomcat no tiene phased restart porque no lo necesita —
@@ -548,7 +551,7 @@ El driver nativo de PostgreSQL. Wrapper sobre `libpq`, la librería oficial en C
 ```ruby
 ActiveRecord::Base.connection.adapter_name  # => "PostgreSQL"
 select_value("show server_version")         # => "16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)"
-PG.library_version                          # => 180001   (libpq 18.0.1)
+PG.library_version                          # => 180001   (libpq 18.1)
 ```
 
 Fijate que **libpq 18 habla con un servidor 16**: el protocolo de Postgres es compatible
@@ -604,7 +607,7 @@ emite dos etiquetas:
 
 ```html
 <link rel="stylesheet" href="/assets/application-8b441ae0.css" />
-<link rel="stylesheet" href="/assets/tailwind-2ff6ae68.css" />
+<link rel="stylesheet" href="/assets/tailwind-7f74a9b4.css" />
 ```
 
 Una viene de `app/assets/stylesheets/application.css`, la otra de
@@ -903,8 +906,10 @@ Dos consecuencias operativas que casi nadie piensa:
    siguen sirviendo requests mientras uno hashea. Este es exactamente el tipo de detalle que
    distingue "leí sobre el GVL" de "lo entiendo".
 
-En test, `ActiveModel::SecurePassword.min_cost` baja el cost al mínimo; si no, cada `create(:user)`
-de la suite costaría 233 ms.
+En test no hay que configurar nada: el railtie de ActiveModel
+(`active_model/railtie.rb:18`) hace `ActiveModel::SecurePassword.min_cost = Rails.env.test?`,
+así que el digest se genera con `BCrypt::Engine::MIN_COST` (4) en vez de 12. Sin eso, cada
+`create(:user)` de la suite costaría 233 ms.
 
 Java: `BCryptPasswordEncoder` de Spring Security, misma primitiva y mismo parámetro
 (`strength`). La diferencia real es que en Rails viene enchufado en el modelo con una línea y
@@ -917,7 +922,8 @@ no tenés que declarar un bean.
 include Pundit::Authorization
 ```
 
-Pundit: **una clase por recurso, un método por acción**. `app/policies/` tiene nueve.
+Pundit: **una clase por recurso, un método por acción**. `app/policies/` tiene diez archivos:
+`ApplicationPolicy` más nueve policies de recurso.
 `ApplicationPolicy` define los defaults y la clase anidada `Scope` filtra colecciones.
 
 | | Pundit | CanCanCan |
@@ -1035,14 +1041,17 @@ O sea: la gema se carga en cada proceso, suma RAM, y no serializa un solo byte.
 ```text
 json gem: 2.21.2 / oj: 3.17.6 / ruby 3.3.6
 
-  ActiveSupport::JSON.encode (lo que usa render json:)     1.36 ms/iter
-  Oj.dump(mode: :rails)                                    2.75 ms/iter
-  Oj.dump(mode: :compat)                                   1.96 ms/iter
+  JSON.generate (gem json puro)                             1.15 ms/iter
+  ActiveSupport::JSON.encode (lo que usa render json:)       1.46 ms/iter
+  Oj.dump(mode: :compat)                                     3.15 ms/iter
+  Oj.dump(mode: :rails)                                     17.05 ms/iter
 ```
 
-El `json` de la stdlib ganó por 2x. La razón es histórica: entre 2023 y 2025 el gem `json`
-se reescribió y optimizó fuerte (acá corre 2.21.2, contra la 2.7.2 que Ruby 3.3 trae por
-defecto). La ventaja de Oj, que era real en la época de `json` 1.x, se evaporó.
+El `json` de la stdlib ganó: más de 2x contra `mode: :compat` y más de 10x contra
+`mode: :rails`, que es el modo que emula la semántica de ActiveSupport y es justamente el
+más caro. La razón es histórica: entre 2023 y 2025 el gem `json` se reescribió y optimizó
+fuerte (acá corre 2.21.2, contra la 2.7.2 que Ruby 3.3 trae por defecto). La ventaja de Oj,
+que era real en la época de `json` 1.x, se evaporó.
 
 **Conclusión:** `oj` es candidato a salir del `Gemfile`. Y la lección general vale más que la
 gema: **una dependencia que entró por una razón de performance necesita que revalides esa
@@ -1164,26 +1173,37 @@ larga corriendo, tu ALTER espera, y todas las queries que llegan después espera
 `add_index` sin `CONCURRENTLY`, `remove_column`, cambios de tipo, `NOT NULL` sin constraint
 previa, backfills en la misma migración, `add_reference` con índice, y más.
 
-Config actual, leída del proceso:
+Config real de este repo, leída del proceso (la fija `config/initializers/strong_migrations.rb`):
 
 ```ruby
-StrongMigrations.start_after                  # => 0
-StrongMigrations.target_postgresql_version    # => nil
-StrongMigrations.lock_timeout                 # => nil
-StrongMigrations.safe_by_default              # => false
+StrongMigrations.start_after        # => 20260830161300
+StrongMigrations.target_version     # => 16
+StrongMigrations.lock_timeout       # => 10 seconds
+StrongMigrations.statement_timeout  # => 1 hour
+StrongMigrations.safe_by_default    # => false
 ```
 
-Todo por defecto. Para un proyecto en serio, las tres que conviene tocar en un initializer:
+Las cuatro que están puestas son exactamente las que hay que poner, y cada una arregla un
+problema distinto:
 
-```ruby
-StrongMigrations.start_after = 20260830161300      # no revises migraciones ya aplicadas
-StrongMigrations.target_version = 16               # sabé qué es seguro en TU versión de PG
-StrongMigrations.lock_timeout = 10.seconds         # abortá antes de encolar a media app
-```
+- **`start_after`** es lo primero que necesitás al instalar la gema en un proyecto que ya
+  tiene migraciones: sin eso analiza también las viejas —que ya corrieron— y no te deja
+  bootear. Se pone el timestamp de la última migración existente.
+- **`target_version`** es la versión de Postgres de **producción**, no la de tu máquina. Lo
+  que es peligroso depende de la versión: agregar una columna con default reescribía la tabla
+  antes de PG 11 y es instantáneo desde PG 11. Sin ese dato la gema es conservadora de más.
+  Acá vale 16 (`ENV.fetch("PG_TARGET_VERSION", 16)`).
+- **`lock_timeout = 10.seconds`** es lo que evita la caída en cascada: si la migración no
+  consigue el lock en 10 segundos, aborta en vez de quedarse encolada bloqueando a todo lo
+  que viene atrás.
+- **`statement_timeout = 1.hour`** acota la migración en sí, que es un límite distinto del
+  anterior: uno es "cuánto espero el lock", el otro "cuánto puedo tardar teniéndolo".
 
-`target_version` importa porque lo que es peligroso depende de la versión: agregar una
-columna con default era un rewrite de tabla antes de PG 11 y es instantáneo desde PG 11.
-Sin decirle tu versión, strong_migrations es conservador de más.
+La que queda en su default es **`safe_by_default = false`**: la gema te frena y te escribe
+el reemplazo seguro, pero no lo aplica sola. Ponerla en `true` haría que, por ejemplo,
+`add_index` se convierta solo en `algorithm: :concurrently`. Es cómodo y es discutible:
+esconde la decisión en vez de obligarte a tomarla. Con un equipo que recién arranca con
+Postgres, prendela; con gente que ya sabe, dejala apagada.
 
 Ojo con `safety_assured { ... }`: existe para saltarse un chequeo cuando sabés lo que hacés.
 Cada uso necesita un comentario que explique por qué es seguro **en esta tabla y con este
@@ -1360,7 +1380,7 @@ integraciones de terceros con payloads grandes.
 ## 26. `capybara` (3.40) + `selenium-webdriver` (4.48) + `cuprite` (0.17)
 
 Capybara es el **DSL** (`visit`, `fill_in`, `click_button`); el **driver** es quien habla con
-el browser. Este repo tiene los tres drivers configurados en `spec/support/capybara.rb`:
+el browser. Los tres que importan:
 
 | Driver | Cómo habla | Necesita | Ejecuta JS |
 |---|---|---|---|
@@ -1373,9 +1393,11 @@ del Chrome instalado, y Chrome se autoactualiza solo. Es la causa número uno de
 rompió y nadie tocó nada". Cuprite habla CDP directo y elimina la pieza intermedia.
 
 En este entorno el problema es literal y está documentado en `spec/support/capybara.rb`:
-**Chromium 141 contra ChromeDriver 147**. Por eso el driver por defecto para `js: true` es
-cuprite. Selenium queda configurado igual, porque es lo que vas a encontrar en la mayoría de
-los proyectos y porque soporta Firefox y Safari, que cuprite no.
+**Chromium 141 contra ChromeDriver 147**. Por eso ese archivo registra sólo dos:
+`driven_by :rack_test` para los system specs sin JS y `driven_by :cuprite` para los marcados
+`js: true`. `selenium-webdriver` sigue en el `Gemfile` —es lo que vas a encontrar en la
+mayoría de los proyectos, y es el único que maneja Firefox y Safari— pero **no está
+enganchado en la suite**: si lo querés usar, hay que agregar el `driven_by :selenium`.
 
 El otro problema, más profundo, también está explicado ahí: **el servidor de test corre en
 otro thread con otra conexión**, y con transactional fixtures los datos del ejemplo están en
@@ -1397,20 +1419,42 @@ también habla CDP y por eso arranca más rápido y es más estable.
 
 ## 27. Análisis estático y auditoría
 
-Todas con `require: false`, todas en `config/ci.rb`, ninguna cargada en la app.
+Las tres que corren en CI (`config/ci.rb`) van con `require: false` y nunca se cargan dentro
+de la app: `rubocop`, `brakeman` y `bundler-audit`. `bullet` es la excepción y conviene mirarla
+de cerca, porque ahí hay una trampa.
 
-**`bullet` (8.2.0)** — detector de N+1 y de eager loading innecesario. Está en
-`:development` (aparece como `Bullet::Rack` en el stack de middleware) y se activa en test.
-La configuración de `spec/support/bullet.rb` es la parte interesante:
+**`bullet` (8.2.0)** — detector de N+1 y de eager loading innecesario. Se declara **sin**
+`require: false` y **sólo en `group :development`**, así que en desarrollo se carga entero
+(aparece como `Bullet::Rack` al final del stack de `bin/rails middleware`).
+
+La intención de `spec/support/bullet.rb` es que un N+1 rompa la suite:
 
 ```ruby
 Bullet.raise = true                        # el N+1 ROMPE el test
 Bullet.unused_eager_loading_enable = true  # detecta el problema INVERSO
 ```
 
-Que un N+1 falle el CI es la única forma de que no vuelvan. Pero fijate que sólo se activa
-en los ejemplos marcados con `:n_plus_one` (`config.before(:each, :n_plus_one)` en
-`spec/rails_helper.rb`): activarlo globalmente genera falsos positivos en specs unitarios
+**Pero hoy ese archivo no hace nada**, y es exactamente el tipo de cosa que hay que
+comprobar en vez de asumir. Tanto `spec/support/bullet.rb` como el hook de
+`spec/rails_helper.rb` están guardados con `if defined?(Bullet)`, y en el entorno de test la
+constante no existe:
+
+```text
+$ RAILS_ENV=test bin/rails runner 'p Rails.groups; p Object.const_defined?(:Bullet)'
+[:default, "test"]
+false
+```
+
+`Bundler.require(*Rails.groups)` carga `:default` + el grupo del entorno; con `bullet` sólo
+en `:development`, en test nunca se hace el `require`, el `defined?` da falso y la
+configuración se saltea en silencio. El arreglo es de una línea en el `Gemfile`
+(`group :development, :test do` para bullet), y es el mismo patrón que el `require`
+condicional de sidekiq de §1.5: **una optimización a medio aplicar, partida entre el
+`Gemfile` y otro archivo, no hace nada.**
+
+Suponiendo que estuviera cargado, el diseño del hook es el correcto: sólo se activa en los
+ejemplos marcados con `:n_plus_one` (`config.before(:each, :n_plus_one)` en
+`spec/rails_helper.rb`). Activarlo globalmente genera falsos positivos en specs unitarios
 donde la query repetida es intencional, la gente empieza a silenciarlos, y ahí perdés la
 herramienta. Es una lección de tooling más general que de Bullet.
 
@@ -1425,9 +1469,9 @@ está cerrada.
 **`brakeman` (8.0.6)** — analizador estático de seguridad específico de Rails. Corrida real:
 
 ```text
-Controllers: 19 | Models: 22 | Templates: 34 | Errors: 0
+Controllers: 20 | Models: 22 | Templates: 34 | Errors: 0
 Security Warnings: 0
-Duration: 1.53 s | Checks Run: 80+
+Duration: 1.49 s | Checks Run: 79
 ```
 
 Busca SQLi por interpolación, XSS por `html_safe`/`raw`, mass assignment, redirects abiertos,
@@ -1444,16 +1488,16 @@ Find-Sec-Bugs, pero con **conocimiento de Rails**: sabe qué es un controller, q
 el preset oficial de Rails 8 (el estilo de DHH): deliberadamente **permisivo**, mucho más que
 el default de RuboCop. La filosofía es que un linter debe atrapar errores, no imponer gusto
 personal; discutir comillas simples contra dobles en un code review es tiempo perdido.
-`.rubocop.yml` entero son 3 líneas útiles:
+`.rubocop.yml` entero tiene **una sola línea útil** (el resto son comentarios del generador):
 
 ```yaml
 inherit_gem: { rubocop-rails-omakase: rubocop.yml }
 ```
 
-Corrida real: **176 archivos, 2 ofensas, las 2 autocorregibles** (un `Layout/EndAlignment` en
-`spec/lib/result_spec.rb`). El workflow de CI cachea `RUBOCOP_CACHE_ROOT` con una clave
-derivada de `.ruby-version` + `.rubocop.yml` + `Gemfile.lock`, que es la forma correcta:
-la clave del cache tiene que incluir todo lo que invalida el resultado.
+Corrida real: **188 archivos inspeccionados, 0 ofensas**. El workflow de CI cachea
+`RUBOCOP_CACHE_ROOT` (`tmp/rubocop`) con una clave derivada de `.ruby-version` +
+`.rubocop.yml` + `.rubocop_todo.yml` + `Gemfile.lock`, que es la forma correcta: la clave del
+cache tiene que incluir todo lo que invalida el resultado.
 
 Java: Checkstyle/Spotless. La diferencia es que `rubocop -a` autocorrige de verdad la mayoría
 de las ofensas de estilo.
@@ -1606,6 +1650,7 @@ corriendo — el equivalente del *remote debugging* de la JVM con `-agentlib:jdw
 | `brakeman` | seguridad estática | SpotBugs + Find-Sec-Bugs |
 | `bundler-audit` | CVEs en dependencias | OWASP dependency-check |
 | `rubocop` | estilo | Checkstyle / Spotless |
+| `rack-mini-profiler` | desglose de tiempo por request | p6spy + profiler de request |
 | `stackprof` | profiler de CPU | async-profiler / JFR |
 | `memory_profiler` | profiler de memoria | Eclipse MAT |
 | `dotenv-rails` | `.env` en dev | `application-dev.properties` |
@@ -1661,7 +1706,7 @@ x86_64 Linux; o Alpine, que es `musl` y no `gnu`).
 *Arreglo:* `libpq-dev` (Debian) en la **etapa de build**, como hace el `Dockerfile`. La
 imagen final sólo necesita `postgresql-client`.
 
-**7. Producción usa 26 MB más por proceso de lo esperado.**
+**7. Producción usa 16 MB más por proceso de lo esperado.**
 *Causa:* una gema de herramientas sin `require: false`, o `BUNDLE_WITHOUT` mal configurado.
 *Arreglo:* `bin/rails runner 'puts defined?(RuboCop)'` en producción. Si dice algo distinto
 de `nil`, ahí está.
@@ -1679,8 +1724,9 @@ modelo de procesos y no tiene equivalente en la JVM.
 *Síntoma:* timeouts masivos durante el deploy, la app se recupera sola después.
 *Causa:* `ALTER TABLE` toma `ACCESS EXCLUSIVE`, espera detrás de una query larga, y **encola
 todo lo que llega después**.
-*Arreglo:* `strong_migrations` te lo caza en desarrollo. Además, `lock_timeout` para abortar
-en vez de encolar, y `algorithm: :concurrently` con `disable_ddl_transaction!` para índices.
+*Arreglo:* `strong_migrations` te lo caza en desarrollo, y en este repo ya está configurado
+con `lock_timeout = 10.seconds` (abortar en vez de encolar) y `target_version = 16`. Para
+índices, `algorithm: :concurrently` con `disable_ddl_transaction!`.
 
 **11. El CI se rompió solo y nadie tocó nada.**
 *Causa:* Chrome se autoactualizó y su versión mayor ya no coincide con la de chromedriver.
@@ -1731,8 +1777,8 @@ cada gema por proceso, no hay shading que te salve.
 
 Instala la gema pero no le hace `require` al bootear. Importa porque en Ruby `require`
 **ejecuta** el archivo, así que cada gema cargada suma RAM y tiempo de boot a **todos** los
-procesos. Lo medí en este repo: cargar rubocop y brakeman son **+26 MB y +404 archivos** por
-proceso. Con 4 workers son ~100 MB para dos herramientas que nunca corren dentro de la app.
+procesos. Lo medí en este repo: cargar rubocop y brakeman son **+16 MB y +404 archivos** por
+proceso. Con 4 workers son ~64 MB para dos herramientas que nunca corren dentro de la app.
 *Trade-off:* tenés que acordarte de `bundle exec` o de cargarla a mano, y si una gema tiene un
 railtie que hace algo importante, con `require: false` deja de funcionar en silencio.
 *Contraste con Java:* el problema no existe porque el classloader es perezoso; un jar en el

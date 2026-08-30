@@ -6,7 +6,7 @@ la respuesta corta y precisa que conviene dar, y —donde hace falta— una lín
 consistente con el código de este repositorio y con `docs/00` a `docs/14`; los
 números y las salidas de comandos se midieron acá, sobre **Ruby 3.3.6, Rails
 8.1.3.1 y PostgreSQL 16.13**, con la base de seed (15 productos, 4 depósitos, 48
-`stock_items`, 106 movimientos, 4 usuarios).
+`stock_items`, 109 movimientos, 4 usuarios).
 
 Está escrito para alguien que viene de **Java/Spring**: casi todas las respuestas
 incluyen la comparación con el equivalente de la JVM y, sobre todo, marcan **dónde
@@ -38,9 +38,11 @@ inserta el módulo en la cadena de ancestros
 (`app/models/concerns/discardable.rb:25`). Es más parecido a una `default method`
 de Java 8 llevada al extremo, pero sin chequeo estático de nada.
 
-**Si repreguntan:** `include` mete el módulo **arriba** de la clase en los
-ancestros, `prepend` lo mete **abajo** (intercepta llamadas), `extend` lo agrega a
-la clase singleton (métodos de clase).
+**Si repreguntan:** en `ancestors`, `prepend` mete el módulo **antes** de la clase
+(por eso puede interceptar llamadas) e `include` lo mete **después**, entre la clase
+y su superclase; `extend` lo agrega a la clase singleton (métodos de clase).
+Comprobalo: con `class C < Base; include Inc; prepend Pre; end`, `C.ancestors` da
+`[Pre, C, Inc, Base, Object, Kernel, BasicObject]`.
 
 ### ¿Cómo resuelve Ruby una llamada a método?
 
@@ -117,8 +119,9 @@ el módulo que la envuelve, no dentro de `Money`. Está explicado en el archivo.
 
 Un mutex global por proceso: los `Thread` de Ruby son pthreads reales pero sólo uno
 ejecuta bytecode a la vez. Se **libera** durante I/O bloqueante (el driver `pg` lo
-suelta mientras espera a Postgres). Medición de `docs/00`: trabajo CPU-bound con 4
-threads → 1.53 s contra 1.51 s secuencial (cero ganancia); I/O-bound → 0.50 s
+suelta mientras espera a Postgres). Medición de `docs/00`, en esta máquina de 4
+cores con `(1..12_000_000).reduce(:+)` como carga: CPU-bound con 4 threads → 2.41 s
+contra 2.37 s secuencial (cero ganancia, y encima un poco peor); I/O-bound → 0.50 s
 contra 2.00 s (4×).
 
 **Si repreguntan:** la unidad de paralelismo real es el **proceso**. Puma corre N
@@ -149,8 +152,8 @@ sino fragmentación del allocator de C. `MALLOC_ARENA_MAX=2` o jemalloc por
 El receptor implícito del mensaje actual. Cambia según el contexto: en el cuerpo de
 una clase es la clase; en un método de instancia, la instancia; dentro de
 `instance_exec`, el objeto que le pasás. Esto último es lo que hace que
-`by: -> { current_api_token&.id }` en `rate_limit` pueda ver métodos del controller
-(`app/controllers/api/v1/base_controller.rb:77`).
+`by: -> { current_api_token&.id || request.remote_ip }` en `rate_limit` pueda ver
+métodos del controller (`app/controllers/api/v1/base_controller.rb:77`).
 
 ### ¿Qué es un `ActiveSupport::Concern` y en qué se diferencia de un módulo pelado?
 
@@ -249,8 +252,9 @@ debería ser un objeto aparte.
 
 Una allow-list explícita sobre `params` para evitar **mass assignment**
 (`app/controllers/api/v1/products_controller.rb:78-83`). Sin eso, un atacante manda
-campos que nunca pensaste exponer. Rails lo aprendió por las malas: en 2012 alguien
-se dio permisos en el repo de Rails en GitHub explotando exactamente esto.
+campos que nunca pensaste exponer. Rails lo aprendió por las malas: en 2012 Egor
+Homakov explotó exactamente esto contra GitHub (que es una app Rails) y terminó
+commiteando en el repo `rails/rails`.
 
 **Si repreguntan:** `params.expect` en Rails 8 es la forma nueva y más estricta;
 `require` + `permit` sigue siendo perfectamente válido.
@@ -338,8 +342,10 @@ infiere.
 
 ### ¿Cómo detectás un N+1 antes de que llegue a producción?
 
-Con `bullet` activado **en test**, de modo que un N+1 **rompa la suite**
-(`spec/rails_helper.rb:62-70`, tag `:n_plus_one`). En desarrollo, el log de queries
+Con `bullet` activado **en test** y `Bullet.raise = true`
+(`spec/support/bullet.rb:14-24`), de modo que un N+1 **rompa la suite**; el tag
+`:n_plus_one` es el que abre y cierra el request de Bullet en cada ejemplo
+(`spec/rails_helper.rb:62-70`). En desarrollo, el log de queries
 o `rack-mini-profiler`. En producción, el APM.
 
 ### ¿Qué es un scope y cuándo pasar a un query object?
@@ -371,8 +377,8 @@ Ruby (`app/models/stock_movement.rb:76-84`) y como CHECK constraint
 
 ### ¿Cuáles son los CHECK constraints de `stock_items` y por qué existen?
 
-`quantity_on_hand >= 0`, `quantity_reserved >= 0`,
-`quantity_reserved <= quantity_on_hand` y
+Cinco (`db/schema.rb:213-217`): `quantity_on_hand >= 0`, `quantity_reserved >= 0`,
+`quantity_reserved <= quantity_on_hand`, `reorder_point >= 0` y
 `maximum_level IS NULL OR maximum_level >= reorder_point`. Son la última red:
 aunque alguien se saltee `Stock::ApplyMovement` con un script o un `psql`, la base
 rechaza el estado inválido.
@@ -452,10 +458,11 @@ mano, como hace `StockItem.atomically_decrement`
 
 ### ¿Cómo se ve el optimistic locking sobre HTTP?
 
-El cliente manda el `lock_version` que leyó; si otro lo modificó, Rails levanta
-`StaleObjectError` y devolvemos **409**
-(`app/controllers/api/v1/products_controller.rb:56`). Es el mismo mecanismo que
-`ETag` + `If-Match`, y evita el *last write wins* silencioso.
+El cliente manda el `lock_version` que leyó
+(`app/controllers/api/v1/products_controller.rb:56`); si otro lo modificó, Rails
+levanta `StaleObjectError` y el `rescue_from` del concern lo traduce a **409**
+(`app/controllers/concerns/api/error_handling.rb:27` y `:85-89`). Es el mismo
+mecanismo que `ETag` + `If-Match`, y evita el *last write wins* silencioso.
 
 ### ¿Qué diferencia hay entre `update_attribute`, `update_column` y `update!`?
 
@@ -525,7 +532,8 @@ Prefiero locks explícitos: más código, comportamiento predecible.
 **Si repreguntan:** dos cosas que conviene aclarar. Postgres **no tiene dirty
 reads** ni en READ COMMITTED (`READ UNCOMMITTED` se comporta igual), y su REPEATABLE
 READ es snapshot isolation, así que también elimina phantoms — no es el REPEATABLE
-READ de MySQL con gap locks. Lo que REPEATABLE READ no te da es **write skew**.
+READ de MySQL con gap locks. Lo que REPEATABLE READ **no** te evita es el **write
+skew**: para eso sí necesitás SERIALIZABLE o un lock explícito.
 
 ### ¿Qué es un deadlock y cómo lo prevenís?
 
@@ -567,11 +575,13 @@ que frenan el VACUUM y hacen crecer la tabla).
 ### ¿Cuándo particionarías una tabla?
 
 Cuando el volumen hace que el mantenimiento sea el problema, no la lectura: retención
-por fecha (borrar 190M de filas genera tuplas muertas que el autovacuum no da
-abasto a limpiar), o índices que ya no entran en memoria. Con particiones
-declarativas de Postgres 12+, `DROP PARTITION` es instantáneo y no genera bloat. Los
-candidatos naturales acá son `stock_movements` y `outbox_events` por `occurred_at` /
-`created_at`.
+por fecha (un `DELETE` de decenas de millones de filas deja tuplas muertas que el
+autovacuum no da abasto a limpiar), o índices que ya no entran en memoria. Con
+particiones declarativas (existen desde Postgres 10 y son usables de verdad desde la
+12), tirar un período viejo es `DETACH PARTITION` + `DROP TABLE`: instantáneo y sin
+bloat. Ojo con el detalle: Postgres **no** tiene la sentencia `DROP PARTITION` de
+Oracle/MySQL. Los candidatos naturales acá son `stock_movements` y `outbox_events`
+por `occurred_at` / `created_at`.
 
 **Si repreguntan:** mientras tanto, la respuesta barata es borrar seguido y en lotes
 chicos, que es lo que hace `Cleanup::ExpiredRecordsJob`
@@ -639,10 +649,14 @@ class << self
 end
 ```
 
-**Si repreguntan:** `Result` implementa `deconstruct_keys`, así que el controller
-usa pattern matching (`case/in`) y el runtime te avisa si no contemplaste un caso:
-`case/in` levanta `NoMatchingPatternError` en vez de devolver `nil` como
-`case/when`.
+**Si repreguntan:** `Result` implementa `deconstruct_keys` y `deconstruct`
+(`app/lib/result.rb:88-91`), así que se puede consumir con pattern matching
+(`case/in`, como en `spec/lib/result_spec.rb:97-110`) y el runtime te avisa si no
+contemplaste un caso: `case/in` levanta `NoMatchingPatternError` en vez de devolver
+`nil` como `case/when`. En los controllers de esta API el traductor está
+centralizado en un helper, `render_result`
+(`app/controllers/concerns/api/error_handling.rb:58-67`), que mapea el `code` del
+error al status HTTP.
 
 ### ¿Qué es CQRS y qué versión de CQRS tenés acá?
 
@@ -982,7 +996,8 @@ mensaje**. Por eso el store se elige explícitamente y se avisa
 
 ### Contame una trampa real de `rate_limit` de Rails 8.
 
-La clave del contador se arma así (actionpack 8.1, `rate_limiting.rb:72-77`):
+La clave del contador se arma así (actionpack 8.1.3.1,
+`lib/action_controller/metal/rate_limiting.rb:75-77`):
 
 ```ruby
 cache_key = ["rate-limit", scope, name, by].compact.join(":")
@@ -999,9 +1014,16 @@ distinto a cada límite.
 
 ### ¿Qué devolvés cuando bloqueás?
 
-429 con `Retry-After` y las cabeceras `RateLimit-*` (RFC 9331). Un 429 sin cabeceras
-es hostil: el cliente no sabe cuánto esperar y reintenta en loop, empeorando todo
-(`config/initializers/rack_attack.rb:230-254`).
+429 con `Retry-After` y las cabeceras `RateLimit-*`
+(`config/initializers/rack_attack.rb:230-254`). Un 429 sin cabeceras es hostil: el
+cliente no sabe cuánto esperar y reintenta en loop, empeorando todo.
+
+Y tené bien la letra chica: el 429 viene de **RFC 6585** y `Retry-After` de **RFC
+9110**, pero las cabeceras `RateLimit-Limit` / `RateLimit-Remaining` /
+`RateLimit-Reset` **todavía no son un RFC**: son el borrador de la IETF
+`draft-ietf-httpapi-ratelimit-headers`, convención de hecho muy implementada. (El
+comentario del initializer las atribuye a la RFC 9331, que en realidad es la de
+ECN/L4S: número equivocado.)
 
 **Si repreguntan:** antes de activar un límite nuevo en producción se lo deja en
 `track` (mide sin bloquear) un par de semanas, para ver cuántos clientes legítimos lo
@@ -1023,10 +1045,10 @@ mentiras. Arriba, pocos tests de sistema; abajo, unitarios puros para value obje
 **Si repreguntan:** los números de este repo:
 
 ```bash
-$ bundle exec rspec --dry-run
-325 examples, 0 failures
+$ bundle exec rspec
+338 examples, 0 failures        # 17 s de reloj
 $ cat coverage/.last_run.json
-{ "result": { "line": 79.07, "branch": 57.27 } }    # línea vs rama
+{ "result": { "line": 88.45, "branch": 63.25 } }    # línea vs rama
 ```
 
 ### Factories vs fixtures.
@@ -1055,8 +1077,9 @@ seguiría dando verde en falso.
 Cada ejemplo corre dentro de una transacción que se revierte al terminar: el rollback
 es O(1), muchísimo más rápido que truncar. **Fallan** cuando el código bajo test corre
 en otro hilo con otra conexión (tests de concurrencia, system tests con un server
-aparte): ese hilo no ve tus datos sin commitear. Por eso los specs de concurrencia lo
-desactivan explícitamente (`spec/rails_helper.rb:37-45`).
+aparte): ese hilo no ve tus datos sin commitear. Está activado globalmente en
+`spec/rails_helper.rb:45`, y los specs de concurrencia lo desactivan y limpian con
+`TRUNCATE` (`spec/support/concurrency.rb`).
 
 ### ¿Qué hace flakey a un test y cómo lo arreglás?
 
@@ -1071,12 +1094,13 @@ tests de browser (esperá por condición, no por tiempo).
 No. La cobertura te dice qué **no** probaste; no te dice si lo que probaste está
 bien. Un 100% de líneas con asserts triviales es peor que un 75% con tests que
 ejercitan las invariantes. Mirá la cobertura de **rama**, que es la que se olvida:
-acá es 57.27% contra 79.07% de línea, y esa brecha son los `if` sin el camino
+acá es 63.25% contra 88.45% de línea, y esa brecha son los `if` sin el camino
 alternativo probado.
 
 ### ¿Cómo probás que no hay N+1?
 
-Con Bullet activado en test y un tag que hace fallar el ejemplo
+Con Bullet en test y `Bullet.raise = true` (`spec/support/bullet.rb:20`), más el tag
+`:n_plus_one` que abre y cierra el request de Bullet alrededor del ejemplo
 (`spec/rails_helper.rb:62-70`). Es la única forma de que un N+1 no se cuele: que el
 CI falle.
 
@@ -1231,13 +1255,17 @@ el cursor apunta a una fila concreta insertar no desplaza nada
 
 ```sql
 SELECT * FROM stock_movements
-WHERE (occurred_at, id) < ($1, $2)          -- comparación de TUPLAS, SQL estándar
+WHERE stock_item_id = $1                     -- prefijo del índice, no lo saltees
+  AND (occurred_at, id) < ($2, $3)           -- comparación de TUPLAS, SQL estándar
 ORDER BY occurred_at DESC, id DESC
 LIMIT 20;                                    -- usa index_stock_movements_ledger
 ```
 
-Contra: no podés saltar a la página 37 —
-irrelevante en un ledger.
+Ojo con el prefijo: el índice es
+`(stock_item_id, occurred_at DESC, id DESC)`, así que sirve para el keyset **sólo si
+la query también filtra por `stock_item_id`**. Sin ese filtro, Postgres no lo puede
+usar para el rango y termina ordenando. Contra del keyset: no podés saltar a la
+página 37 — irrelevante en un ledger.
 
 **Si repreguntan:** el cursor se devuelve en Base64 de un JSON para que sea **opaco**:
 si el cliente no puede adivinar qué hay adentro, no se rompe cuando cambiás el
@@ -1250,10 +1278,13 @@ Dos causas distintas. Si `GC.stat[:heap_live_slots]` crece, es un leak de objeto
 **fragmentación del allocator de C**: glibc crea una arena por thread y la memoria
 liberada queda en huecos que no vuelven al SO. `MALLOC_ARENA_MAX=2` o jemalloc.
 
-**Si repreguntan:** el piso medido para este repo es ~95 MB de RSS por worker de Puma
-antes de servir una request. Con 4 workers, 380 MB. En Java pagás ese costo una vez
-para todos los threads; en Ruby lo pagás N veces, salvo por copy-on-write con
-`preload_app!`.
+**Si repreguntan:** el piso medido en `docs/13` es **94 MB de RSS** por proceso Ruby
+recién booteado, antes de servir una request. Pero cuidado con multiplicarlo por la
+cantidad de workers: con `preload_app!` el master forkea y buena parte de esas
+páginas quedan **compartidas** por copy-on-write, y `RSS` las cuenta enteras en cada
+proceso. Para saber cuánta memoria consume de verdad la flota hay que mirar **PSS**,
+no RSS. En Java pagás el costo del heap una vez para todos los threads; en Ruby lo
+pagás por proceso, menos lo que el copy-on-write te devuelva.
 
 ---
 
@@ -1424,7 +1455,7 @@ Cada uno con el **síntoma** (lo que reporta el usuario o el monitoreo) y el
 > incrementar `lock_version` a mano si escribís SQL crudo.
 >
 > Lo segundo fue la concurrencia: en la JVM subís threads y ganás CPU; con el GVL de
-> CRuby, no. Medido acá: 4 threads en trabajo CPU-bound dan 1.53 s contra 1.51 s
+> CRuby, no. Medido acá: 4 threads en trabajo CPU-bound dan 2.41 s contra 2.37 s
 > secuencial. La unidad de paralelismo es el proceso, y eso tiene un efecto dominó —
 > el pool de conexiones es por proceso, una caché en memoria son N copias, y un rate
 > limiter con `MemoryStore` multiplica tu límite por la cantidad de workers.
@@ -1483,7 +1514,7 @@ Cada uno con el **síntoma** (lo que reporta el usuario o el monitoreo) y el
 - Colas, outbox y reintentos: `docs/07-colas-jobs-y-mensajeria.md`
 - Rate limiting en detalle: `docs/08-rate-limiting.md`
 - Testing: `docs/09-testing.md`
-- Los 16 errores con su reproducción: `docs/10-errores-comunes.md`
+- Los 28 errores con su reproducción: `docs/10-errores-comunes.md`
 - API, serialización e idempotencia: `docs/11-api-rest-serializacion-e-idempotencia.md`
 - Seguridad: `docs/12-seguridad.md`
 - Observabilidad y performance: `docs/13-observabilidad-y-performance.md`

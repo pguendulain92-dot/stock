@@ -26,7 +26,7 @@ de escribir esta página; donde hay salida de consola, es salida real.
 | 2 | [`default_scope`](#2-default_scope-casi-nunca) | Datos "desaparecidos" |
 | 3 | [Índices que no se usan](#3-índices-que-no-se-usan) | Seq Scan silencioso |
 | 4 | [`validates_uniqueness_of` sin índice único](#4-uniqueness-validates_uniqueness_of-sin-índice-único) | Duplicados |
-| 5 | [`find_or_create_by` bajo concurrencia](#5-find_or_create_by-find_or_create_by-bajo-concurrencia) | 500 intermitente |
+| 5 | [`find_or_create_by` bajo concurrencia](#5-find_or_create_by-find_or_create_by-bajo-concurrencia) | Objeto sin persistir, en silencio |
 | 6 | [El query cache y el `INSERT ... RETURNING`](#6-query-cache-el-query-cache-cacheando-un-insert--returning-bug-real) | **Corrupción de datos** |
 | 7 | [Transacciones: `return`, `Rollback` anidado](#7-transacciones-return-dentro-de-transaction-y-rollback-anidado) | Commits parciales |
 | 8 | [Callbacks: `after_save` vs `after_commit`](#8-callbacks-after_save-vs-after_commit) | Efectos fantasma |
@@ -59,8 +59,8 @@ Todo el mundo conoce la primera. Las otras tres son las que efectivamente
 llegan a producción, porque `includes` **no** las arregla.
 
 Los números de abajo salieron de correr esto contra la base de desarrollo real
-(15 productos, 4 depósitos, 48 `stock_items`, 105 movimientos), contando las
-queries con `ActiveSupport::Notifications.subscribe("sql.active_record")`.
+(15 productos, 4 depósitos, 48 `stock_items`, algo más de 100 movimientos),
+contando las queries con `ActiveSupport::Notifications.subscribe("sql.active_record")`.
 
 ### Variante A — N+1 de asociación (el clásico)
 
@@ -252,7 +252,8 @@ Esta es la parte que importa, porque sacarlo de un golpe rompe todo.
 4. Agregá el test que garantice que no vuelve.
 
 **Cómo detectarlo antes**: `grep -rn "default_scope" app/` en el CI. En este
-repo la única aparición es el comentario que explica por qué no lo usamos.
+repo las únicas apariciones son el comentario de `Discardable` que explica por
+qué no lo usamos y el test que fija la decisión: cero usos reales.
 
 ---
 
@@ -443,20 +444,63 @@ pena automatizarla.
 
 ## 5. `#find_or_create_by`: `find_or_create_by` bajo concurrencia
 
-**Síntoma**: `ActiveRecord::RecordNotUnique` intermitente en un endpoint que
-"crea si no existe". Aparece sólo con tráfico, nunca en test.
+**Síntoma**: un endpoint que "crea si no existe" devuelve cada tanto —y sólo con
+tráfico— un objeto **sin persistir**, sin excepción y sin nada en el log. O, si
+escribiste el `find_by || create!` a mano, un `ActiveRecord::RecordNotUnique`
+intermitente.
 
-`find_or_create_by` es literalmente `find_by(...) || create!(...)`: dos
-sentencias, la misma ventana del punto anterior.
+Acá hay que ser preciso con la versión, porque el consejo de la mayoría de los
+blogs quedó viejo. **En Rails 8 `find_or_create_by` ya no es
+`find_by(...) || create(...)`**. El código real
+(`activerecord-8.1.3.1/lib/active_record/relation.rb:231`) es:
 
-Lo reproduje con dos hilos:
-
-```text
-find_or_create_by ingenuo bajo concurrencia: ["creado id=49", "ActiveRecord::RecordNotUnique"]
+```ruby
+def find_or_create_by(attributes, &block)
+  find_by(attributes) || create_or_find_by(attributes, &block)
+end
 ```
 
-El arreglo es **no intentar evitar la carrera, sino perderla con elegancia**:
-confiar en el índice único y rescatar. Está en `app/models/stock_item.rb:121`:
+...y `create_or_find_by` envuelve el `create` en un **savepoint** y rescata el
+choque contra el índice:
+
+```ruby
+transaction(requires_new: true) { record = create(attributes, &block) ... }
+rescue ActiveRecord::RecordNotUnique
+  find_by!(attributes)
+```
+
+O sea que el patrón "confiar en el índice y perder la carrera con elegancia" ya
+viene de fábrica. Lo comprobé con dos hilos contra una tabla con índice único y
+sin validaciones:
+
+```text
+find_or_create_by (Rails 8.1):     ["ok id=1", "ok id=1"]                     filas: 1
+create! pelado, sin rescue:        ["OK", "ActiveRecord::RecordNotUnique"]    filas: 1
+```
+
+### Lo que sigue rompiendo: la validación se adelanta al índice
+
+La combinación que tienen casi todos los modelos reales es `find_or_create_by`
+**más** una validación `uniqueness`. Ahí la validación corre **antes** que el
+`INSERT`: si perdiste la carrera, `create` falla por validación, nunca se emite
+el `INSERT`, nunca hay `RecordNotUnique` y el `rescue` de `create_or_find_by`
+**no llega a dispararse**. Forzando la carrera de forma determinística:
+
+```text
+find_or_create_by pierde la carrera CON validación de uniqueness:
+  persisted? = false   errores = ["K has already been taken"]
+```
+
+Y como `find_or_create_by` no es bang, ese objeto vacío te lo llevás sin
+enterarte. Es exactamente lo que advierte la documentación de
+`create_or_find_by`: *"las columnas con constraints únicos en la base no
+deberían tener validaciones de unicidad; si no, `create` falla por validación y
+`find_by` nunca se llama"*.
+
+### El arreglo
+
+Escribir el paso explícito, con `create!`, en vez de confiar en el método mágico
+(`app/models/stock_item.rb:121`):
 
 ```ruby
 def self.find_or_provision!(product:, warehouse:)
@@ -467,27 +511,37 @@ rescue ActiveRecord::RecordNotUnique
 end
 ```
 
-Mismos dos hilos, con este método:
+Verificado con dos hilos: los dos devuelven **el mismo registro** y queda **una
+sola fila**.
 
 ```text
-find_or_provision! (con rescue RecordNotUnique): ["ok id=51", "ok id=51"]
-filas: 1
+find_by || create! + rescue RecordNotUnique: ["ok id=4", "ok id=4"]   filas: 1
 ```
 
-Los dos hilos devuelven **el mismo registro** y hay **una sola fila**.
+El `!` es la diferencia que importa: si la validación falla, explota en vez de
+devolver un objeto mudo. Ojo igual con la ventana angosta que le queda a este
+método: `StockItem` **también** tiene `validates :product_id, uniqueness: { scope:
+:warehouse_id }`, así que si el ganador commitea justo antes de la validación del
+perdedor, lo que sale es un `RecordInvalid` y no el `RecordNotUnique` que
+rescatamos. Rescatar los dos —o sacar la validación y quedarse con el índice— es
+lo que cierra el caso del todo.
 
 ### Las tres trampas de este patrón
 
 1. **Sin índice único, el `rescue` nunca dispara** y te quedan dos filas. El
    rescue no *crea* la garantía, la *aprovecha*.
-2. **Adentro de una transacción, el `rescue` no alcanza.** Cuando Postgres
-   aborta una sentencia, la transacción entera queda en estado `failed`: toda
-   query siguiente devuelve `current transaction is aborted, commands ignored
-   until end of transaction block`. Si necesitás seguir operando, envolvé el
-   intento en un savepoint: `transaction(requires_new: true) { create! }`.
-3. **`find_or_create_by` con un bloque no valida.** `find_or_create_by(sku: x) { |p| p.name = y }`
-   usa `create`, no `create!`: si falla la validación devuelve un objeto no
-   persistido en silencio. Usá `find_or_create_by!`.
+2. **Adentro de una transacción, el `rescue` a secas no alcanza.** Cuando
+   Postgres aborta una sentencia, la transacción entera queda en estado
+   `failed`: toda query siguiente devuelve `current transaction is aborted,
+   commands ignored until end of transaction block`. Si necesitás seguir
+   operando, envolvé el intento en un savepoint:
+   `transaction(requires_new: true) { create! }` — que es, literalmente, lo que
+   hace `create_or_find_by` por dentro.
+3. **`find_or_create_by` no es bang.** Usa `create`, no `create!` (el bloque
+   opcional no cambia nada: se le pasa igual a los dos). Si la validación falla
+   —incluida la de unicidad del párrafo anterior— devuelve un objeto **no
+   persistido** en silencio. Usá `find_or_create_by!`, que levanta
+   `RecordInvalid`.
 
 **La alternativa nativa de Postgres**, cuando de verdad querés una sola
 sentencia, es `upsert` (`INSERT ... ON CONFLICT`). Este repo la usa para los
@@ -636,14 +690,17 @@ una excepción propia en vez de un `return`.
 
 ### 7.a — `return` dentro del bloque hace **COMMIT**
 
-Hasta Rails 6.1, un `return`/`break`/`throw` dentro de un bloque `transaction`
-hacía **rollback**. Desde Rails 7 hace **commit** y sólo emite un warning en el
-caso de `break`/`throw`. El cambio rompió muchísimo código en silencio.
+Hasta Rails 6.0, un `return`/`break`/`throw` dentro de un bloque `transaction`
+hacía **rollback**; Rails 6.1 lo deprecó y desde Rails 7 hace **commit**. El
+cambio rompió muchísimo código en silencio, y sigue siendo silencioso: en Rails
+8.1 **ninguna** de las tres formas emite warning alguno.
 
-Lo verifiqué en este repo (Rails 8.1.3.1):
+Lo verifiqué en este repo (Rails 8.1.3.1), con las tres:
 
 ```text
-despues de return dentro de transaction, la fila SIGUE (COMMIT)
+return dentro de transaction -> la fila SIGUE (COMMIT)
+break  dentro de transaction -> la fila SIGUE (COMMIT), sin warning
+throw  dentro de transaction -> la fila SIGUE (COMMIT), sin warning
 ```
 
 ```ruby
@@ -803,12 +860,35 @@ commiteó.
 - **`after_commit` no corre en `update_all` / `delete_all` / `update_column`**:
   esos métodos van directo al SQL, sin instanciar modelos. Si tu lógica depende
   de un callback, un `update_all` la saltea entera.
-- **Una excepción en `after_commit` no revierte nada** (ya commiteó) y, según la
-  configuración, puede quedar tragada. Envolvela y logueala vos.
-- **`after_commit` en tests con transacciones**: si RSpec envuelve cada ejemplo
-  en una transacción que hace rollback (`use_transactional_fixtures`), el commit
-  nunca ocurre y el callback nunca corre. Es la causa clásica de "el test pasa
-  pero en producción no manda el mail" — o al revés.
+- **Una excepción en `after_commit` no revierte nada**, y desde Rails 5 tampoco
+  queda tragada: **se propaga** hasta quien llamó a `save`/`create!`. O sea que
+  tu caller recibe una excepción por una operación que **sí se completó**.
+  Verificado:
+
+  ```text
+  create! propagó: RuntimeError: BOOM en after_commit
+  fila commiteada? true
+  ```
+
+  Si el efecto externo puede fallar —y siempre puede—, envolvelo vos en un
+  `rescue` y logueá, o mandalo a un job con reintentos. Dejar que reviente
+  convierte un "el webhook falló" en un "la operación falló", que es mentira.
+- **`after_commit` en tests con transacciones**: acá hay un mito viejo que hay
+  que enterrar. Con `use_transactional_fixtures = true` (el default, y lo que usa
+  este repo, `spec/rails_helper.rb:45`) el commit real **nunca ocurre**, pero el
+  callback **sí corre**: desde Rails 5 la transacción que envuelve cada ejemplo
+  se marca como no-joinable, así que la transacción de tu código es la "más
+  externa" a efectos de callbacks. Verificado en esta suite:
+
+  ```text
+  after_save=true after_commit=true
+  ```
+
+  Lo que sí se rompe es todo lo que necesite que el dato **esté** commiteado:
+  otra conexión, un worker de verdad, un browser en un test de sistema, un
+  servicio externo que lee la base. Eso no ve nada, porque la fila sólo existe
+  dentro de tu transacción. Era cierto que "el callback no corre" antes de Rails
+  5 —de ahí la gema `test_after_commit`—, y esa creencia sobrevivió al arreglo.
 
 **Comparación con Java**: `after_commit` es
 `TransactionSynchronization#afterCommit` / `@TransactionalEventListener(phase = AFTER_COMMIT)`.
@@ -938,11 +1018,33 @@ def boolean_param(name)
 end
 ```
 
-`ActiveModel::Type::Boolean` trata como **falso** exactamente esta lista:
-`false`, `0`, `"0"`, `"f"`, `"F"`, `"false"`, `"FALSE"`, `"off"`, `"OFF"`, `""`,
-y `nil`. Todo lo demás es verdadero. Es el mismo casteo que aplica ActiveRecord
-al asignar a una columna boolean, así que usarlo te garantiza consistencia entre
-el filtro y la persistencia.
+La lista exacta es `ActiveModel::Type::Boolean::FALSE_VALUES`, y conviene mirarla
+de verdad porque tiene dos sorpresas:
+
+```ruby
+ActiveModel::Type::Boolean::FALSE_VALUES.to_a
+# => [false, 0, "0", :"0", "f", :f, "F", :F, "false", :false,
+#     "FALSE", :FALSE, "off", :off, "OFF", :OFF]
+```
+
+1. **Están los símbolos además de los strings** (`:false`, `:off`, ...), porque
+   el mismo tipo castea lo que viene de un `Hash` de Ruby y no sólo de un form.
+2. **`""` y `nil` NO están en la lista**: no castean a `false`, castean a `nil`.
+
+```ruby
+b = ActiveModel::Type::Boolean.new
+b.cast("false")  # => false
+b.cast("")       # => nil     <- NO es false
+b.cast(nil)      # => nil
+b.cast("no")     # => true    <- ¡"no" es verdadero!
+```
+
+Ese `"no" => true` es la trampa que queda: todo lo que no esté en `FALSE_VALUES`
+es verdadero, y `"no"`, `"nope"` y `"nein"` no están. Si tu API tiene que aceptar
+`"no"`, mapealo vos antes de castear.
+
+Es el mismo casteo que aplica ActiveRecord al asignar a una columna boolean, así
+que usarlo te garantiza consistencia entre el filtro y la persistencia.
 
 Ojo con el `return nil if blank?`: hay tres estados, no dos —`true`, `false` y
 "no filtrar"—. Si colapsás `nil` y `false`, `?active=false` y no mandar nada dan
@@ -1007,7 +1109,21 @@ Notá el `rescue ArgumentError, TypeError`: `Integer(nil)` levanta `TypeError`, 
 | `.to_f` | `0.0` en silencio | nunca sobre dinero (ver §13) |
 | `Float(s)` | `ArgumentError` | medidas, nunca dinero |
 | `BigDecimal(s)` | `ArgumentError` | dinero, si no usás centavos |
-| `ActiveModel::Type::Integer.new.cast(s)` | `nil` | cuando querés "inválido = ausente" |
+| `ActiveModel::Type::Integer.new.cast(s)` | `0` (¡no `nil`!) | sólo para castear lo que ya validaste |
+
+**Cuidado con la última fila**, que es la que más se malinterpreta: el tipo de
+ActiveModel **no valida nada**, es `to_i` con un `presence` adelante. Verificado:
+
+```ruby
+t = ActiveModel::Type::Integer.new
+t.cast("abc")          # => 0     ❌ igual de silencioso que to_i
+t.cast("10 unidades")  # => 10    ❌ igual de peligroso que to_i
+t.cast("")             # => nil
+t.cast(nil)            # => nil
+```
+
+Sólo devuelve `nil` para lo que está en blanco o no sabe convertirse. Para input
+externo va `Integer(s, 10)` y un `rescue`, punto.
 
 **Comparación con Java**: `Integer.parseInt` siempre fue `Integer()`, no `to_i`.
 El instinto de un javero es correcto acá; el problema es que `to_i` es lo que
@@ -1028,10 +1144,11 @@ distintos.
 Lo que rompe en la práctica:
 
 ```ruby
-# ❌ un valor legítimo de 0 se trata como "no vino"
-cantidad = params[:quantity] || 10        # si params[:quantity] es 0, queda 0 (ok)
-cantidad = params[:quantity].presence     # si es "0", queda "0" (ok)
-cantidad = 0 || 10                        # => 0 (¡ojo si esperabas el default!)
+# El default con `||` sólo tapa nil/false, NUNCA el 0 ni el "".
+# Viniendo de otros lenguajes esto se espera al revés en las dos direcciones:
+cantidad = 0 || 10          # => 0    (en JS/Python el 0 caía al default)
+cantidad = "" || 10         # => ""   (idem)
+cantidad = nil || 10        # => 10
 
 # ❌ Confundir "atributo ausente" con "atributo false"
 if producto.active   # false y nil dan lo mismo -> perdés información
@@ -1115,8 +1232,11 @@ t.string :currency, null: false, default: "USD"
 - **prohíbe sumar monedas distintas** (`CurrencyMismatch`, no un número mal);
 - **prohíbe multiplicar dinero por dinero** (daría "dólares al cuadrado");
 - conoce las monedas sin centavos (`CLP`, `JPY` tienen subunidad 1, no 100);
-- construye desde `String`/`BigDecimal`, **nunca desde Float**, en
-  `Money.from_amount`, para no heredar el error de redondeo desde el input.
+- construye pensado para `String`/`BigDecimal` y **no para Float**:
+  `Money.from_amount` hace `BigDecimal(amount.to_s)`, así el input decimal nunca
+  pasa por un `Float` intermedio. Es una convención documentada en el código, no
+  una restricción que levante excepción: si le mandás un Float igual entra, por
+  su `to_s`. Si querés la garantía dura, validá el tipo en el borde.
 
 La macro `has_money` (`app/models/concerns/has_money.rb:26`) expone la columna
 `*_cents` como Value Object sin que cada modelo repita nada.
@@ -1173,10 +1293,14 @@ end
 2. **`permit!`** (con bang) permite todo. No existe un caso legítimo en un
    controller que reciba input de un usuario.
 
-3. **`to_unsafe_h`** salta la protección entera. En este repo aparece dos veces
-   y las dos con transformación inmediata y validación explícita — por ejemplo
-   `app/controllers/api/v1/stock_transfers_controller.rb:66`, que resuelve cada
-   SKU contra la base y levanta `RecordNotFound` si no existe:
+3. **`to_unsafe_h`** salta la protección entera. En este repo aparece tres veces
+   (`app/controllers/api/v1/stock_transfers_controller.rb:66`,
+   `app/controllers/api/v1/purchase_orders_controller.rb:99` y
+   `app/controllers/stock_transfers_controller.rb:70`) y las tres sobre un hash
+   de pares "clave → cantidad" cuyas claves son datos, no atributos: por eso la
+   allow-list no aplica y hace falta transformación inmediata más validación
+   explícita. La de la API resuelve cada SKU contra la base y levanta
+   `RecordNotFound` si no existe:
 
    ```ruby
    raw.to_unsafe_h.each_with_object({}) do |(sku, qty), acc|
@@ -1296,8 +1420,11 @@ def held?      = status_held?
 def committed? = status_committed?
 ```
 
-Otros nombres que colisionan: `new`, `save`, `destroy`, `valid`, `changed`,
-`errors`, `persisted`, `frozen`.
+Otros nombres que colisionan, comprobados uno por uno contra el chequeo de
+Rails: `new`, `save`, `destroy`, `valid`, `changed`, `persisted`, `frozen`.
+(`errors` **no** colisiona, porque lo que genera el enum es `errors?`/`errors!`,
+que no existen; el criterio de Rails es el método generado, no el nombre del
+valor.)
 
 **Comparación con Java**: es *exactamente* el problema de
 `@Enumerated(EnumType.ORDINAL)` versus `EnumType.STRING` en JPA. Si venís de
@@ -1332,10 +1459,14 @@ para saber si salió bien, te miente.
 | `update_column` | ❌ | ❌ | ❌ | ❌ | `true`/`false` |
 | `update_columns` | ❌ | ❌ | ❌ | ❌ | `true`/`false` |
 | `update_all` (relación) | ❌ | ❌ | ❌ (salvo que lo pongas) | ❌ | nº de filas |
-| `touch` | ❌ | ✅ (`after_touch`) | ✅ | ❌ | `true` |
+| `touch` | ❌ | ✅ (`after_touch`, `after_commit`) | ✅ | ✅ | `true` |
 
-`update_attribute` es el peor de los tres: saltea validaciones **pero corre
-callbacks**, o sea que te deja el objeto en un estado inválido y encima dispara
+Dos filas de esa tabla suelen sorprender. `touch` **sí** incrementa la columna de
+optimistic locking: `ActiveRecord::Locking::Optimistic#_touch_row` le agrega
+`locking_column` a los atributos que escribe, así que un `touch` invalida la
+versión que tenga otro proceso en memoria. Y `update_attribute`, que parece el
+hermano menor de `update`, es en realidad el peor de los tres: saltea
+validaciones **pero corre callbacks**, o sea que te deja el objeto en un estado inválido y encima dispara
 efectos. Prácticamente nunca es lo que querés. Si querés saltear validaciones a
 propósito, `save(validate: false)` al menos lo dice en voz alta.
 
@@ -1519,8 +1650,10 @@ purchase orders: `post :receive, action: :receive_order` (`config/routes.rb:87`)
 
 ## 19. `after_action ... only:` apuntando a una acción inexistente **[BUG REAL]**
 
-**Síntoma**: al actualizar de Rails 7.0 a 7.1+, controllers enteros que andaban
-empiezan a tirar 500 en **todas** sus acciones.
+**Síntoma**: al actualizar a Rails 7.1+, controllers enteros que andaban empiezan
+a tirar 500 en **todas** sus acciones — **en desarrollo y en test**. En
+producción el mismo código no falla: hace algo peor, que es no correr el callback
+y no decir nada.
 
 Reproducido en Rails 8.1.3.1:
 
@@ -1538,7 +1671,7 @@ show EXPLOTA: AbstractController::ActionNotFound:
   but it is listed in the controller's :only option.
 ```
 
-Sin el `only:`, el mismo controller funciona (`sin only: ok`).
+Sin el `only:`, el mismo controller funciona.
 
 **Por qué es un cambio de comportamiento**: hasta Rails 7.0 el `only:` con una
 acción inexistente se ignoraba en silencio. Desde 7.1 levanta
@@ -1547,6 +1680,35 @@ El razonamiento de Rails es correcto —un `only:` que apunta a nada es casi
 siempre un typo o un callback que quedó huérfano después de renombrar—, pero la
 migración duele porque el error aparece en runtime.
 
+### El detalle que casi nadie conoce: está detrás de un flag, y el flag no es global
+
+La excepción sólo se levanta si
+`config.action_controller.raise_on_missing_callback_actions` está en `true`. El
+default del framework —`mattr_accessor ..., default: false` en
+`abstract_controller/callbacks.rb`— es **`false`**; lo que lo prende es el
+generador de aplicaciones de Rails 7.1+, que escribe la línea **sólo en
+`config/environments/development.rb` y `config/environments/test.rb`**. Este repo
+la tiene en los dos (`config/environments/development.rb:79`,
+`config/environments/test.rb:64`) y en ningún lado más.
+
+Comprobado con el mismo controller de arriba:
+
+```text
+raise_on_missing_callback_actions = true   -> AbstractController::ActionNotFound
+raise_on_missing_callback_actions = false  -> HTTP 200  (el callback NO corre)
+```
+
+Las consecuencias, que son distintas de lo que sugiere el mensaje de error:
+
+- **En dev y test explota todo**, que es lo que querés: el typo se paga caro y
+  temprano, y la suite entera se pone roja de golpe.
+- **En producción no explota**: el callback simplemente **no se ejecuta**. Si el
+  callback era `verify_authorized`, tu red de seguridad de autorización dejó de
+  existir en producción y nadie se enteró. El daño no es el 500, es el silencio.
+
+Por eso la respuesta correcta nunca es bajar el flag para "arreglar" el error: es
+arreglar el `only:`.
+
 ### Dónde nos mordió acá
 
 `Api::V1::BaseController` (`app/controllers/api/v1/base_controller.rb:107`) es la
@@ -1554,14 +1716,16 @@ clase base de **toda** la API. La forma "natural" de verificar el uso de Pundit
 sería:
 
 ```ruby
-# ❌ rompe TODAS las acciones de los controllers que no tienen `index`
+# ❌ en dev/test rompe TODAS las acciones de los controllers que no tienen
+#    `index`; en producción, calladito, no verifica nada
 after_action :verify_authorized, except: %i[index]
 after_action :verify_policy_scoped, only: %i[index]
 ```
 
 `StockOperationsController` (acciones `receive`, `issue`, `adjust`) y
 `ReportsController` (`low_stock`, `valuation`, `reconciliation`) **no tienen
-`index`**. Un `only: %i[index]` en la base rompe los dos por completo.
+`index`**. Un `only: %i[index]` en la base los toca a los dos: la suite se cae
+entera y en producción el `verify_policy_scoped` nunca corre.
 
 La solución robusta es **un solo callback que decide adentro**
 (`app/controllers/api/v1/base_controller.rb:117`):
@@ -1631,10 +1795,11 @@ Ahí está el bug de "un día de corrimiento", en dos líneas.
 | `1.day.ago`, `30.minutes.from_now` | `Time.now - 86400` | los helpers ya devuelven `TimeWithZone` y respetan DST |
 | `Time.zone.at(epoch)` | `Time.at(epoch)` | ídem |
 
-En este repo hay **una sola** forma en uso: `Time.current`, en los 30 lugares que
-tocan tiempo (`app/models/stock_item.rb:76`, `app/models/api_token.rb:31`,
-`app/models/session.rb:10`, `app/jobs/cleanup/expired_records_job.rb:30`, etc.).
-No hay un solo `Time.now` en `app/`.
+En este repo hay **una sola** forma en uso: `Time.current`, en los casi treinta
+lugares que tocan tiempo (`app/models/stock_item.rb:76`,
+`app/models/api_token.rb:31`, `app/models/session.rb:10`,
+`app/jobs/cleanup/expired_records_job.rb:30`, etc.). `grep -rn "Time.now\|Date.today" app/`
+no devuelve nada: es una regla que se puede verificar en el CI en una línea.
 
 **Comparación con Java**: `Time.now` es `LocalDateTime.now()` con la zona por
 default de la JVM —el clásico problema que resolvés con
@@ -1707,19 +1872,23 @@ tipo, el `@attributes` con valores casteados y sin castear, y la referencia a la
 clase. Lo medí sobre un `StockMovement` real de esta base:
 
 ```text
-un StockMovement completo (deep): ~7632 bytes
+un StockMovement completo (deep): ~7,6 KB
 una fila de pluck(3 columnas)   : ~560 bytes
-ratio: 13.6x
+ratio: ~13,6x
 
 extrapolado a 500.000 filas:
-  modelos AR: ~3639 MB
+  modelos AR: ~3,6 GB
   pluck     : ~267 MB
 ```
 
-3,6 GB en un worker que probablemente tiene 512 MB de límite. Y el problema
-adicional: **CRuby casi nunca le devuelve la memoria al sistema operativo**. Una
-sola request que cargó 500.000 filas deja el RSS del worker alto **para siempre**,
-aunque los objetos ya se hayan liberado (fragmentación del heap de malloc).
+La medición es un recorrido con `ObjectSpace.memsize_of` sobre el objeto y sus
+referencias, así que el número exacto se mueve unas decenas de bytes entre
+corridas; el ratio es lo estable. La cifra de 500.000 filas es una
+**extrapolación lineal**, y en la realidad da peor por dos motivos: 3,6 GB en un
+worker que probablemente tiene 512 MB de límite, y **CRuby casi nunca le devuelve
+la memoria al sistema operativo**. Una sola request que cargó 500.000 filas deja
+el RSS del worker alto **para siempre**, aunque los objetos ya se hayan liberado
+(fragmentación del heap de malloc).
 
 ### Los cuatro arreglos, en orden de preferencia
 
@@ -1893,7 +2062,9 @@ Son coincidencias **parciales**: `passw` matchea `password` y `password_confirma
 3. **No filtra lo que loguea tu código.** `Rails.logger.info(params.inspect)`
    escupe todo.
 
-Y en producción, `config.log_level = "info"` (`config/environments/production.rb:41`).
+Y en producción, `config.log_level = ENV.fetch("RAILS_LOG_LEVEL", "info")`
+(`config/environments/production.rb:41`): `info` por default, y `debug`
+disponible por variable de entorno para cuando de verdad haga falta.
 El comentario del propio Rails es explícito: *"Change to debug to log everything
 (including potentially personally-identifiable information!)"*. `debug` loguea
 los binds de cada query.
@@ -2122,7 +2293,7 @@ Verificado en esta app:
 "html_parser".camelize # => "HtmlParser"
 ```
 
-Las convergencias que hay que tener claras:
+Las correspondencias que hay que tener claras:
 
 | Ruta | Constante esperada |
 |------|--------------------|
@@ -2380,7 +2551,34 @@ configurar `config.action_dispatch.trusted_proxies`. Es un header que manda el
 **cliente** y lo puede falsificar para evadir el rate limit; `RemoteIp` sólo lo
 respeta viniendo de un proxy conocido.
 
-Podés ver el stack completo con `bin/rails middleware`.
+### El detalle que confunde al mirar `bin/rails middleware`
+
+Si corrés `bin/rails middleware` en este repo vas a ver **dos** `Rack::Attack`:
+
+```text
+11. use ActionDispatch::RemoteIp
+12. use Rack::Attack          <- la que insertamos nosotros
+...
+30. use Rack::Attack          <- la que agrega el railtie de la gema
+```
+
+No es un error de configuración nuestro y no hace falta arreglarlo: la gema trae
+un railtie que hace `app.middleware.use(Rack::Attack)` al final del stack, y
+`insert_after` **agrega** una segunda instancia en vez de mover la primera.
+
+Lo importante es que **no cuenta doble**, que es lo que uno teme después de leer
+el punto (a). `Rack::Attack#call` arranca con una guarda de reentrada:
+
+```ruby
+return @app.call(env) if !self.class.enabled || env["rack.attack.called"]
+```
+
+La instancia de arriba corre, marca el env y llama al resto; la de abajo se
+saltea sola. Comprobado contra el servidor real con el throttle de login
+(`limit: 5`): el 429 aparece en la request **6**, no en la 3.
+
+Si te molesta el ruido, la forma prolija de tener una sola es
+`config.middleware.delete Rack::Attack` antes del `insert_after`.
 
 ---
 
@@ -2396,7 +2594,7 @@ La versión corta, para tener a mano. Síntoma → causa → arreglo.
 | 4 | `Product.count` no coincide con `psql` | `default_scope` | scopes explícitos; salir con `unscope(where: :col)` (§2) |
 | 5 | Índice creado, `EXPLAIN` dice Seq Scan | función sobre la columna, o tabla chica | índice funcional / `citext` / normalizar (§3) |
 | 6 | Dos filas con el mismo SKU | `uniqueness` sin índice único | `add_index unique: true` + `rescue RecordNotUnique` (§4) |
-| 7 | `RecordNotUnique` intermitente al crear | `find_or_create_by` | rescatar y releer (§5) |
+| 7 | `find_or_create_by` devuelve un objeto sin persistir | la validación `uniqueness` se adelanta al índice | `find_or_create_by!`, o `create!` + `rescue` explícito (§5) |
 | 8 | Dos comprobantes con el mismo número | query cache sobre `INSERT ... RETURNING` | `uncached` + `clear_query_cache` (§6) |
 | 9 | Se commiteó algo que "cancelaste" | `return` dentro de `transaction` (Rails 7+) | excepción propia + `rescue` (§7a) |
 | 10 | El rollback anidado no revirtió nada | `ActiveRecord::Rollback` sin `requires_new` | `requires_new: true` o excepción propia (§7b) |
@@ -2411,7 +2609,7 @@ La versión corta, para tener a mano. Síntoma → causa → arreglo.
 | 19 | Filas que no pasan sus validaciones | `update_attribute` / `update_column` | `update!`, y `update_columns` sólo para escrituras técnicas (§16) |
 | 20 | Se borró historial al borrar un usuario | `dependent: :destroy` donde iba `:nullify` | revisar cada `has_many` (§17) |
 | 21 | `wrong number of arguments (given 3, expected 0)` | método reservado (`dispatch`) | renombrar el método, no la URL (§18) |
-| 22 | `AbstractController::ActionNotFound` tras subir a 7.1 | `only:` a acción inexistente | un callback que decide adentro (§19) |
+| 22 | `AbstractController::ActionNotFound` en dev/test tras subir a 7.1 (y en prod, el callback que no corre) | `only:` a acción inexistente | un callback que decide adentro (§19) |
 | 23 | Reporte "de hoy" corrido un día | `Time.now` / `Date.today` | `Time.current` / `Date.current` (§20) |
 | 24 | Workers matados por OOM, 502 sin excepción | cargar todo en memoria | `find_each`, `pluck`, `GROUP BY` (§21) |
 | 25 | El sitio se cae antes de que la migración empiece | lock encolado | `lock_timeout`, `algorithm: :concurrently` (§22) |
@@ -2501,9 +2699,9 @@ mail, un job, un webhook, invalidar un cache. Si mandás el mail en `after_save`
 la transacción hace rollback, mandaste un mail sobre algo que no existe.
 
 **El trade-off**: `after_commit` corre fuera de la transacción, así que si falla
-no hay rollback posible: hay que manejar el error a mano. Y en tests con
-transacciones envolventes no dispara, lo cual esconde bugs en las dos
-direcciones.
+no hay rollback posible: hay que manejar el error a mano. Y en tests
+transaccionales el callback dispara pero el dato no está realmente commiteado,
+así que cualquier cosa que lo lea desde otra conexión no lo encuentra.
 
 **El remate**: la trampa fina es que `after_commit` dispara cuando commitea la
 transacción a la que el registro está asociado, que con anidamiento no siempre es

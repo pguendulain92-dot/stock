@@ -6,13 +6,11 @@ cómo está modelado el dominio de stock y con qué justificación, el patrón
 proyección + ledger que sostiene todo, el contrato `Result` que reemplaza a las
 excepciones, y una receta paso a paso para agregar una operación nueva.
 
-Está escrito para vos, que venís de Spring + JPA/Hibernate. Cada vez que hay un
+Está escrito para vos, que venís de Spring + JPA/Hibernate: donde hay un
 equivalente en Java lo marco y —más importante— marco **dónde la analogía se
-rompe**, que es exactamente donde se equivoca la gente que llega desde Java.
-
-Todo el código citado sale del repositorio real y todos los números que aparecen
-se midieron corriendo la app. Si algo no te cierra, abrí el archivo: los
-comentarios del código son la fuente de verdad y este documento los amplía.
+rompe**, que es justo donde se equivoca el que llega desde Java. Todo el código
+citado sale del repositorio y los números se midieron corriendo la app; si algo
+no te cierra, abrí el archivo, que los comentarios son la fuente de verdad.
 
 ---
 
@@ -413,9 +411,9 @@ que es donde querés verlo.
 `internal_cost_notes`, se filtra sola: es una fuga de datos por omisión.
 
 Los serializers son POROs: `.new(objeto).as_json → Hash`,
-`.collection(array) → Array<Hash>`. Cero magia, y son la clase más fácil de
-testear que existe. `app/serializers/error_serializer.rb` centraliza el formato de
-error, que junto con `STATUS_FOR` **es** el contrato de errores de la API.
+`.collection(array) → Array<Hash>` (`app/serializers/application_serializer.rb`).
+`ErrorSerializer` centraliza el formato de error, que junto con `STATUS_FOR` **es**
+el contrato de errores de la API.
 
 ### 4.6 `forms/` — el DTO validado
 
