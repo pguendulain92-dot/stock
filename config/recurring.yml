@@ -3,9 +3,17 @@
 #
 # VENTAJAS sobre el cron del sistema operativo:
 #   * Está versionado en git junto al código que ejecuta.
-#   * Corre en UNA sola instancia aunque tengas 10 servidores (Solid Queue usa
-#     un lock para elegir el líder). Con crontab en 10 máquinas, el job corre
-#     10 veces — y ese es un bug de producción clásico y carísimo.
+#   * Corre UNA sola vez aunque tengas 10 servidores. Con crontab en 10
+#     máquinas el job corre 10 veces, y ese es un bug de producción clásico y
+#     carísimo.
+#
+#     ¿Cómo lo logra? NO hay elección de líder (es lo que todo el mundo asume).
+#     El mecanismo es más simple y más robusto: cada scheduler intenta INSERTAR
+#     una fila en `solid_queue_recurring_executions` con un índice único sobre
+#     (task_key, run_at). El primero gana; los demás reciben una violación de
+#     unicidad que Solid Queue traduce a `RecurringExecution::AlreadyRecorded` y
+#     siguen de largo. Es el mismo truco que usamos para la idempotencia: un
+#     índice único como lock distribuido, sin coordinación ni consenso.
 #   * Se ve en el dashboard de Mission Control como cualquier otro job.
 #
 # El formato de `schedule` es cron estándar de 5 campos, o los atajos de

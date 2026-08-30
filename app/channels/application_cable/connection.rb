@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 # Mismo criterio que Authentication#find_session_by_cookie: se filtra por
 # `active` para que una sesión vencida no siga autenticando el WebSocket.
 module ApplicationCable

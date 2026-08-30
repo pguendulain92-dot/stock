@@ -43,9 +43,15 @@ default: &default
       polling_interval: 0.5
       processes: 1
 
-    # `*` toma TODO lo demás. El orden del array ES la prioridad: primero
-    # default, después mailers, después maintenance. Un worker que puede tomar
-    # todo evita que una cola quede sin atender por falta de proceso dedicado.
+    # `*` toma TODO lo demás.
+    #
+    # ⚠️ OJO CON LA PRIORIDAD. El orden del array SÍ define prioridad... salvo
+    # cuando incluís `"*"`. Con el comodín en la lista y sin colas pausadas,
+    # el selector de Solid Queue detecta que puede tomar todo y colapsa a un
+    # `SELECT * FROM solid_queue_ready_executions` SIN filtro de cola, ordenado
+    # sólo por (priority, job_id). O sea: el orden que escribiste acá NO tiene
+    # efecto. Si querés prioridad real entre estas colas, sacá el `"*"` y
+    # enumeralas, o usá el atributo `priority` de cada job.
     - queues: [ default, mailers, maintenance, "*" ]
       threads: 5
       polling_interval: 1

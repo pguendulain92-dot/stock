@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_30_161300) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_30_220000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "btree_gin"
   enable_extension "citext"
@@ -235,6 +235,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_30_161300) do
     t.bigint "user_id"
     t.bigint "warehouse_id", null: false
     t.index ["idempotency_key"], name: "index_stock_movements_on_idempotency_key", unique: true, where: "(idempotency_key IS NOT NULL)"
+    t.index ["occurred_at", "id"], name: "index_stock_movements_global_ledger", order: :desc
     t.index ["product_id", "occurred_at"], name: "index_stock_movements_on_product_id_and_occurred_at", order: { occurred_at: :desc }
     t.index ["reference_type", "reference_id"], name: "index_stock_movements_on_reference_type_and_reference_id", where: "(reference_type IS NOT NULL)"
     t.index ["stock_item_id", "occurred_at", "id"], name: "index_stock_movements_ledger", order: { occurred_at: :desc, id: :desc }

@@ -97,7 +97,18 @@ env:
     # Procesos de Puma. Regla práctica: cantidad de núcleos. Cada worker es un
     # proceso Ruby completo: multiplicá por la RAM que consume uno.
     WEB_CONCURRENCY: 2
-    SOLID_QUEUE_IN_PUMA: false   # el worker corre en su propio contenedor
+    # ⚠️ NO pongas SOLID_QUEUE_IN_PUMA acá, ni siquiera en false.
+    #
+    # Kamal serializa `env.clear` como `--env CLAVE=valor`, así que el
+    # contenedor recibe el STRING "false". Y en Ruby "false" es TRUTHY:
+    # config/puma.rb hace `plugin :solid_queue if ENV["SOLID_QUEUE_IN_PUMA"]`,
+    # la condición da true, y el supervisor de Solid Queue arranca DENTRO de
+    # cada contenedor web además del rol job. Terminás con workers de más
+    # compitiendo por los mismos jobs y consumiendo conexiones a la base.
+    #
+    # Los únicos valores falsy de Ruby son `false` y `nil`: "false", "0" y ""
+    # son todos verdaderos. La forma segura de "apagar" una variable de entorno
+    # es NO DEFINIRLA. Si necesitás encenderla en un rol, declarala sólo ahí.
     QUEUE_ADAPTER: solid_queue
     OUTBOX_ADAPTER: webhook
   secret:

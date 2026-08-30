@@ -255,8 +255,9 @@ QUEUE_ADAPTER=sidekiq REDIS_URL=redis://localhost:6379/0 bin/rails server
 
 ## Bugs reales encontrados construyendo esto
 
-Están documentados en el código, con el comentario al lado del arreglo. Son buen
-material de entrevista porque son problemas que **de verdad** aparecen:
+Están documentados en el código, con el comentario al lado del arreglo y —donde
+corresponde— un test de regresión que los cubre. Son buen material de entrevista
+porque son problemas que **de verdad** aparecen:
 
 1. **Query cache de ActiveRecord sobre un `INSERT ... RETURNING`** — ejecutado con
    `select_value`, Rails lo trata como un SELECT y lo cachea: dos comprobantes
@@ -279,6 +280,38 @@ material de entrevista porque son problemas que **de verdad** aparecen:
    no tienen esa acción (Rails 7.1+). → `app/controllers/api/v1/base_controller.rb`
 10. **Autofix de reconciliación vía `ApplyMovement`** — mueve la proyección y el
     ledger a la vez, así que la diferencia nunca converge. → `app/jobs/stock/reconcile_balances_job.rb`
+11. **Bullet sólo en `group :development`** — en test la constante no existía, los
+    guards `if defined?(Bullet)` daban false y los specs marcados `:n_plus_one`
+    pasaban hubiera o no un N+1. Una red de seguridad que no atrapaba nada.
+    → `Gemfile`, `spec/n_plus_one_guard_spec.rb`
+12. **`find_or_provision!` con un `rescue` inútil** — se llama dentro de una
+    transacción, y en Postgres una sentencia fallida aborta la transacción
+    entera: el `find_by!` del rescate moría. Necesita un SAVEPOINT.
+    → `app/models/stock_item.rb`
+13. **`enqueue_after_transaction_commit = :always` en un initializer** — no-op en
+    Rails 8.1: el railtie excluye esa clave de la config global. Parecía
+    configurado y no lo estaba. → `app/jobs/application_job.rb`
+14. **Los throttles de login por email nunca dispararon** — leían los params
+    anidados (`session[email_address]`) y el formulario los manda planos.
+    Discriminador nil = Rack::Attack no cuenta nada, sin error ni aviso.
+    → `config/initializers/rack_attack.rb`
+15. **Fuerza bruta de tokens de API sin límite** — el 401 corta la cadena de
+    callbacks, así que el rate limit de aplicación nunca corría, y el de borde
+    discrimina por token: cada token adivinado estrenaba su propio balde.
+    → `config/initializers/rack_attack.rb`
+16. **Sesiones vencidas seguían autenticando** — `Session.find_by` en vez de
+    `Session.active.find_by`. → `app/controllers/concerns/authentication.rb`
+17. **Paginación sin techo** — `?limit=1000000` era un DoS de una línea en seis
+    endpoints. → `app/controllers/api/v1/base_controller.rb`
+18. **La clave de idempotencia se quemaba con un error del cliente** — quedaba en
+    `processing` 24 h. Y el arreglo obvio (`ensure`) tampoco sirve: corre antes
+    de que el `rescue_from` renderice. → `app/controllers/concerns/api/idempotency.rb`
+19. **`"false"` es truthy en Ruby** — `SOLID_QUEUE_IN_PUMA: false` en Kamal llega
+    como el string `"false"` y el plugin arrancaba igual en los contenedores web.
+    → `config/deploy.yml`
+20. **Traits de enum autogenerados por FactoryBot** — inventaban estados que
+    violan los CHECK constraints y rompían el lint de factories en CI.
+    → `spec/support/factory_bot.rb`
 
 ---
 

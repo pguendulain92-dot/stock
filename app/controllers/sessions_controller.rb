@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 class SessionsController < ApplicationController
   allow_unauthenticated_access only: %i[ new create ]
   # Rate limit NATIVO de Rails sobre el login: la segunda capa, después de

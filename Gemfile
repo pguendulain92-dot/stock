@@ -121,8 +121,15 @@ gem "rack-attack", "~> 6.7"
 # PERFORMANCE / QUERIES
 # ------------------------------------------------------------------------------
 
-# Paginación más rápida y liviana del ecosistema (no genera objetos de más,
-# no hace COUNT(*) si no se lo pedís). Ver docs/04 sobre keyset pagination.
+# Paginación más rápida y liviana del ecosistema: no instancia objetos de más
+# y no toca ActiveRecord con métodos de clase.
+#
+# OJO: por defecto SÍ hace un `SELECT COUNT(*)` extra para saber cuántas
+# páginas hay. En tablas grandes ese COUNT puede costar más que la página en
+# sí. Si no necesitás el total, cargá el extra `countless`
+# (`require "pagy/extras/countless"`) y usá `pagy_countless`. Para un log que
+# crece sin límite, mejor directamente keyset pagination: ver
+# app/queries/stock_movements/ledger.rb.
 gem "pagy", "~> 9.3"
 
 # Parser/serializador JSON en C.

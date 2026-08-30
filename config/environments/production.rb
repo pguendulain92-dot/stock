@@ -22,14 +22,27 @@ Rails.application.configure do
   # config.asset_host = "http://assets.example.com"
 
   # Store uploaded files on the local file system (see config/storage.yml for options).
-  config.active_storage.service = :local
+  # ⚠️ :local guarda los adjuntos en el DISCO DEL CONTENEDOR, que es EFÍMERO:
+  # cada deploy los borra. Sirve para arrancar; en producción de verdad va S3
+  # (o el volumen persistente que declara config/deploy.yml). Lo dejamos
+  # explícito para que la decisión sea consciente y no un olvido.
+  config.active_storage.service = ENV.fetch("ACTIVE_STORAGE_SERVICE", "local").to_sym
 
   # Assume all access to the app is happening through a SSL-terminating reverse proxy.
-  # config.assume_ssl = true
+  # Detrás de un proxy que ya terminó TLS (Kamal, nginx, un ALB), Rails no ve
+  # que la conexión original era HTTPS. `assume_ssl` se lo dice, y sin eso
+  # `force_ssl` entraría en un bucle de redirects infinito.
+  config.assume_ssl = true
 
   # Force all access to the app over SSL, use Strict-Transport-Security, and use secure cookies.
-  # config.force_ssl = true
-
+  # force_ssl hace TRES cosas, y las tres importan:
+  #   1. Redirige HTTP -> HTTPS.
+  #   2. Manda la cabecera HSTS (el browser deja de intentar HTTP).
+  #   3. Marca las cookies como `secure`, así no viajan nunca en claro.
+  # Sin esto, la cookie de sesión sale sin el flag `secure` (sólo con httponly
+  # y same_site: lax) y basta una request HTTP para que un atacante en la misma
+  # red la capture. Era el único hallazgo de confianza alta de Brakeman -A.
+  config.force_ssl = true
   # Skip http-to-https redirect for the default health check endpoint.
   # config.ssl_options = { redirect: { exclude: ->(request) { request.path == "/up" } } }
 
@@ -58,7 +71,10 @@ Rails.application.configure do
   # config.action_mailer.raise_delivery_errors = false
 
   # Set host to be used by links generated in mailer templates.
-  config.action_mailer.default_url_options = { host: "example.com" }
+  # `host` NO es decorativo: es lo que arma las URLs de los mails (por ejemplo
+  # el link de reseteo de contraseña). Con "example.com" los usuarios reciben
+  # links rotos. Sale del entorno para que no haya un default que engañe.
+  config.action_mailer.default_url_options = { host: ENV.fetch("APP_HOST", "localhost") }
 
   # Specify outgoing SMTP server. Remember to add smtp/* credentials via bin/rails credentials:edit.
   # config.action_mailer.smtp_settings = {

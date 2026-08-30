@@ -47,3 +47,6 @@
 /tmp/capybara/
 /tmp/rspec_examples.txt
 /.kamal/secrets
+
+# Secretos de Kamal (el .example SÍ se versiona)
+.kamal/secrets

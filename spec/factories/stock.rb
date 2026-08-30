@@ -36,9 +36,32 @@ FactoryBot.define do
       movement.warehouse_id ||= movement.stock_item&.warehouse_id
     end
 
+    # Traits EXPLÍCITOS: cada uno respeta el CHECK que exige que el signo de la
+    # cantidad coincida con el tipo de movimiento (ver la migración).
     trait(:issue) do
       kind { "issue" }
       quantity { -5 }
+    end
+
+    trait(:transfer_in) do
+      kind { "transfer_in" }
+      quantity { 5 }
+    end
+
+    trait(:transfer_out) do
+      kind { "transfer_out" }
+      quantity { -5 }
+    end
+
+    trait(:scrap) do
+      kind { "scrap" }
+      quantity { -1 }
+    end
+
+    trait(:adjustment) do
+      kind { "adjustment" }
+      quantity { -2 }
+      reason { "Ajuste por conteo" }
     end
   end
 
@@ -49,11 +72,24 @@ FactoryBot.define do
     expires_at { 30.minutes.from_now }
 
     trait(:expired_soon) { expires_at { 1.second.from_now } }
+
+    # Los tres estados terminales necesitan su marca de tiempo, o el CHECK
+    # constraint los rechaza. Por eso los escribimos a mano en vez de dejar que
+    # factory_bot los invente desde el enum (ver spec/support/factory_bot.rb).
     trait(:already_expired) do
-      # `to_create` no valida, pero igual necesitamos released_at por el CHECK.
       status { "expired" }
       released_at { Time.current }
       expires_at { 1.hour.ago }
+    end
+
+    trait(:released) do
+      status { "released" }
+      released_at { Time.current }
+    end
+
+    trait(:committed) do
+      status { "committed" }
+      committed_at { Time.current }
     end
   end
 

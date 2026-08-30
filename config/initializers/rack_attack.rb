@@ -266,8 +266,14 @@ class Rack::Attack
   # RESPUESTA AL BLOQUEO
   #
   # Un 429 SIN cabeceras es hostil: el cliente no sabe cuánto esperar y reintenta
-  # en loop, empeorando todo. Devolver `Retry-After` + las cabeceras `RateLimit-*`
-  # (RFC 9331) permite que un cliente bien hecho haga backoff solo.
+  # en loop, empeorando todo. Devolver `Retry-After` (ese sí está en el RFC 9110)
+  # más las cabeceras `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset`
+  # permite que un cliente bien hecho haga backoff solo.
+  #
+  # Nota: las cabeceras RateLimit-* NO son un RFC publicado todavía; vienen del
+  # draft `draft-ietf-httpapi-ratelimit-headers`. (Este comentario decía
+  # "RFC 9331", que es la RFC de ECN/L4S y no tiene nada que ver. Verificá
+  # siempre el número antes de citarlo: da una falsa autoridad.)
   # ---------------------------------------------------------------------------
   self.throttled_responder = lambda do |request|
     match = request.env["rack.attack.match_data"] || {}
