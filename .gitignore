@@ -46,3 +46,4 @@
 /coverage/
 /tmp/capybara/
 /tmp/rspec_examples.txt
+/.kamal/secrets

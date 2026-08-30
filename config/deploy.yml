@@ -1,0 +1,161 @@
+# ==============================================================================
+# Kamal — deploy de contenedores Docker sobre servidores "pelados", sin
+# Kubernetes. Es lo que usa Basecamp/37signals para correr sus apps en hardware
+# propio, y viene de fábrica en Rails 8.
+#
+# QUÉ HACE, en una línea: buildea la imagen, la sube a un registry, la baja en
+# tus servidores, arranca el contenedor nuevo, espera a que pase el healthcheck
+# y recién ahí apaga el viejo. Cero downtime, con un proxy (kamal-proxy) que
+# maneja el corte.
+#
+# CUÁNDO ELEGIRLO (respuesta de entrevista):
+#   * Kamal      -> 1 a 20 servidores, un equipo chico, querés controlar el
+#                   costo. Complejidad operativa MUY baja. No hay autoscaling,
+#                   no hay scheduling, no hay service mesh.
+#   * Kubernetes -> muchos servicios, muchos equipos, necesitás autoscaling y
+#                   una plataforma. Potentísimo y carísimo en tiempo humano.
+#   * PaaS       -> el equipo no quiere tocar infraestructura y el costo por
+#                   unidad de cómputo no importa.
+#
+# Los comandos que importan:
+#   kamal setup            primera vez (instala Docker, arranca todo)
+#   kamal deploy           build + push + rolling restart
+#   kamal rollback <ver>   volver a la versión anterior
+#   kamal app logs -f      logs en vivo
+#   kamal app exec -i "bin/rails console"
+#   kamal proxy reboot     reiniciar el proxy sin tocar la app
+# ==============================================================================
+
+service: stock
+
+# La imagen en el registry. Con Docker Hub alcanza el nombre; con GHCR o ECR va
+# la URL completa (ghcr.io/usuario/stock).
+image: <%= ENV.fetch("KAMAL_IMAGE", "tu-usuario/stock") %>
+
+# ------------------------------------------------------------------------------
+# Servidores, agrupados por ROL.
+#
+# Separar `web` de `job` es la decisión de arquitectura importante: los procesos
+# web y los workers tienen perfiles de recursos y de escalado distintos. Un pico
+# de tráfico web no debería hacerte esperar los jobs, y un backfill pesado no
+# debería frenar las requests.
+# ------------------------------------------------------------------------------
+servers:
+  web:
+    - 192.168.0.1        # reemplazar por las IPs reales
+  job:
+    hosts:
+      - 192.168.0.2
+    # `cmd` sobreescribe el CMD del Dockerfile: este contenedor corre el worker
+    # de Solid Queue en vez de Puma. MISMA IMAGEN, distinto proceso — es lo que
+    # garantiza que el worker corra exactamente el mismo código que la web.
+    cmd: bin/jobs
+
+# ------------------------------------------------------------------------------
+# Proxy: termina TLS (Let's Encrypt automático) y hace el corte entre versiones.
+# ------------------------------------------------------------------------------
+proxy:
+  ssl: true
+  host: stock.tu-dominio.test
+  # El endpoint que decide si la versión nueva está lista para recibir tráfico.
+  # /up es el health check de Rails: devuelve 200 si la app booteó sin excepciones.
+  #
+  # ⚠️ OJO CON QUÉ CHEQUEA TU HEALTH CHECK. Si /up consultara la base y la base
+  # tiene un hipo, TODAS las instancias fallan el check a la vez y el proxy las
+  # saca a todas: te tumbás solo. Un health check de LIVENESS tiene que
+  # responder "el proceso está vivo", no "todas mis dependencias andan".
+  # Ver docs/13 §health checks.
+  healthcheck:
+    path: /up
+    interval: 3
+    timeout: 5
+
+# Registry de imágenes. La password sale de .kamal/secrets, NUNCA de acá.
+registry:
+  username: <%= ENV.fetch("KAMAL_REGISTRY_USER", "tu-usuario") %>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: amd64
+  # Cachear las capas entre builds acorta el deploy de minutos a segundos.
+  cache:
+    type: registry
+
+# ------------------------------------------------------------------------------
+# Variables de entorno.
+#
+# `clear` son públicas y quedan en el archivo. `secret` sólo nombra la variable:
+# el VALOR sale de .kamal/secrets (que está en .gitignore) y Kamal lo inyecta al
+# contenedor sin escribirlo en disco del servidor.
+# ------------------------------------------------------------------------------
+env:
+  clear:
+    RAILS_ENV: production
+    # Threads de Puma Y tamaño del pool de conexiones. Ver config/database.yml.
+    RAILS_MAX_THREADS: 5
+    # Procesos de Puma. Regla práctica: cantidad de núcleos. Cada worker es un
+    # proceso Ruby completo: multiplicá por la RAM que consume uno.
+    WEB_CONCURRENCY: 2
+    SOLID_QUEUE_IN_PUMA: false   # el worker corre en su propio contenedor
+    QUEUE_ADAPTER: solid_queue
+    OUTBOX_ADAPTER: webhook
+  secret:
+    - RAILS_MASTER_KEY
+    - DATABASE_URL
+    - OUTBOX_WEBHOOK_URL
+    - OUTBOX_WEBHOOK_SECRET
+
+# ------------------------------------------------------------------------------
+# Comandos auxiliares: mismo contenedor, sesión interactiva.
+# ------------------------------------------------------------------------------
+aliases:
+  console: app exec --interactive --reuse "bin/rails console"
+  shell: app exec --interactive --reuse "bash"
+  logs: app logs -f
+  dbc: app exec --interactive --reuse "bin/rails dbconsole"
+  migrate: app exec --reuse "bin/rails db:migrate"
+  reconcile: app exec --reuse "bin/rails stock:reconcile"
+
+# ------------------------------------------------------------------------------
+# Volúmenes persistentes. El contenedor es EFÍMERO: todo lo que no esté en un
+# volumen se pierde en cada deploy. Active Storage en disco local va acá.
+# (En producción de verdad, mejor S3: un volumen local no sobrevive a que se
+# muera la máquina.)
+# ------------------------------------------------------------------------------
+volumes:
+  - "stock_storage:/rails/storage"
+
+# ------------------------------------------------------------------------------
+# `asset_path` habilita el "asset bridging": durante el corte entre versiones,
+# Kamal deja disponibles los assets de la versión VIEJA además de los de la
+# nueva. Sin esto, un usuario que tenía la página abierta pide un JS con el
+# digest viejo, recibe 404 y ve la app rota. Es un detalle chico con un impacto
+# desproporcionado en la experiencia durante el deploy.
+# ------------------------------------------------------------------------------
+asset_path: /rails/public/assets
+
+# ------------------------------------------------------------------------------
+# Servicios auxiliares en la misma máquina. Para una app chica alcanza; a
+# partir de cierto tamaño querés la base gestionada (backups, failover, PITR).
+# ------------------------------------------------------------------------------
+# accessories:
+#   db:
+#     image: postgres:16
+#     host: 192.168.0.3
+#     port: "127.0.0.1:5432:5432"
+#     env:
+#       clear:
+#         POSTGRES_USER: stock
+#         POSTGRES_DB: stock_production
+#       secret:
+#         - POSTGRES_PASSWORD
+#     directories:
+#       - data:/var/lib/postgresql/data
+#
+#   redis:
+#     image: redis:7
+#     host: 192.168.0.3
+#     port: "127.0.0.1:6379:6379"
+#     directories:
+#       - data:/data
