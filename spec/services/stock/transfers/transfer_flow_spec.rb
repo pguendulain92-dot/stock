@@ -109,9 +109,24 @@ RSpec.describe "Flujo de transferencia entre depósitos" do
     it "rechaza recibir más de lo despachado" do
       result = Stock::Transfers::Receive.call(
         transfer: transfer.reload, user:, event_recorder: recorder,
-        received_quantities: { producto_a.id => 999 }
+        received_quantities: { producto_a.id => 999, producto_b.id => 20 }
       )
       expect(result.error.code).to eq(:invalid_quantity)
+    end
+
+    it "EXIGE informar todas las líneas despachadas (no adivina el resto)" do
+      # Si aceptáramos un hash parcial habría que suponer algo, y las dos
+      # suposiciones posibles son destructivas: dar por recibido lo que no
+      # llegó (inventa stock) o dar por perdido lo que no se informó (lo
+      # destruye como merma). Mejor exigir que el operador se pronuncie.
+      result = Stock::Transfers::Receive.call(
+        transfer: transfer.reload, user:, event_recorder: recorder,
+        received_quantities: { producto_a.id => 40 }
+      )
+
+      expect(result.error.code).to eq(:incomplete_receipt)
+      expect(result.error.details[:missing_product_ids]).to eq([ producto_b.id ])
+      expect(transfer.reload).to be_in_transit   # nada cambió
     end
 
     it "el ledger cierra al final de todo el flujo" do

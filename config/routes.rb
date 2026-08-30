@@ -78,6 +78,17 @@ Rails.application.routes.draw do
       # registrar (recibir != ajustar, aunque las dos sumen 10 unidades).
       # Esto es RPC-sobre-HTTP y está bien: no seas dogmático con REST cuando el
       # dominio es de comandos.
+      resources :purchase_orders, only: %i[index show create] do
+        member do
+          post :submit
+          # Mismo criterio que en transferencias: la URL dice /receive pero el
+          # método se llama distinto, para no arriesgar colisiones con métodos
+          # del framework y para que quede explícito qué recibe.
+          post :receive, action: :receive_order
+          post :cancel
+        end
+      end
+
       post "stock/receive", to: "stock_operations#receive"
       post "stock/issue",   to: "stock_operations#issue"
       post "stock/adjust",  to: "stock_operations#adjust"

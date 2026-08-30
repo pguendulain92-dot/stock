@@ -34,6 +34,22 @@ module Stock
           transit = transfer.transit_warehouse || Warehouse.find_by!(code: Warehouse::TRANSIT_CODE)
           shrinkage_total = 0
 
+          # Si mandaste el hash de cantidades, tiene que cubrir TODAS las líneas
+          # despachadas. Acá NO podemos asumir 0 para lo que falta (eso daría de
+          # baja mercadería real como merma) ni asumir "todo" (eso ingresaría
+          # mercadería que no llegó). Las dos suposiciones son destructivas, así
+          # que exigimos que el operador se pronuncie sobre cada línea.
+          if @received_quantities
+            faltantes = transfer.lines.select { |l| l.quantity_dispatched.positive? }
+                                .map(&:product_id) - @received_quantities.keys
+            if faltantes.any?
+              fail!(:incomplete_receipt,
+                    "Faltan cantidades recibidas para #{faltantes.size} línea(s). " \
+                    "Indicá explícitamente cuánto llegó de cada producto despachado.",
+                    missing_product_ids: faltantes)
+            end
+          end
+
           transfer.lines.order(:id).each do |line|
             received = (@received_quantities || {}).fetch(line.product_id, line.quantity_dispatched).to_i
 

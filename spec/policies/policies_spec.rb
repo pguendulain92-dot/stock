@@ -102,13 +102,28 @@ RSpec.describe "Políticas de autorización" do
   end
 
   describe StockTransferPolicy do
-    it "las transiciones dependen del ESTADO, no sólo del rol" do
+    # ─────────────────────────────────────────────────────────────────────────
+    # La policy responde SÓLO por el permiso, no por el estado. Ver la nota en
+    # app/policies/purchase_order_policy.rb: mezclarlos hace que "enviar dos
+    # veces" devuelva 403 (nunca vas a poder) en vez de 422 (ya está enviada).
+    # ─────────────────────────────────────────────────────────────────────────
+    it "el permiso NO depende del estado del recurso" do
       borrador = build_stubbed(:stock_transfer, status: "draft")
-      en_transito = build_stubbed(:stock_transfer, status: "in_transit")
+      recibida = build_stubbed(:stock_transfer, status: "received")
 
       expect(described_class.new(operator, borrador).dispatch?).to be(true)
-      expect(described_class.new(operator, en_transito).dispatch?).to be(false)
-      expect(described_class.new(operator, en_transito).receive?).to be(true)
+      expect(described_class.new(operator, recibida).dispatch?).to be(true)
+    end
+
+    it "cancelar es de manager para arriba" do
+      transfer = build_stubbed(:stock_transfer)
+      expect(described_class.new(operator, transfer).cancel?).to be_falsey
+      expect(described_class.new(manager, transfer).cancel?).to be(true)
+    end
+
+    it "el ESTADO lo valida el modelo, no la policy" do
+      recibida = build_stubbed(:stock_transfer, status: "received")
+      expect(recibida.can_transition_to?("in_transit")).to be(false)
     end
   end
 end

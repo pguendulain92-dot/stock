@@ -64,7 +64,7 @@ Seis queries (1 + N) contra dos (una por tabla: Rails hace `IN (...)`, no un
 JOIN, salvo que uses `preload`/`eager_load` explícitamente). No hay ningún
 `fetch = EAGER` que te salve por defecto: hay que pedir `includes` en cada
 listado. Por eso los modelos de este repo exponen un scope `with_associations`
-(`app/models/product.rb:34`, `app/models/stock_item.rb:47`).
+(`app/models/product.rb:60`, `app/models/stock_item.rb:47`).
 
 La consecuencia más cara de no tener identity map: **dos instancias del mismo
 registro se pisan**. Por eso el dominio bloquea la fila antes de leer y escribir,
@@ -138,8 +138,11 @@ Dos reglas:
 2. **Contá las cuatro bases, no una.** Es el error de escalado #2 y está avisado
    en `config/database.yml:23-26`.
 
-Ojo con la nomenclatura: en Rails 8.1 la clave es `max_connections`
-(`pool` sigue funcionando como alias). Verificado:
+Ojo con la nomenclatura: en Rails 8.1 la clave es `max_connections`. `pool`
+sigue funcionando como alias pero está **deprecado**, y si ponés las dos con
+valores distintos Rails levanta un error de configuración ambigua
+(`activerecord-8.1.3.1/lib/active_record/database_configurations/hash_config.rb:85,220`).
+Verificado:
 
 ```bash
 $ bin/rails runner 'p ActiveRecord::Base.connection_pool.db_config.configuration_hash
@@ -243,7 +246,7 @@ conexiones de servidor distintas**. De ahí salen todos los problemas:
 ### 3.1 Las cuatro bases
 
 Rails 8 arranca con `primary`, `cache`, `queue` y `cable`
-(`config/database.yml:60-77`). La idea: que la carga de infraestructura no
+(`config/database.yml:62-77`). La idea: que la carga de infraestructura no
 contamine la base de negocio. Solid Cache reescribe filas constantemente, Solid
 Queue tiene un patrón de INSERT/DELETE brutal — dos cosas que ensucian el vacuum
 y las estadísticas de tu base de dominio. Además podés tirar la base de cache sin
@@ -819,17 +822,17 @@ Mirando `db/schema.rb` de este repo, el dumper de Rails 8.1 captura:
 
 | Cosa | Ejemplo en el repo |
 |---|---|
-| Extensiones | `enable_extension "citext"`, `"pg_trgm"`, `"btree_gin"` (`db/schema.rb:16-19`) |
-| Índices parciales | `where: "(revoked_at IS NULL)"` (`db/schema.rb:33`) |
-| Índices con `opclass` y `using` | `opclass: :gin_trgm_ops, using: :gin` (`db/schema.rb:123`) |
-| Índices con orden | `order: { occurred_at: :desc, id: :desc }` (`db/schema.rb:243`) |
+| Extensiones | `enable_extension "citext"`, `"pg_trgm"`, `"btree_gin"` (`db/schema.rb:15-18`) |
+| Índices parciales | `where: "(revoked_at IS NULL)"` (`db/schema.rb:34`) |
+| Índices con `opclass` y `using` | `opclass: :gin_trgm_ops, using: :gin` (`db/schema.rb:127`) |
+| Índices con orden | `order: { occurred_at: :desc, id: :desc }` (`db/schema.rb:240`) |
 | CHECK constraints | los 5 de `stock_items` (`db/schema.rb:214-218`) |
 | Columnas generadas | `t.virtual "quantity_available", ... stored: true` (`db/schema.rb:203`) |
-| Arrays | `t.string "scopes", default: [], array: true` (`db/schema.rb:29`) |
+| Arrays | `t.string "scopes", default: [], array: true` (`db/schema.rb:27`) |
 | Tipos PG (`citext`, `jsonb`, `uuid`) | `t.citext "sku"` (`db/schema.rb:120`) |
-| Defaults por función | `t.uuid "event_id", default: -> { "gen_random_uuid()" }` (`db/schema.rb:78`) |
-| PK no convencional | `create_table "sequence_counters", primary_key: "key", id: :string` (`db/schema.rb:184`) |
-| FK con `on_delete` | `add_foreign_key "stock_movements", "users", on_delete: :nullify` (`db/schema.rb:362`) |
+| Defaults por función | `t.uuid "event_id", default: -> { "gen_random_uuid()" }` (`db/schema.rb:77`) |
+| PK no convencional | `create_table "sequence_counters", primary_key: "key", id: :string` (`db/schema.rb:177`) |
+| FK con `on_delete` | `add_foreign_key "stock_movements", "users", on_delete: :nullify` (`db/schema.rb:372`) |
 | Tipos ENUM nativos | `create_enum` (Rails 7.0+; este repo no los usa a propósito, ver `db/migrate/20260830154959_create_users.rb`) |
 | Exclusion constraints | `t.exclusion_constraint` (Rails 7.1+) |
 
@@ -1062,7 +1065,7 @@ que la escritura pase por Rails. Pero:
 `timestamptz` no guarda la zona: guarda el instante absoluto en UTC y lo renderiza
 en la zona que pidas. El contra-caso legítimo —"las 9 de la mañana hora local de
 cada sucursal"— quiere `timestamp` naive + la zona en otra columna. Es raro, y
-para eso `warehouses` ya tiene su columna `timezone` (`app/models/warehouse.rb:16`).
+para eso `warehouses` ya tiene su columna `timezone` (`app/models/warehouse.rb:19`).
 
 Cambiar columnas existentes de `timestamp` a `timestamptz` requiere un
 `ALTER ... USING`, que **reescribe la tabla**: va con expand–contract (§5.7).
@@ -1159,7 +1162,7 @@ SELECT de refresco solo; acá lo pedís a mano.
 
 ### 8.1 CHECK
 
-Este repo tiene **28 CHECK constraints** en `db/schema.rb`. No son decoración:
+Este repo tiene **32 CHECK constraints** en `db/schema.rb`. No son decoración:
 codifican las invariantes del dominio en el único lugar donde nadie las puede
 saltear.
 
@@ -1260,7 +1263,7 @@ FKs son explícitas y todas eligen su `on_delete`:
 | `:nullify` | `ON DELETE SET NULL` | pone NULL en el hijo | `stock_movements` → `users`, `stock_reservations` → `users` |
 | (sin opción) | `NO ACTION` | como RESTRICT pero **diferible** al final de la transacción | — |
 
-La decisión de diseño se lee sola en `db/schema.rb:346-372`: **la historia
+La decisión de diseño se lee sola en `db/schema.rb:356-381`: **la historia
 contable nunca se borra en cascada.** Un movimiento de stock sobrevive al borrado
 del usuario que lo hizo (`nullify`), y no podés borrar un producto que tiene
 movimientos (`restrict`). Por eso además existe el soft delete
@@ -1370,7 +1373,7 @@ funciona si la inserción está en su propio `SAVEPOINT`
 service.
 
 La misma lógica aplica a los CHECK: las validaciones de `StockMovement`
-(`app/models/stock_movement.rb:37`) duplican a propósito el CHECK de la
+(`app/models/stock_movement.rb:35`) duplican a propósito el CHECK de la
 migración. La validación da el mensaje; el CHECK garantiza que ni un script, ni
 un seed, ni un `psql` metan basura.
 
@@ -1488,9 +1491,24 @@ a la regla del párrafo anterior.)
    transacción, y un proceso aparte los publica. `after_commit` no es un
    sustituto del outbox: es la mitad no confiable.
 2. **Una excepción en un `after_commit` no revierte nada.** La transacción ya
-   commiteó. Rails la loguea (y en Rails 7.1+ la re-lanza por defecto: el flag es
-   `raise_after_transaction_commit`). O sea que rompés la request **con los datos
-   ya guardados**.
+   commiteó, así que la excepción **sale del bloque** hacia el que llamó y rompés
+   la request con los datos ya guardados. Verificado:
+
+   ```bash
+   $ bin/rails runner '
+   class P4 < ApplicationRecord
+     self.table_name = "warehouses"
+     after_commit { raise "explota en after_commit" }
+   end
+   begin; P4.create!(code: "ZZ-1", name: "probe"); rescue => e; puts "salio: #{e.message}"; end
+   puts "la fila quedo guardada? #{Warehouse.exists?(code: "ZZ-1")}"'
+
+   salio: explota en after_commit
+   la fila quedo guardada? true
+   ```
+
+   (En Rails 4.2 estas excepciones se tragaban y se logueaban; desde Rails 5
+   propagan. Si el efecto puede fallar, va en un job, no en el callback.)
 3. **`after_commit` no corre en tests con transactional fixtures**… bueno, sí
    corre desde Rails 5 gracias a `test_framework` y los savepoints, pero el
    `after_commit` de una transacción anidada con `requires_new: true` se dispara
@@ -1511,7 +1529,7 @@ Por eso, en este repo, los efectos externos viven en los **services**
 sus colaboradores por constructor (`event_recorder:`, `clock:`) y devuelven un
 `Result`. Los callbacks quedan para lo que realmente es responsabilidad del
 registro: normalizar (`before_validation`), derivar campos de la propia fila
-(`denormalize_from_stock_item`, `app/models/stock_movement.rb:69`) y mantener
+(`denormalize_from_stock_item`, `app/models/stock_movement.rb:68`) y mantener
 consistencia interna dentro de la misma transacción.
 
 ---
@@ -1525,8 +1543,8 @@ permitir NULL hay que decirlo:
 
 ```ruby
 belongs_to :category, optional: true                       # app/models/product.rb:11
-belongs_to :user, optional: true                           # app/models/stock_movement.rb:16
-belongs_to :reference, polymorphic: true, optional: true   # app/models/stock_movement.rb:17
+belongs_to :user, optional: true                           # app/models/stock_movement.rb:18
+belongs_to :reference, polymorphic: true, optional: true   # app/models/stock_movement.rb:19
 ```
 
 Es lo contrario de JPA, donde `@ManyToOne` es opcional salvo
@@ -1558,7 +1576,7 @@ has_one :preferred_supplier, through: :preferred_product_supplier, source: :supp
 ### 11.3 Polimórficas: por qué no hay foreign key
 
 ```ruby
-# app/models/stock_movement.rb:17
+# app/models/stock_movement.rb:19
 belongs_to :reference, polymorphic: true, optional: true
 ```
 
@@ -1682,7 +1700,7 @@ En este repo, el criterio es explícito: **destroy sólo donde el hijo no tiene
 valor sin el padre** (`product_suppliers`, `purchase_order_lines`, `sessions`,
 `api_tokens`), `nullify` para los movimientos que sobreviven al usuario, y
 `restrict_with_error` para todo lo que sea historia
-(`app/models/product.rb:13-18`, `app/models/user.rb:15`).
+(`app/models/product.rb:13-18`, `app/models/user.rb:17`).
 
 ### 11.6 `counter_cache` y `touch`
 
@@ -1842,13 +1860,13 @@ mejor herramienta que hay para cazar N+1 y queries huérfanas.
 | Síntoma | Causa | Arreglo |
 |---|---|---|
 | `PG::ConnectionBad: FATAL: sorry, too many clients already` | La cuenta de §2.2: workers × threads × bases × máquinas > `max_connections` | Bajar el pool a la cantidad real de threads, contar las 4 bases, y recién ahí PgBouncer |
-| `ActiveRecord::ConnectionTimeoutError: could not obtain a connection from the pool within 5.000 seconds` | Pool más chico que los threads, o conexiones que no se devuelven (threads creados a mano sin `with_connection`) | `max_connections >= RAILS_MAX_THREADS`; en threads propios, `ActiveRecord::Base.connection_pool.with_connection` (ver `spec/support/concurrency.rb:31`) |
+| `ActiveRecord::ConnectionTimeoutError: could not obtain a connection from the pool within 5.000 seconds` | Pool más chico que los threads, o conexiones que no se devuelven (threads creados a mano sin `with_connection`) | `max_connections >= RAILS_MAX_THREADS`; en threads propios, `ActiveRecord::Base.connection_pool.with_connection` (ver `spec/support/concurrency.rb:33`) |
 | Deploy que "cuelga" la app 3 minutos con un `ALTER TABLE` de 2 ms | La cola de locks de §5.1: una query lenta bloqueó a tu ALTER y tu ALTER bloqueó a todos | `lock_timeout` bajo + reintento con backoff |
 | `PG::ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a transaction block` | `algorithm: :concurrently` sin `disable_ddl_transaction!` | agregar `disable_ddl_transaction!` |
 | Un índice que existe pero el planner nunca usa | Quedó `INVALID` de un `CONCURRENTLY` que falló | `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` y `DROP INDEX CONCURRENTLY` |
 | `PG::UndefinedColumn: column products.barcode does not exist` durante un deploy | Se borró la columna sin `ignored_columns` un deploy antes; los procesos viejos tienen el schema cacheado | §5.6, y mientras tanto, reiniciar los procesos viejos |
 | Dos filas para el mismo (producto, depósito) y el stock que "no cierra" | `validates uniqueness` sin índice único: la carrera de §9 | índice `UNIQUE` + `rescue RecordNotUnique` |
-| `PG::UniqueViolation` al marcar un proveedor como preferido | El índice único parcial `index_one_preferred_supplier_per_product` | desmarcar el anterior en la misma transacción (`app/models/product_supplier.rb:23`) |
+| `PG::UniqueViolation` al marcar un proveedor como preferido | El índice único parcial `index_one_preferred_supplier_per_product` | desmarcar el anterior en la misma transacción (`app/models/product_supplier.rb:21`) |
 | El total de la orden no coincide con las líneas | Alguien usó `update_column`/`update_all` sobre las líneas: no dispara callbacks | recalcular con `recalculate_totals!`; o `reset_counters` si fuera `counter_cache` |
 | Un mail enviado por una operación que se revirtió | Efecto externo en `after_save` en vez de `after_commit` | §10.2 |
 | Un evento que se perdió sin dejar rastro | Se confió en `after_commit` para publicar; el proceso murió entre el COMMIT y el callback | outbox (`db/migrate/20260830161100_create_outbox_events.rb`) |

@@ -27,7 +27,16 @@ module Purchasing
         total_received = 0
 
         order.lines.order(:id).each do |line|
-          qty = (@received_quantities || {}).fetch(line.product_id, line.pending).to_i
+          # SEMÁNTICA DE LA RECEPCIÓN PARCIAL:
+          #   received_quantities == nil  -> se recibe TODO lo pendiente.
+          #   received_quantities == hash -> se recibe SÓLO lo que está listado;
+          #                                  lo que no figura queda PENDIENTE.
+          #
+          # La alternativa (completar lo no listado con lo pendiente) es
+          # peligrosa: el operador informa lo que llegó de un producto y el
+          # sistema le da por recibido lo de los demás, creando stock que no
+          # existe. Ante la duda, NUNCA inventes mercadería.
+          qty = @received_quantities.nil? ? line.pending : @received_quantities.fetch(line.product_id, 0).to_i
           next if qty.zero?
 
           if qty.negative? || qty > line.pending
