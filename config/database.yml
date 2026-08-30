@@ -1,0 +1,131 @@
+# ==============================================================================
+# config/database.yml
+#
+# Este archivo pasa por ERB antes de ser parseado como YAML, así que podés
+# incrustar Ruby con <%= %>. Es el equivalente a application.properties +
+# HikariCP config de Spring, pero con soporte nativo de MÚLTIPLES bases.
+#
+# CONCEPTOS QUE TE VAN A PREGUNTAR:
+#
+# 1) POOL DE CONEXIONES (`max_connections`, antes `pool`)
+#    Rails abre un pool POR PROCESO, no por aplicación. Si tenés 3 workers de
+#    Puma x 5 threads, son 3 pools de 5 = 15 conexiones a Postgres desde una
+#    sola máquina. Multiplicá por la cantidad de máquinas y comparás contra
+#    `max_connections` de Postgres (default 100). Este es EL error clásico de
+#    escalado: "PG::ConnectionBad: FATAL: sorry, too many clients already".
+#    Regla: max_connections del pool >= RAILS_MAX_THREADS. Si es menor, los
+#    threads se pelean por conexiones y vas a ver ActiveRecord::ConnectionTimeoutError.
+#    Solución a escala: PgBouncer en modo transaction pooling. Ver docs/03.
+#
+# 2) MULTI-DATABASE
+#    Rails 8 corre por defecto con 4 bases: primary (tu dominio), cache, queue
+#    y cable. La idea es que la carga de infraestructura (jobs, cache) no
+#    contamine la base de negocio: distintos patrones de escritura, distinto
+#    vacuum, y podés tirar la base de cache sin miedo.
+#    OJO: cada entrada extra abre SU PROPIO POOL. 4 bases x 5 threads = 20
+#    conexiones por proceso. Es el error #2 de escalado.
+#
+# 3) RÉPLICAS DE LECTURA
+#    Ver el bloque `replica:` comentado abajo y docs/03 para
+#    `ActiveRecord::Base.connected_to(role: :reading)`.
+# ==============================================================================
+
+default: &default
+  adapter: postgresql
+  encoding: unicode
+
+  # Tamaño del pool POR PROCESO. Lo atamos a RAILS_MAX_THREADS (los threads de
+  # Puma) para que nunca haya menos conexiones que threads.
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+
+  # Segundos que un thread espera por una conexión libre antes de tirar
+  # ActiveRecord::ConnectionTimeoutError. Bajarlo es BUENO: preferís fallar
+  # rápido y liberar el thread antes que acumular requests colgados.
+  checkout_timeout: 5
+
+  # Cierra conexiones que estuvieron idle más de N segundos (evita que
+  # PgBouncer/el firewall te corte la conexión sin avisar).
+  idle_timeout: 300
+
+  # Timeout de statement del lado del servidor: mata cualquier query que pase
+  # de 15s. Sin esto, una query mala puede tener un worker colgado para siempre.
+  variables:
+    statement_timeout: 15000              # ms
+    lock_timeout: 10000                   # ms — no esperes locks eternamente
+    idle_in_transaction_session_timeout: 30000  # ms — mata transacciones zombies
+
+  host: <%= ENV.fetch("DATABASE_HOST", "/var/run/postgresql") %>
+  username: <%= ENV.fetch("DATABASE_USER", nil) %>
+  password: <%= ENV.fetch("DATABASE_PASSWORD", nil) %>
+
+# ------------------------------------------------------------------------------
+development:
+  primary:
+    <<: *default
+    database: stock_development
+  cache:
+    <<: *default
+    database: stock_development_cache
+    migrations_paths: db/cache_migrate
+  queue:
+    <<: *default
+    database: stock_development_queue
+    migrations_paths: db/queue_migrate
+  cable:
+    <<: *default
+    database: stock_development_cable
+    migrations_paths: db/cable_migrate
+
+  # --- Ejemplo de réplica de lectura (descomentar si tenés una) ---------------
+  # replica:
+  #   <<: *default
+  #   database: stock_development
+  #   replica: true          # <- Rails NUNCA escribe acá y no corre migraciones
+  #   database_tasks: false  # <- ni db:migrate ni db:schema:dump
+
+# ------------------------------------------------------------------------------
+# La base de test se BORRA Y RECREA. Nunca la apuntes a development.
+#
+# ENV["TEST_ENV_NUMBER"] permite correr la suite en paralelo con
+# `bin/rails test:prepare` / `parallel_tests`: cada proceso usa stock_test1,
+# stock_test2, etc.
+test:
+  primary:
+    <<: *default
+    database: stock_test<%= ENV["TEST_ENV_NUMBER"] %>
+  queue:
+    <<: *default
+    database: stock_test_queue<%= ENV["TEST_ENV_NUMBER"] %>
+    migrations_paths: db/queue_migrate
+  cache:
+    <<: *default
+    database: stock_test_cache<%= ENV["TEST_ENV_NUMBER"] %>
+    migrations_paths: db/cache_migrate
+  cable:
+    <<: *default
+    database: stock_test_cable<%= ENV["TEST_ENV_NUMBER"] %>
+    migrations_paths: db/cable_migrate
+
+# ------------------------------------------------------------------------------
+# En producción NO ponemos credenciales acá. Rails levanta automáticamente
+# DATABASE_URL, y para las bases no-primarias usa <NOMBRE>_DATABASE_URL
+# (CACHE_DATABASE_URL, QUEUE_DATABASE_URL, CABLE_DATABASE_URL).
+production:
+  primary: &primary_production
+    <<: *default
+    url: <%= ENV["DATABASE_URL"] %>
+  cache:
+    <<: *primary_production
+    url: <%= ENV.fetch("CACHE_DATABASE_URL", nil) || ENV["DATABASE_URL"] %>
+    database: stock_production_cache
+    migrations_paths: db/cache_migrate
+  queue:
+    <<: *primary_production
+    url: <%= ENV.fetch("QUEUE_DATABASE_URL", nil) || ENV["DATABASE_URL"] %>
+    database: stock_production_queue
+    migrations_paths: db/queue_migrate
+  cable:
+    <<: *primary_production
+    url: <%= ENV.fetch("CABLE_DATABASE_URL", nil) || ENV["DATABASE_URL"] %>
+    database: stock_production_cable
+    migrations_paths: db/cable_migrate
