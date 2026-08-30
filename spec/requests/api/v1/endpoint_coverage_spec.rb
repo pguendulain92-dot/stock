@@ -67,29 +67,29 @@ RSpec.describe "API v1 · cobertura de endpoints", type: :request do
 
   # Cuerpos válidos para los POST que los necesitan.
   BODIES = {
-    "api/v1/stock_operations#receive" => -> (ctx) {
+    "api/v1/stock_operations#receive" => ->(ctx) {
       { sku: ctx[:product].sku, warehouse_code: ctx[:warehouse].code, quantity: 1 }
     },
-    "api/v1/stock_operations#issue" => -> (ctx) {
+    "api/v1/stock_operations#issue" => ->(ctx) {
       { sku: ctx[:product].sku, warehouse_code: ctx[:warehouse].code, quantity: 1 }
     },
-    "api/v1/stock_operations#adjust" => -> (ctx) {
+    "api/v1/stock_operations#adjust" => ->(ctx) {
       { sku: ctx[:product].sku, warehouse_code: ctx[:warehouse].code,
         counted_quantity: 99, reason: "smoke test" }
     },
-    "api/v1/reservations#create" => -> (ctx) {
+    "api/v1/reservations#create" => ->(ctx) {
       { sku: ctx[:product].sku, warehouse_code: ctx[:warehouse].code, quantity: 1 }
     },
-    "api/v1/products#create" => -> (_ctx) {
+    "api/v1/products#create" => ->(_ctx) {
       { product: { sku: "SMOKE-NEW", name: "Nuevo", cost_cents: 1, price_cents: 2 } }
     },
-    "api/v1/products#update" => -> (_ctx) { { product: { name: "Renombrado" } } },
-    "api/v1/stock_transfers#create" => -> (ctx) {
+    "api/v1/products#update" => ->(_ctx) { { product: { name: "Renombrado" } } },
+    "api/v1/stock_transfers#create" => ->(ctx) {
       { stock_transfer: { source_warehouse_code: ctx[:warehouse].code,
                           destination_warehouse_code: ctx[:destino].code,
                           lines: [ { sku: ctx[:product].sku, quantity: 1 } ] } }
     },
-    "api/v1/purchase_orders#create" => -> (ctx) {
+    "api/v1/purchase_orders#create" => ->(ctx) {
       { purchase_order: { supplier_tax_id: ctx[:supplier].tax_id,
                           warehouse_code: ctx[:warehouse].code,
                           lines: [ { sku: ctx[:product].sku, quantity: 1, unit_cost_cents: 100 } ] } }
