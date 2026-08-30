@@ -93,6 +93,12 @@ test:
   primary:
     <<: *default
     database: stock_test<%= ENV["TEST_ENV_NUMBER"] %>
+    # Pool más grande que en dev: los specs de concurrencia levantan varios
+    # threads REALES y cada uno necesita su propia conexión. Con el pool en 5,
+    # el sexto thread se queda esperando y el test falla con
+    # ActiveRecord::ConnectionTimeoutError — que es justamente el síntoma que
+    # vas a ver en producción si dimensionás mal el pool.
+    max_connections: 15
   queue:
     <<: *default
     database: stock_test_queue<%= ENV["TEST_ENV_NUMBER"] %>

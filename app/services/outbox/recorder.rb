@@ -70,16 +70,4 @@ module Outbox
       }.compact
     end
   end
-
-  # Doble de test / no-op. Lo inyectamos donde no queremos escribir eventos.
-  class NullRecorder
-    attr_reader :recorded
-
-    def initialize = @recorded = []
-
-    def record(aggregate:, event_type:, payload: {}, metadata: {}, occurred_at: Time.current)
-      @recorded << { aggregate:, event_type:, payload:, metadata:, occurred_at: }
-      nil
-    end
-  end
 end

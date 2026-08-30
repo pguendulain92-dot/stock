@@ -6,18 +6,23 @@ module ValueObjects
   #
   # ¿Por qué envolver un Integer? Porque un Integer pelado deja pasar bugs que
   # el tipo puede atrapar:
-  #   * sumar 5 kilos + 3 unidades  -> ahora explota en vez de dar "8"
-  #   * cantidades negativas donde no corresponde
+  #   * sumar 5 kilos + 3 unidades -> ahora explota en vez de dar "8"
   #   * la unidad "se pierde" al pasar de capa en capa
   #
-  # Es exactamente el argumento de "Primitive Obsession" de Fowler, y en Java
-  # lo resolverías con un record + validación en el constructor compacto.
+  # Es exactamente el argumento de "Primitive Obsession" de Fowler; en Java lo
+  # resolverías con un record + validación en el constructor compacto.
+  #
+  # Usamos `class Quantity < Data.define(...)` y no `Data.define do ... end`:
+  # el porqué está explicado en detalle en money.rb (spoiler: las constantes
+  # dentro del bloque se resuelven léxicamente y NO quedan anidadas).
   # ============================================================================
-  Quantity = Data.define(:amount, :unit) do
+  class Quantity < Data.define(:amount, :unit)
     UNITS = %w[unit kg g l ml m cm box pallet].freeze
 
     class UnitMismatch < StandardError; end
     class InvalidUnit < StandardError; end
+
+    include Comparable
 
     def initialize(amount:, unit: "unit")
       unit = unit.to_s
@@ -39,7 +44,6 @@ module ValueObjects
     def to_s = "#{amount} #{unit}"
     def as_json(*) = { amount:, unit: }
 
-    include Comparable
     def <=>(other)
       assert_same_unit!(other)
       amount <=> other.amount

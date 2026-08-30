@@ -42,10 +42,38 @@ module Api
 
     private
 
-    def idempotency_key = request.get_header(HEADER).presence
+    # La clave TAL COMO la mandó el cliente. Se usa sólo para el registro
+    # HTTP (tabla idempotency_keys), que ya está scopeado por usuario con un
+    # índice único sobre (user_id, key).
+    def raw_idempotency_key = request.get_header(HEADER).presence
+
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ CLAVE SCOPEADA POR USUARIO — bug encontrado escribiendo los tests.   │
+    # │                                                                      │
+    # │ Los controllers le pasan esta clave a los services, que la guardan   │
+    # │ en stock_movements.idempotency_key. Ese índice único es GLOBAL, no   │
+    # │ por usuario. Si pasáramos la clave cruda:                            │
+    # │                                                                      │
+    # │   * el usuario A manda Idempotency-Key: "pedido-1"                   │
+    # │   * el usuario B manda Idempotency-Key: "pedido-1" (¡otra empresa!)  │
+    # │   * el service encuentra el movimiento de A y le devuelve ESE.       │
+    # │                                                                      │
+    # │ O sea: B recibe datos de A (fuga de información) y su operación NO   │
+    # │ se ejecuta (pérdida de datos), en silencio. Con claves tipo          │
+    # │ "pedido-1" o "1" —que la gente usa— la colisión no es hipotética.    │
+    # │                                                                      │
+    # │ Prefijar con el id del usuario aísla los espacios de nombres. El     │
+    # │ test "las claves están SCOPEADAS POR USUARIO" cubre esta regresión.  │
+    # └──────────────────────────────────────────────────────────────────────┘
+    def idempotency_key
+      key = raw_idempotency_key
+      return nil if key.nil?
+
+      "u#{current_user&.id || 'anon'}:#{key}"
+    end
 
     def with_idempotency
-      key = idempotency_key
+      key = raw_idempotency_key
 
       # Sin header: se ejecuta normalmente. Lo hacemos opcional a propósito
       # (un GET no lo necesita y forzarlo rompería clientes existentes), pero

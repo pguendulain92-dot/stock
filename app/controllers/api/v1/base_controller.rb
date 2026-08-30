@@ -37,9 +37,21 @@ module Api
       # `store:` es importante: por defecto usa Rails.cache, que acá es Solid
       # Cache (Postgres). Para contadores de alta frecuencia preferimos Redis.
       # ------------------------------------------------------------------------
+      # ⚠️ UN RATE LIMITER SOBRE UN NULL STORE NO LIMITA NADA, Y NO AVISA.
+      # `rate_limit` hace `store.increment(...)`; ActiveSupport::Cache::NullStore
+      # devuelve nil, la comparación `count && count > to` nunca se cumple y el
+      # límite queda desactivado sin un solo mensaje. Es un fallo silencioso de
+      # seguridad: creés que estás protegido y no lo estás.
+      # Por eso elegimos el store explícitamente y avisamos si no sirve.
       RATE_LIMIT_STORE =
         if ENV["REDIS_URL"].present?
           ActiveSupport::Cache::RedisCacheStore.new(url: ENV["REDIS_URL"], namespace: "ratelimit")
+        elsif Rails.cache.is_a?(ActiveSupport::Cache::NullStore)
+          Rails.logger.warn(
+            "[RateLimit] Rails.cache es un NullStore: el rate limiting NO funcionaría. " \
+            "Usando un MemoryStore local (sólo válido para un único proceso)."
+          )
+          ActiveSupport::Cache::MemoryStore.new
         else
           Rails.cache
         end

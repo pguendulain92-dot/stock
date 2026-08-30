@@ -20,7 +20,13 @@
 # Comparación completa en docs/07.
 # ==============================================================================
 Rails.application.configure do
-  adapter = ENV.fetch("QUEUE_ADAPTER", Rails.env.production? ? "solid_queue" : "solid_queue")
+  # En TEST el adapter tiene que ser :test. Ese adapter NO ejecuta nada: sólo
+  # acumula los jobs encolados en un array que podés inspeccionar con los
+  # matchers `have_enqueued_job` / `perform_enqueued_jobs`. Si dejaras
+  # solid_queue en test, cada spec escribiría filas en la base de jobs y los
+  # tests se volverían lentos y acoplados entre sí.
+  default_adapter = Rails.env.test? ? "test" : "solid_queue"
+  adapter = ENV.fetch("QUEUE_ADAPTER", default_adapter)
 
   config.active_job.queue_adapter = adapter.to_sym
 
@@ -29,9 +35,7 @@ Rails.application.configure do
   # parece y es un desastre cuando pasa.
   config.active_job.queue_name_prefix = Rails.env.production? ? nil : Rails.env
 
-  if adapter == "solid_queue"
-    config.solid_queue.connects_to = { database: { writing: :queue } }
-  end
+  config.solid_queue.connects_to = { database: { writing: :queue } } if adapter == "solid_queue"
 
   # `default_queue_name`: si un job no declara `queue_as`, cae acá.
   config.active_job.default_queue_name = "default"

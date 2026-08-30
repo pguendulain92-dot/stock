@@ -41,3 +41,8 @@
 
 /app/assets/builds/*
 !/app/assets/builds/.keep
+
+# Cobertura de tests
+/coverage/
+/tmp/capybara/
+/tmp/rspec_examples.txt

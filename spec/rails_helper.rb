@@ -1,72 +1,79 @@
-# This file is copied to spec/ when you run 'rails generate rspec:install'
-require 'spec_helper'
-ENV['RAILS_ENV'] ||= 'test'
-require_relative '../config/environment'
-# Prevent database truncation if the environment is production
-abort("The Rails environment is running in production mode!") if Rails.env.production?
-# Uncomment the line below in case you have `--require rails_helper` in the `.rspec` file
-# that will avoid rails generators crashing because migrations haven't been run yet
-# return unless Rails.env.test?
-require 'rspec/rails'
-# Add additional requires below this line. Rails is not loaded until this point!
+# frozen_string_literal: true
 
-# Requires supporting ruby files with custom matchers and macros, etc, in
-# spec/support/ and its subdirectories. Files matching `spec/**/*_spec.rb` are
-# run as spec files by default. This means that files in spec/support that end
-# in _spec.rb will both be required and run as specs, causing the specs to be
-# run twice. It is recommended that you do not name files matching this glob to
-# end with _spec.rb. You can configure this pattern with the --pattern
-# option on the command line or in ~/.rspec, .rspec or `.rspec-local`.
+# ==============================================================================
+# rails_helper.rb — el bootstrap de la suite CON Rails cargado.
 #
-# The following line is provided for convenience purposes. It has the downside
-# of increasing the boot-up time by auto-requiring all files in the support
-# directory. Alternatively, in the individual `*_spec.rb` files, manually
-# require only the support files necessary.
-#
-# Rails.root.glob('spec/support/**/*.rb').sort_by(&:to_s).each { |f| require f }
+# La diferencia con spec_helper.rb: spec_helper NO carga Rails. Los tests que no
+# necesitan el framework (Value Objects, Result) sólo requieren spec_helper y
+# arrancan en ~50 ms en vez de ~3 s. En una suite grande eso se nota mucho.
+# ==============================================================================
 
-# Ensures that the test database schema matches the current schema file.
-# If there are pending migrations it will invoke `db:test:prepare` to
-# recreate the test database by loading the schema.
-# If you are not using ActiveRecord, you can remove these lines.
+require "spec_helper"
+
+ENV["RAILS_ENV"] ||= "test"
+require_relative "../config/environment"
+
+# Salvavidas: si por un error de configuración RAILS_ENV apuntara a producción,
+# la suite BORRARÍA la base de producción. Este abort ya salvó muchas empresas.
+abort("¡El entorno de Rails está en modo producción!") if Rails.env.production?
+
+require "rspec/rails"
+
+# Carga todo lo que haya en spec/support/. Sin esto tendrías que requerir cada
+# helper a mano en cada spec.
+Rails.root.glob("spec/support/**/*.rb").sort_by(&:to_s).each { |f| require f }
+
+# Verifica que el schema de test esté al día con db/migrate. Si te olvidaste de
+# correr las migraciones, te avisa en vez de fallar con errores raros de columnas.
 begin
   ActiveRecord::Migration.maintain_test_schema!
 rescue ActiveRecord::PendingMigrationError => e
   abort e.to_s.strip
 end
-RSpec.configure do |config|
-  # Remove this line if you're not using ActiveRecord or ActiveRecord fixtures
-  config.fixture_paths = [
-    Rails.root.join('spec/fixtures')
-  ]
 
-  # If you're not using ActiveRecord, or you'd prefer not to run each of your
-  # examples within a transaction, remove the following line or assign false
-  # instead of true.
+RSpec.configure do |config|
+  config.fixture_paths = [ Rails.root.join("spec/fixtures") ]
+
+  # ── TRANSACTIONAL FIXTURES ────────────────────────────────────────────────
+  # Cada ejemplo corre dentro de una transacción que se revierte al terminar.
+  # Es MUCHÍSIMO más rápido que truncar tablas: el rollback es O(1).
+  #
+  # LIMITACIÓN IMPORTANTE: si el código bajo test corre en OTRO hilo con OTRA
+  # conexión (tests de concurrencia, system tests con un server aparte), ese
+  # hilo NO ve los datos de tu transacción sin commitear. Por eso los specs de
+  # concurrencia desactivan esto explícitamente (ver spec/support/concurrency.rb).
   config.use_transactional_fixtures = true
 
-  # You can uncomment this line to turn off ActiveRecord support entirely.
-  # config.use_active_record = false
+  # Infiere el tipo de spec por la carpeta (spec/models -> :model, etc).
+  config.infer_spec_type_from_file_location!
 
-  # RSpec Rails uses metadata to mix in different behaviours to your tests,
-  # for example enabling you to call `get` and `post` in request specs. e.g.:
-  #
-  #     RSpec.describe UsersController, type: :request do
-  #       # ...
-  #     end
-  #
-  # The different available types are documented in the features, such as in
-  # https://rspec.info/features/8-0/rspec-rails
-  #
-  # You can also infer these behaviours automatically by location, e.g.
-  # /spec/models would pull in the same behaviour as `type: :model` but this
-  # behaviour is considered legacy and will be removed in a future version.
-  #
-  # To enable this behaviour uncomment the line below.
-  # config.infer_spec_type_from_file_location!
-
-  # Filter lines from Rails gems in backtraces.
+  # Recorta el backtrace de las gemas: querés ver TU código, no 40 líneas de rspec.
   config.filter_rails_from_backtrace!
-  # arbitrary gems may also be filtered via:
-  # config.filter_gems_from_backtrace("gem name")
+
+  # ── Helpers disponibles en los specs ──────────────────────────────────────
+  config.include FactoryBot::Syntax::Methods            # create(:product) sin prefijo
+  config.include ActiveSupport::Testing::TimeHelpers    # travel_to, freeze_time
+  config.include ActiveJob::TestHelper, type: :job
+  config.include ApiHelpers, type: :request
+  config.include AuthHelpers, type: :system
+
+  # ── Bullet: los N+1 ROMPEN la suite ───────────────────────────────────────
+  # Es la única forma de que un N+1 no se cuele: que el CI falle.
+  if defined?(Bullet)
+    config.before(:each, :n_plus_one) do
+      Bullet.start_request
+    end
+    config.after(:each, :n_plus_one) do
+      Bullet.perform_out_of_channel_notifications if Bullet.notification?
+      Bullet.end_request
+    end
+  end
+
+  # Limpia el estado GLOBAL entre ejemplos. Si no lo hacés, un spec que setea
+  # Current.user contamina al siguiente y aparecen fallas dependientes del orden
+  # —el tipo de bug más frustrante que existe.
+  config.before do
+    Current.reset
+    Rails.cache.clear
+  end
 end

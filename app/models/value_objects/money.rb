@@ -13,14 +13,36 @@ module ValueObjects
   #
   # Lo que hace este objeto y que un `Integer` pelado no puede:
   #   * Impide sumar USD con EUR (te tira una excepción, no un número mal).
-  #   * Centraliza el redondeo (banker's rounding para no sesgar hacia arriba).
+  #   * Centraliza el redondeo.
   #   * Se formatea solo.
   #
   # Es un Value Object de DDD: sin identidad, inmutable, comparado por valor.
-  # `Data.define` te da ==, hash y freeze gratis (equivale a un record de Java
-  # con equals/hashCode generados).
+  #
+  # ─── POR QUÉ `class Money < Data.define(...)` Y NO `Data.define do ... end` ──
+  #
+  # Las dos formas existen, pero NO son equivalentes, y la diferencia nos mordió
+  # de verdad al escribir los tests:
+  #
+  #     Money = Data.define(:cents, :currency) do
+  #       class CurrencyMismatch < StandardError; end   # ❌
+  #     end
+  #
+  # Eso NO define `ValueObjects::Money::CurrencyMismatch`. Define
+  # `ValueObjects::CurrencyMismatch`. ¿Por qué? Porque `Data.define` recibe un
+  # BLOQUE y lo evalúa con `class_eval`, y en Ruby las constantes se resuelven
+  # LÉXICAMENTE: por el lugar del código donde están ESCRITAS, no por el
+  # receptor del class_eval. Como el bloque está escrito dentro de
+  # `module ValueObjects`, la constante aterriza ahí.
+  #
+  # (El mismo mecanismo explica por qué `Foo.class_eval { class Bar; end }` no
+  # crea `Foo::Bar`. Es una de las diferencias más confusas entre `class_eval`
+  # con bloque y con string.)
+  #
+  # Con la forma de HERENCIA (`class Money < Data.define(...)`) el cuerpo es una
+  # definición de clase normal, el scope léxico es el correcto y todo funciona
+  # como esperás. Es la forma idiomática y la que recomienda la documentación.
   # ============================================================================
-  Money = Data.define(:cents, :currency) do
+  class Money < Data.define(:cents, :currency)
     SUBUNITS = {
       "USD" => 100, "EUR" => 100, "ARS" => 100, "BRL" => 100,
       "CLP" => 1,   # el peso chileno NO tiene centavos
@@ -28,6 +50,8 @@ module ValueObjects
     }.freeze
 
     class CurrencyMismatch < StandardError; end
+
+    include Comparable
 
     class << self
       def zero(currency = "USD") = new(cents: 0, currency:)
@@ -70,7 +94,6 @@ module ValueObjects
     def as_json(*) = { cents:, currency:, formatted: to_s }
 
     # Comparable: habilita <, >, sort, min, max, clamp.
-    include Comparable
     def <=>(other)
       assert_same_currency!(other)
       cents <=> other.cents

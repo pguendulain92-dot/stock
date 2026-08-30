@@ -198,9 +198,25 @@ group :test do
   # Graba/reproduce interacciones HTTP reales en "cassettes" YAML.
   gem "vcr", "~> 6.3"
 
-  # Tests de sistema (browser real, headless). Capybara maneja el DSL,
-  # selenium-webdriver maneja el Chrome headless.
+  # Tests de sistema (browser real, headless). Capybara maneja el DSL; el
+  # "driver" es quien habla con el browser. Tenemos los dos:
+  #
+  #   selenium-webdriver -> el estándar. Habla WebDriver (W3C) y necesita un
+  #     BINARIO INTERMEDIO (chromedriver) cuya versión MAYOR tiene que coincidir
+  #     con la del Chrome instalado. Es la fuente número uno de "el CI se rompió
+  #     solo": Chrome se autoactualiza y el driver queda viejo.
+  #
+  #   cuprite (sobre Ferrum) -> habla el Chrome DevTools Protocol DIRECTO, sin
+  #     chromedriver. No hay versión que sincronizar, arranca más rápido y da
+  #     acceso a cosas que WebDriver no expone (interceptar red, medir tiempos,
+  #     leer la consola del browser). Contra: es específico de Chromium (Selenium
+  #     también maneja Firefox y Safari) y tiene menos usuarios.
+  #
+  # Usamos cuprite por defecto justamente porque en este entorno el chromedriver
+  # disponible (147) no coincide con el Chromium instalado (141). Es el problema
+  # que cuprite elimina de raíz.
   gem "capybara", "~> 3.40"
+  gem "cuprite", "~> 0.17"
   gem "selenium-webdriver", "~> 4.27"
 
   # Congelar/viajar en el tiempo. (ActiveSupport ya trae TimeHelpers; esto es

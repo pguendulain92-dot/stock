@@ -20,7 +20,19 @@ Rails.application.configure do
 
   # Show full error reports.
   config.consider_all_requests_local = true
-  config.cache_store = :null_store
+  # ── Por qué :memory_store y no :null_store ──────────────────────────────────
+  # El default de Rails en test es :null_store, para que ningún test dependa
+  # sin querer de un valor cacheado. Suena razonable, pero tiene una
+  # consecuencia grave: TODO lo que se apoya en el cache deja de funcionar EN
+  # SILENCIO. En particular el rate limiting (que cuenta con
+  # `store.increment`): con un null store, `increment` devuelve nil, la
+  # comparación nunca supera el límite y tus tests de rate limiting dan verde
+  # sin probar nada. Nos pasó exactamente eso escribiendo esta suite.
+  #
+  # Con :memory_store el cache funciona de verdad, y limpiamos entre ejemplos
+  # (ver el `config.before` de spec/rails_helper.rb) para que no haya
+  # dependencia de orden.
+  config.cache_store = :memory_store
 
   # Render exception templates for rescuable exceptions and raise for other exceptions.
   config.action_dispatch.show_exceptions = :rescuable
@@ -50,4 +62,13 @@ Rails.application.configure do
 
   # Raise error when a before_action's only/except options reference missing actions.
   config.action_controller.raise_on_missing_callback_actions = true
+
+  # ── Rack::Attack apagado por defecto en test ────────────────────────────────
+  # Si lo dejaras prendido, los contadores se comparten entre ejemplos y
+  # cualquier spec que haga muchas requests empieza a recibir 429 al azar.
+  # Los specs que SÍ prueban el rate limiting lo encienden a mano
+  # (ver spec/requests/api/v1/rate_limiting_spec.rb).
+  config.after_initialize do
+    Rack::Attack.enabled = false
+  end
 end
