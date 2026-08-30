@@ -65,3 +65,107 @@ jobs:
       - name: Lint code for consistent style
         run: bin/rubocop -f github
 
+  # ============================================================================
+  # LA SUITE DE TESTS
+  #
+  # `rails new --skip-test` no genera este job porque no sabe qué framework vas
+  # a usar. Lo agregamos nosotros.
+  #
+  # Puntos que valen para cualquier CI de Rails:
+  #
+  #  * `services:` levanta Postgres y Redis en contenedores paralelos al job.
+  #    El `--health-cmd` es CRÍTICO: sin él, el job arranca antes de que la base
+  #    esté aceptando conexiones y falla de forma intermitente (el clásico
+  #    "en mi máquina anda").
+  #
+  #  * `bundler-cache: true` cachea las gemas entre corridas. Es el 80% del
+  #    tiempo de un CI de Rails la primera vez.
+  #
+  #  * `db:test:prepare` carga db/schema.rb. NO corre las migraciones una por
+  #    una: es mucho más rápido y además detecta si alguien commiteó una
+  #    migración sin regenerar el schema.
+  #
+  #  * Los artefactos de los tests fallidos (screenshots de Capybara) se suben
+  #    con `if: failure()`. Sin eso, debuggear un system test que sólo falla en
+  #    CI es adivinar.
+  # ============================================================================
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      RAILS_ENV: test
+      DATABASE_HOST: localhost
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      REDIS_URL: redis://localhost:6379/0
+      # Pool más grande que los threads: los specs de concurrencia levantan
+      # varios threads reales y cada uno necesita su propia conexión.
+      RAILS_MAX_THREADS: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y
+             build-essential git libpq-dev pkg-config google-chrome-stable
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Prepare database
+        run: bin/rails db:test:prepare
+
+      - name: Run tests
+        env:
+          COVERAGE: "1"
+          # Chrome de verdad para los system tests con js: true.
+          CHROME_BIN: /usr/bin/google-chrome
+        run: bundle exec rspec
+
+      - name: Verify factories are all valid
+        env:
+          LINT_FACTORIES: "1"
+        run: bundle exec rspec spec/lib
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capybara-screenshots
+          path: tmp/capybara/
+          if-no-files-found: ignore
