@@ -1,0 +1,25 @@
+<%= form_with model: supplier, class: "space-y-4" do |f| %>
+  <% if supplier.errors.any? %>
+    <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+      <ul class="list-disc pl-5"><% supplier.errors.full_messages.each do |m| %><li><%= m %></li><% end %></ul>
+    </div>
+  <% end %>
+  <div class="grid gap-4 sm:grid-cols-2">
+    <div><%= f.label :name, "Nombre", class: "block text-sm font-medium" %>
+      <%= f.text_field :name, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %></div>
+    <div><%= f.label :tax_id, "CUIT / Tax ID", class: "block text-sm font-medium" %>
+      <%= f.text_field :tax_id, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm shadow-sm" %></div>
+    <div><%= f.label :email, "Email", class: "block text-sm font-medium" %>
+      <%= f.email_field :email, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %></div>
+    <div><%= f.label :phone, "Teléfono", class: "block text-sm font-medium" %>
+      <%= f.text_field :phone, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %></div>
+    <div><%= f.label :default_lead_time_days, "Lead time (días)", class: "block text-sm font-medium" %>
+      <%= f.number_field :default_lead_time_days, min: 0, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %></div>
+    <div class="flex items-end gap-2">
+      <%= f.check_box :active, class: "rounded border-slate-300" %><%= f.label :active, "Activo", class: "text-sm" %></div>
+  </div>
+  <div class="flex gap-2">
+    <%= f.submit class: "rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700" %>
+    <%= link_to "Cancelar", suppliers_path, class: "rounded-md border border-slate-300 bg-white px-4 py-2 text-sm" %>
+  </div>
+<% end %>

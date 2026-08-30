@@ -1,12 +1,55 @@
+# ==============================================================================
+# Configuración de Solid Queue (el worker que corre con bin/jobs).
+#
+# CÓMO FUNCIONA SOLID QUEUE POR DENTRO (pregunta de entrevista):
+#   * Los jobs son FILAS en Postgres (solid_queue_jobs + tablas de ejecución).
+#   * Un "dispatcher" mueve jobs programados a la cola de listos.
+#   * Los "workers" hacen polling con
+#         SELECT ... FOR UPDATE SKIP LOCKED LIMIT n
+#     que es la misma primitiva que usamos en el outbox: varios workers se
+#     reparten el trabajo sin coordinarse ni bloquearse entre sí.
+#   * Hay "semáforos" (solid_queue_semaphores) para concurrencia limitada.
+#
+# VS SIDEKIQ (Redis):
+#   Solid Queue  -> menos infraestructura, jobs DURABLES y transaccionales con
+#                   tus datos (podés encolar dentro de la misma transacción),
+#                   latencia de polling (~0.1-1s), throughput más bajo.
+#   Sidekiq      -> latencia sub-milisegundo, throughput altísimo, PERO Redis es
+#                   otro sistema que mantener y por defecto NO es durable
+#                   (un `enqueue` puede perderse si Redis se cae sin snapshot).
+#
+# REGLA PRÁCTICA: si tus jobs son < 10k/min, Solid Queue alcanza y te ahorra
+# medio stack. Si necesitás latencia mínima o millones de jobs, Sidekiq.
+#
+# `polling_interval` es el trade-off central: bajarlo reduce la latencia y sube
+# la carga de la base (cada worker hace una query por intervalo).
+# ==============================================================================
 default: &default
   dispatchers:
     - polling_interval: 1
       batch_size: 500
+      # Jobs "concurrency limited": los que esperan un semáforo libre.
+      concurrency_maintenance_interval: 600
   workers:
-    - queues: "*"
+    # Cola crítica: pocas cosas, atendidas ya.
+    - queues: [ critical ]
       threads: 3
-      processes: <%= ENV.fetch("JOB_CONCURRENCY", 1) %>
+      polling_interval: 0.1
+      processes: 1
+
+    # El outbox necesita latencia baja: son los eventos que ven otros sistemas.
+    - queues: [ outbox ]
+      threads: 2
+      polling_interval: 0.5
+      processes: 1
+
+    # `*` toma TODO lo demás. El orden del array ES la prioridad: primero
+    # default, después mailers, después maintenance. Un worker que puede tomar
+    # todo evita que una cola quede sin atender por falta de proceso dedicado.
+    - queues: [ default, mailers, maintenance, "*" ]
+      threads: 5
       polling_interval: 1
+      processes: 1
 
 development:
   <<: *default
@@ -16,3 +59,16 @@ test:
 
 production:
   <<: *default
+  workers:
+    - queues: [ critical ]
+      threads: 5
+      polling_interval: 0.1
+      processes: 2
+    - queues: [ outbox ]
+      threads: 3
+      polling_interval: 0.5
+      processes: 2
+    - queues: [ default, mailers, maintenance, "*" ]
+      threads: 5
+      polling_interval: 1
+      processes: 3

@@ -1,0 +1,25 @@
+<% content_for :title, "Movimientos" %>
+<%= render "shared/page_header", title: "Libro de movimientos",
+      subtitle: "Registro inmutable de todo lo que entró y salió" %>
+
+<%= form_with url: stock_movements_path, method: :get, class: "mb-4 flex flex-wrap gap-2" do |f| %>
+  <%= f.select :warehouse_id, options_from_collection_for_select(@warehouses, :id, :code, params[:warehouse_id]),
+        { include_blank: "Todos los depósitos" }, class: "rounded-md border-slate-300 text-sm shadow-sm" %>
+  <%= f.select :kind, options_for_select(StockMovement::KINDS.map { |k| [k.humanize, k] }, params[:kind]),
+        { include_blank: "Todos los tipos" }, class: "rounded-md border-slate-300 text-sm shadow-sm" %>
+  <%= f.submit "Filtrar", class: "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50" %>
+<% end %>
+
+<div class="overflow-hidden rounded-xl border border-slate-200 bg-white">
+  <%= render "table", movements: @movements %>
+</div>
+
+<%# PAGINACIÓN POR CURSOR: no hay "página 5", hay "siguiente". Es lo correcto
+    para un log que crece: ver app/queries/stock_movements/ledger.rb %>
+<% if @next_cursor %>
+  <div class="mt-4 text-center">
+    <%= link_to "Cargar más →",
+          stock_movements_path(request.query_parameters.merge(cursor: @next_cursor)),
+          class: "inline-block rounded-md border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50" %>
+  </div>
+<% end %>

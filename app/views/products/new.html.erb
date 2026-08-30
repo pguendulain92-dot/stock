@@ -1,0 +1,5 @@
+<% content_for :title, "Nuevo producto" %>
+<%= render "shared/page_header", title: "Nuevo producto" %>
+<div class="max-w-3xl rounded-xl border border-slate-200 bg-white p-6">
+  <%= render "form", product: @product %>
+</div>

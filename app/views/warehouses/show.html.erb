@@ -1,0 +1,25 @@
+<% content_for :title, @warehouse.code %>
+<%= render "shared/page_header", title: @warehouse.to_s, subtitle: @warehouse.address,
+      actions: (policy(@warehouse).update? ? link_to("Editar", edit_warehouse_path(@warehouse.code), class: "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50") : nil) %>
+
+<div class="overflow-hidden rounded-xl border border-slate-200 bg-white">
+  <table class="min-w-full divide-y divide-slate-200 text-sm">
+    <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+      <tr><th class="px-4 py-2">SKU</th><th class="px-4 py-2">Producto</th>
+      <th class="px-4 py-2 text-right">En mano</th><th class="px-4 py-2 text-right">Disponible</th>
+      <th class="px-4 py-2">Ubicación</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100">
+      <% @stock_items.each do |item| %>
+        <tr class="hover:bg-slate-50">
+          <td class="px-4 py-2 font-mono"><%= link_to item.product.sku, stock_item_path(item), class: "hover:underline" %></td>
+          <td class="px-4 py-2"><%= truncate(item.product.name, length: 45) %></td>
+          <td class="px-4 py-2 text-right font-mono"><%= item.quantity_on_hand %></td>
+          <td class="px-4 py-2 text-right font-mono <%= stock_level_class(item) %>"><%= item.quantity_available %></td>
+          <td class="px-4 py-2 text-xs text-slate-400"><%= item.bin_location %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+</div>
+<div class="mt-4"><%== pagy_nav(@pagy) %></div>

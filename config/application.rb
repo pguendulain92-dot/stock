@@ -28,6 +28,29 @@ module Stock
     # Common ones are `templates`, `generators`, or `middleware`, for example.
     config.autoload_lib(ignore: %w[assets tasks])
 
+    # ─── Rate limiting de borde ─────────────────────────────────────────────
+    #
+    # DÓNDE VA EN EL STACK: esta decisión tiene una trampa importante.
+    #
+    # El instinto es `insert_before 0` (lo más arriba posible) para cortar antes
+    # de gastar nada. PERO ahí Rack::Attack corre ANTES de
+    # ActionDispatch::RemoteIp, y entonces `request.ip` es la IP del PEER TCP:
+    # detrás de un load balancer, eso es la IP DEL BALANCEADOR. Resultado: TODOS
+    # tus usuarios comparten un único contador y el primero que haga 300
+    # requests deja afuera a todo el mundo.
+    #
+    # ActionDispatch::RemoteIp es el que interpreta X-Forwarded-For descartando
+    # los proxies de confianza (config.action_dispatch.trusted_proxies). Por eso
+    # insertamos DESPUÉS de él: seguimos estando muy arriba (antes de la sesión,
+    # el routing y los controllers) pero ya con la IP del cliente real.
+    #
+    # ⚠️ Y NUNCA confíes en X-Forwarded-For sin configurar `trusted_proxies`:
+    # es un header que manda el CLIENTE y lo puede falsificar para evadir el
+    # rate limit. RemoteIp sólo lo respeta viniendo de un proxy conocido.
+    #
+    # Mirá el stack completo con: bin/rails middleware
+    config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
+
     # Configuration for the application, engines, and railties goes here.
     #
     # These settings can be overridden in specific environments using the files

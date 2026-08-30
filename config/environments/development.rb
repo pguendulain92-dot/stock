@@ -26,7 +26,12 @@ Rails.application.configure do
   end
 
   # Change to :null_store to avoid any caching.
-  config.cache_store = :memory_store
+  # En desarrollo usamos Solid Cache (la misma implementación que producción)
+  # para que el comportamiento del cache sea el mismo en los dos lados. Con
+  # :memory_store, un bug de serialización de cache aparece recién en prod.
+  config.cache_store = :solid_cache_store
+  config.solid_cache.connects_to = { database: { writing: :cache } }
+  config.solid_queue.connects_to = { database: { writing: :queue } }
 
   # Store uploaded files on the local file system (see config/storage.yml for options).
   config.active_storage.service = :local

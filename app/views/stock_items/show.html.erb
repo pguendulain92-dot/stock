@@ -1,0 +1,80 @@
+<% content_for :title, "#{@stock_item.product.sku} @ #{@stock_item.warehouse.code}" %>
+
+<%= render "shared/page_header",
+      title: "#{@stock_item.product.sku} @ #{@stock_item.warehouse.code}",
+      subtitle: @stock_item.product.name %>
+
+<div class="grid gap-4 sm:grid-cols-4">
+  <%= render "shared/stat_card", label: "En mano", value: @stock_item.quantity_on_hand %>
+  <%= render "shared/stat_card", label: "Reservado", value: @stock_item.quantity_reserved %>
+  <%= render "shared/stat_card", label: "Disponible", value: @stock_item.quantity_available,
+        tone: @stock_item.below_reorder_point? ? "text-amber-600" : "text-slate-900" %>
+  <%= render "shared/stat_card", label: "Valuación", value: money(@stock_item.valuation) %>
+</div>
+
+<div class="mt-8 grid gap-4 lg:grid-cols-3">
+  <% if policy(@stock_item).receive? %>
+    <form action="<%= receive_stock_item_path(@stock_item) %>" method="post"
+          class="rounded-xl border border-emerald-200 bg-emerald-50/40 p-4">
+      <%= hidden_field_tag :authenticity_token, form_authenticity_token %>
+      <h3 class="text-sm font-semibold text-emerald-900">Ingresar mercadería</h3>
+      <input type="number" name="quantity" min="1" required placeholder="Cantidad"
+             class="mt-2 w-full rounded-md border-slate-300 text-sm shadow-sm">
+      <input type="text" name="reason" placeholder="Motivo (opcional)"
+             class="mt-2 w-full rounded-md border-slate-300 text-sm shadow-sm">
+      <button class="mt-3 w-full rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700">
+        Ingresar
+      </button>
+    </form>
+  <% end %>
+
+  <% if policy(@stock_item).issue? %>
+    <form action="<%= issue_stock_item_path(@stock_item) %>" method="post"
+          class="rounded-xl border border-rose-200 bg-rose-50/40 p-4">
+      <%= hidden_field_tag :authenticity_token, form_authenticity_token %>
+      <h3 class="text-sm font-semibold text-rose-900">Egresar mercadería</h3>
+      <input type="number" name="quantity" min="1" max="<%= @stock_item.quantity_available %>" required
+             placeholder="Cantidad (máx. <%= @stock_item.quantity_available %>)"
+             class="mt-2 w-full rounded-md border-slate-300 text-sm shadow-sm">
+      <input type="text" name="reason" placeholder="Motivo (opcional)"
+             class="mt-2 w-full rounded-md border-slate-300 text-sm shadow-sm">
+      <button class="mt-3 w-full rounded-md bg-rose-600 px-3 py-2 text-sm font-medium text-white hover:bg-rose-700">
+        Egresar
+      </button>
+    </form>
+  <% end %>
+
+  <% if policy(@stock_item).adjust? %>
+    <form action="<%= adjust_stock_item_path(@stock_item) %>" method="post"
+          class="rounded-xl border border-violet-200 bg-violet-50/40 p-4">
+      <%= hidden_field_tag :authenticity_token, form_authenticity_token %>
+      <h3 class="text-sm font-semibold text-violet-900">Ajuste por conteo</h3>
+      <input type="number" name="counted_quantity" min="0" required placeholder="Cantidad contada"
+             class="mt-2 w-full rounded-md border-slate-300 text-sm shadow-sm">
+      <input type="text" name="reason" required placeholder="Motivo (obligatorio)"
+             class="mt-2 w-full rounded-md border-slate-300 text-sm shadow-sm">
+      <button class="mt-3 w-full rounded-md bg-violet-600 px-3 py-2 text-sm font-medium text-white hover:bg-violet-700">
+        Ajustar
+      </button>
+    </form>
+  <% end %>
+</div>
+
+<% if @reservations.any? %>
+  <section class="mt-8 rounded-xl border border-slate-200 bg-white">
+    <header class="border-b border-slate-200 px-4 py-3"><h2 class="text-sm font-semibold">Reservas activas</h2></header>
+    <ul class="divide-y divide-slate-100 text-sm">
+      <% @reservations.each do |r| %>
+        <li class="flex items-center justify-between px-4 py-2">
+          <span><%= status_badge(r.status) %> <strong><%= r.quantity %></strong> unidades</span>
+          <span class="text-xs text-slate-400">vence <%= time_ago_in_words(r.expires_at) %></span>
+        </li>
+      <% end %>
+    </ul>
+  </section>
+<% end %>
+
+<section class="mt-8 rounded-xl border border-slate-200 bg-white">
+  <header class="border-b border-slate-200 px-4 py-3"><h2 class="text-sm font-semibold">Historial</h2></header>
+  <%= render "stock_movements/table", movements: @movements %>
+</section>

@@ -29,9 +29,25 @@ class Product < ApplicationRecord
   normalizes :sku, with: ->(s) { s.to_s.strip.upcase }
   normalizes :barcode, with: ->(b) { b.to_s.strip.presence }
 
+  # ¡OJO CON LOS ANCLAS DEL REGEX EN RUBY!
+  #
+  # En Ruby, `^` y `$` significan "principio/fin de LÍNEA", no de string
+  # (a diferencia de Java, donde por defecto son principio/fin de INPUT).
+  # O sea que /^[A-Z0-9]+$/ acepta ESTO:
+  #
+  #     "VALIDO\n<script>alert(1)</script>"
+  #
+  # ...porque la PRIMERA LÍNEA cumple. Es una vulnerabilidad clásica de Rails y
+  # sale en todos los checklists de seguridad. La forma correcta es SIEMPRE
+  # `\A` (principio de string) y `\z` (fin de string, sin permitir el \n final
+  # que sí permite `\Z`). Brakeman marca esto automáticamente.
+  #
+  # Nota: [A-Z] es ASCII puro, así que un SKU con Ñ o acentos se rechaza. Es
+  # deliberado: los SKUs viajan por códigos de barras, EDI y sistemas legacy
+  # que suelen no ser UTF-8.
   validates :sku, presence: true, uniqueness: true,
             format: { with: /\A[A-Z0-9][A-Z0-9._-]{1,31}\z/,
-                      message: "2-32 caracteres alfanuméricos, punto, guion o guion bajo" }
+                      message: "2-32 caracteres alfanuméricos ASCII, punto, guion o guion bajo" }
   validates :name, presence: true, length: { maximum: 200 }
   validates :unit, inclusion: { in: UNITS }
   validates :currency, format: { with: /\A[A-Z]{3}\z/ }

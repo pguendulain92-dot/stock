@@ -1,0 +1,52 @@
+<% content_for :title, "Productos" %>
+
+<%= render "shared/page_header", title: "Productos",
+      subtitle: "#{number_with_delimiter(@pagy.count)} productos en el catálogo",
+      actions: (policy(Product).create? ? link_to("Nuevo producto", new_product_path, class: "rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700") : nil) %>
+
+<%= form_with url: products_path, method: :get, class: "mb-4 flex flex-wrap gap-2" do |f| %>
+  <%= f.search_field :q, value: params[:q], placeholder: "Buscar por SKU, nombre o código de barras…",
+        class: "w-full max-w-md rounded-md border-slate-300 text-sm shadow-sm sm:w-auto" %>
+  <%= f.select :sort, options_for_select(
+        [["Nombre", "name"], ["SKU", "sku"], ["Más nuevos", "newest"], ["Precio", "price"]], params[:sort]),
+        {}, class: "rounded-md border-slate-300 text-sm shadow-sm" %>
+  <%= f.submit "Filtrar", class: "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50" %>
+<% end %>
+
+<% if @products.empty? %>
+  <%= render "shared/empty", message: "No hay productos que coincidan con la búsqueda." %>
+<% else %>
+  <div class="overflow-hidden rounded-xl border border-slate-200 bg-white">
+    <table class="min-w-full divide-y divide-slate-200 text-sm">
+      <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+        <tr>
+          <th class="px-4 py-2.5">SKU</th>
+          <th class="px-4 py-2.5">Nombre</th>
+          <th class="px-4 py-2.5">Categoría</th>
+          <th class="px-4 py-2.5 text-right">Costo</th>
+          <th class="px-4 py-2.5 text-right">Precio</th>
+          <th class="px-4 py-2.5 text-right">Disponible</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100">
+        <% @products.each do |product| %>
+          <tr class="hover:bg-slate-50">
+            <td class="px-4 py-2.5 font-mono">
+              <%= link_to product.sku, product_path(product.sku), class: "font-medium hover:underline" %>
+            </td>
+            <td class="px-4 py-2.5"><%= truncate(product.name, length: 55) %></td>
+            <%# product.category NO dispara query: el query object hizo includes(:category) %>
+            <td class="px-4 py-2.5 text-slate-500"><%= product.category&.name || "—" %></td>
+            <td class="px-4 py-2.5 text-right font-mono text-slate-600"><%= money(product.cost) %></td>
+            <td class="px-4 py-2.5 text-right font-mono"><%= money(product.price) %></td>
+            <%# @availability se calculó con UNA query agregada en el controller %>
+            <td class="px-4 py-2.5 text-right font-mono font-semibold">
+              <%= @availability.dig(product.id, :available) || 0 %>
+            </td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  </div>
+  <div class="mt-4"><%== pagy_nav(@pagy) %></div>
+<% end %>

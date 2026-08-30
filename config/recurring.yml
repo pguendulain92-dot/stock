@@ -1,15 +1,44 @@
-# examples:
-#   periodic_cleanup:
-#     class: CleanSoftDeletedRecordsJob
-#     queue: background
-#     args: [ 1000, { batch_size: 500 } ]
-#     schedule: every hour
-#   periodic_cleanup_with_command:
-#     command: "SoftDeletedRecord.due.delete_all"
-#     priority: 2
-#     schedule: at 5am every day
+# ==============================================================================
+# Jobs recurrentes de Solid Queue — el "cron" que vive dentro de la app.
+#
+# VENTAJAS sobre el cron del sistema operativo:
+#   * Está versionado en git junto al código que ejecuta.
+#   * Corre en UNA sola instancia aunque tengas 10 servidores (Solid Queue usa
+#     un lock para elegir el líder). Con crontab en 10 máquinas, el job corre
+#     10 veces — y ese es un bug de producción clásico y carísimo.
+#   * Se ve en el dashboard de Mission Control como cualquier otro job.
+#
+# El formato de `schedule` es cron estándar de 5 campos, o los atajos de
+# Fugit ("every 5 minutes", "every day at 3am").
+#
+# OJO CON LA ZONA HORARIA: se interpreta en `Time.zone` de la app. Si tu app
+# está en UTC y el negocio en Buenos Aires, "3am" es medianoche allá. Definir
+# explícitamente config.time_zone evita el clásico "el reporte diario salió con
+# 3 horas de diferencia después del cambio de horario".
+# ==============================================================================
+default: &default
+  expire_reservations:
+    class: Stock::ExpireReservationsJob
+    schedule: every minute
+
+  publish_outbox:
+    class: Outbox::PublishPendingJob
+    schedule: every minute
+
+  low_stock_scan:
+    class: Stock::LowStockAlertJob
+    schedule: every hour
+
+  reconcile_balances:
+    class: Stock::ReconcileBalancesJob
+    schedule: every day at 3am
+
+  cleanup:
+    class: Cleanup::ExpiredRecordsJob
+    schedule: every day at 4am
+
+development:
+  <<: *default
 
 production:
-  clear_solid_queue_finished_jobs:
-    command: "SolidQueue::Job.clear_finished_in_batches(sleep_between_batches: 0.3)"
-    schedule: every hour at minute 12
+  <<: *default

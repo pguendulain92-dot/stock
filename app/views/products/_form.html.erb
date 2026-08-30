@@ -1,0 +1,73 @@
+<%# `form_with model:` genera el POST o el PATCH según el objeto esté nuevo o
+    persistido, y arma los name= como product[campo]. Eso es lo que espera
+    `params.require(:product).permit(...)` del controller. %>
+<%= form_with model: product, class: "space-y-5" do |f| %>
+  <% if product.errors.any? %>
+    <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+      <p class="font-medium"><%= pluralize(product.errors.count, "error") %> impidieron guardar:</p>
+      <ul class="mt-1 list-disc pl-5">
+        <% product.errors.full_messages.each do |msg| %><li><%= msg %></li><% end %>
+      </ul>
+    </div>
+  <% end %>
+
+  <%# Campo oculto con lock_version: habilita el optimistic locking en el form.
+      Si otro usuario guardó mientras editabas, el update tira StaleObjectError. %>
+  <%= f.hidden_field :lock_version %>
+
+  <div class="grid gap-4 sm:grid-cols-2">
+    <div>
+      <%= f.label :sku, "SKU", class: "block text-sm font-medium" %>
+      <%= f.text_field :sku, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm shadow-sm" %>
+    </div>
+    <div>
+      <%= f.label :name, "Nombre", class: "block text-sm font-medium" %>
+      <%= f.text_field :name, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+    </div>
+  </div>
+
+  <div>
+    <%= f.label :description, "Descripción", class: "block text-sm font-medium" %>
+    <%= f.text_area :description, rows: 3, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+  </div>
+
+  <div class="grid gap-4 sm:grid-cols-4">
+    <div>
+      <%= f.label :category_id, "Categoría", class: "block text-sm font-medium" %>
+      <%= f.collection_select :category_id, Category.order(:path), :id, :name,
+            { include_blank: "— sin categoría —" }, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+    </div>
+    <div>
+      <%= f.label :unit, "Unidad", class: "block text-sm font-medium" %>
+      <%= f.select :unit, Product::UNITS, {}, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+    </div>
+    <div>
+      <%= f.label :cost_cents, "Costo (centavos)", class: "block text-sm font-medium" %>
+      <%= f.number_field :cost_cents, min: 0, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm shadow-sm" %>
+    </div>
+    <div>
+      <%= f.label :price_cents, "Precio (centavos)", class: "block text-sm font-medium" %>
+      <%= f.number_field :price_cents, min: 0, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm shadow-sm" %>
+    </div>
+  </div>
+
+  <div class="grid gap-4 sm:grid-cols-3">
+    <div>
+      <%= f.label :barcode, "Código de barras", class: "block text-sm font-medium" %>
+      <%= f.text_field :barcode, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm shadow-sm" %>
+    </div>
+    <div>
+      <%= f.label :currency, "Moneda", class: "block text-sm font-medium" %>
+      <%= f.text_field :currency, maxlength: 3, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm uppercase shadow-sm" %>
+    </div>
+    <div class="flex items-end gap-2">
+      <%= f.check_box :active, class: "rounded border-slate-300" %>
+      <%= f.label :active, "Activo", class: "text-sm" %>
+    </div>
+  </div>
+
+  <div class="flex gap-2">
+    <%= f.submit class: "rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700" %>
+    <%= link_to "Cancelar", products_path, class: "rounded-md border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50" %>
+  </div>
+<% end %>

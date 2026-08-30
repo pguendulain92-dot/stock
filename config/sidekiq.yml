@@ -1,0 +1,20 @@
+# Config del proceso worker de Sidekiq: bundle exec sidekiq -C config/sidekiq.yml
+#
+# `concurrency` = threads por proceso. La regla NO es "más es mejor":
+#   * cada thread necesita su propia conexión a Postgres (ver database.yml);
+#   * Ruby tiene GVL, así que los threads NO ejecutan Ruby en paralelo — sólo
+#     se solapan durante I/O (base, red). Para trabajo CPU-bound, subir threads
+#     no acelera nada: necesitás más PROCESOS.
+# Punto de partida razonable: 5-10 threads para jobs I/O-bound.
+:concurrency: 5
+:max_retries: 10
+
+# El ORDEN define la prioridad: Sidekiq vacía critical antes de mirar default.
+# Con pesos (`- [default, 2]`) hacés prioridad ponderada en vez de estricta,
+# que evita que una cola de alta prioridad muy cargada mate de hambre al resto.
+:queues:
+  - [ critical, 6 ]
+  - [ outbox, 4 ]
+  - [ default, 2 ]
+  - [ mailers, 2 ]
+  - [ maintenance, 1 ]

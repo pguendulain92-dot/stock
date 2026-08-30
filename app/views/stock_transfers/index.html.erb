@@ -1,0 +1,27 @@
+<% content_for :title, "Transferencias" %>
+<%= render "shared/page_header", title: "Transferencias entre depósitos",
+      actions: (policy(StockTransfer).create? ? link_to("Nueva transferencia", new_stock_transfer_path, class: "rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700") : nil) %>
+
+<div class="overflow-hidden rounded-xl border border-slate-200 bg-white">
+  <table class="min-w-full divide-y divide-slate-200 text-sm">
+    <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+      <tr><th class="px-4 py-2">Referencia</th><th class="px-4 py-2">Estado</th>
+      <th class="px-4 py-2">Origen → Destino</th><th class="px-4 py-2 text-right">Líneas</th>
+      <th class="px-4 py-2 text-right">Unidades</th><th class="px-4 py-2">Creada</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100">
+      <% @transfers.each do |t| %>
+        <tr class="hover:bg-slate-50">
+          <td class="px-4 py-2 font-mono"><%= link_to t.reference, stock_transfer_path(t), class: "hover:underline" %></td>
+          <td class="px-4 py-2"><%= status_badge(t.status) %></td>
+          <td class="px-4 py-2"><%= t.source_warehouse.code %> → <%= t.destination_warehouse.code %></td>
+          <td class="px-4 py-2 text-right"><%= t.lines.size %></td>
+          <td class="px-4 py-2 text-right font-mono"><%= t.total_units_requested %></td>
+          <td class="px-4 py-2 text-xs text-slate-400"><%= l(t.created_at, format: :short) %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+  <% if @transfers.empty? %><p class="px-4 py-8 text-center text-sm text-slate-500">Sin transferencias.</p><% end %>
+</div>
+<div class="mt-4"><%== pagy_nav(@pagy) %></div>

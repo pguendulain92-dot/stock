@@ -1,0 +1,28 @@
+<%= form_with model: warehouse, class: "space-y-4" do |f| %>
+  <% if warehouse.errors.any? %>
+    <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+      <ul class="list-disc pl-5"><% warehouse.errors.full_messages.each do |m| %><li><%= m %></li><% end %></ul>
+    </div>
+  <% end %>
+  <div class="grid gap-4 sm:grid-cols-2">
+    <div>
+      <%= f.label :code, "Código", class: "block text-sm font-medium" %>
+      <%= f.text_field :code, class: "mt-1 w-full rounded-md border-slate-300 font-mono text-sm uppercase shadow-sm" %>
+    </div>
+    <div>
+      <%= f.label :name, "Nombre", class: "block text-sm font-medium" %>
+      <%= f.text_field :name, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+    </div>
+  </div>
+  <div>
+    <%= f.label :address, "Dirección", class: "block text-sm font-medium" %>
+    <%= f.text_area :address, rows: 2, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+  </div>
+  <div class="flex items-center gap-2">
+    <%= f.check_box :active, class: "rounded border-slate-300" %><%= f.label :active, "Activo", class: "text-sm" %>
+  </div>
+  <div class="flex gap-2">
+    <%= f.submit class: "rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700" %>
+    <%= link_to "Cancelar", warehouses_path, class: "rounded-md border border-slate-300 bg-white px-4 py-2 text-sm" %>
+  </div>
+<% end %>

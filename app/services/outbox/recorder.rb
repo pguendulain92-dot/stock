@@ -15,7 +15,7 @@ module Outbox
   # ============================================================================
   class Recorder
     def record(aggregate:, event_type:, payload: {}, metadata: {}, occurred_at: Time.current)
-      OutboxEvent.create!(
+      event = OutboxEvent.create!(
         aggregate_type: aggregate.class.name,
         aggregate_id: aggregate.id,
         event_type:,
@@ -23,9 +23,39 @@ module Outbox
         metadata: default_metadata.merge(metadata).deep_stringify_keys,
         occurred_at:
       )
+      schedule_publish
+      event
     end
 
     private
+
+    # ------------------------------------------------------------------------
+    # "Empujoncito" para bajar la latencia. El job recurrente ya publica cada
+    # minuto; esto hace que, si acabás de escribir un evento, salga en segundos.
+    #
+    # `ActiveRecord.after_all_transactions_commit` (Rails 7.2+) ejecuta el
+    # bloque cuando commitea la transacción MÁS EXTERNA. Es clave: si usáramos
+    # un `after_commit` del modelo dentro de una transacción anidada, se
+    # dispararía antes de que la de afuera termine, y encolaríamos un job para
+    # datos que todavía pueden hacer rollback.
+    #
+    # El SETNX del cache DEBOUNCEA: 500 eventos en un lote encolan UN job de
+    # publicación, no 500. Sin esto, una importación masiva genera un job por
+    # fila y la cola se ahoga sola.
+    # ------------------------------------------------------------------------
+    def schedule_publish
+      ActiveRecord.after_all_transactions_commit do
+        next unless Rails.cache.write("outbox/publish_scheduled", 1,
+                                      expires_in: 2.seconds, unless_exist: true)
+
+        Outbox::PublishPendingJob.perform_later
+      rescue StandardError => e
+        # Si el encolado falla, NO nos importa: el job recurrente lo va a
+        # levantar igual en el próximo minuto. Justamente por eso el outbox es
+        # robusto: el estado durable ya está commiteado en la base.
+        Rails.logger.warn(event: "outbox.nudge_failed", error: e.message)
+      end
+    end
 
     # Metadata de trazabilidad. `Current` es un CurrentAttributes de Rails:
     # un contenedor por thread/fiber que se limpia solo al terminar el request.

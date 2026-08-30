@@ -1,0 +1,5 @@
+<% content_for :title, "Editar #{@product.sku}" %>
+<%= render "shared/page_header", title: "Editar #{@product.sku}" %>
+<div class="max-w-3xl rounded-xl border border-slate-200 bg-white p-6">
+  <%= render "form", product: @product %>
+</div>

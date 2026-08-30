@@ -1,0 +1,28 @@
+<% if movements.empty? %>
+  <p class="px-4 py-8 text-center text-sm text-slate-500">Sin movimientos.</p>
+<% else %>
+  <table class="min-w-full divide-y divide-slate-200 text-sm">
+    <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+      <tr>
+        <th class="px-4 py-2">Fecha</th><th class="px-4 py-2">Tipo</th>
+        <th class="px-4 py-2">Producto</th><th class="px-4 py-2">Depósito</th>
+        <th class="px-4 py-2 text-right">Cantidad</th><th class="px-4 py-2 text-right">Saldo</th>
+        <th class="px-4 py-2">Usuario</th><th class="px-4 py-2">Motivo</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100">
+      <% movements.each do |m| %>
+        <tr class="hover:bg-slate-50">
+          <td class="whitespace-nowrap px-4 py-2 text-xs text-slate-500"><%= l(m.occurred_at, format: :short) %></td>
+          <td class="px-4 py-2"><%= movement_badge(m.kind) %></td>
+          <td class="px-4 py-2 font-mono"><%= link_to m.product.sku, product_path(m.product.sku), class: "hover:underline" %></td>
+          <td class="px-4 py-2 text-slate-500"><%= m.warehouse.code %></td>
+          <td class="px-4 py-2 text-right"><%= signed_quantity(m.quantity) %></td>
+          <td class="px-4 py-2 text-right font-mono text-slate-500"><%= m.quantity_after %></td>
+          <td class="px-4 py-2 text-xs text-slate-500"><%= m.user&.to_s || "sistema" %></td>
+          <td class="px-4 py-2 text-xs text-slate-400"><%= truncate(m.reason, length: 40) %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>

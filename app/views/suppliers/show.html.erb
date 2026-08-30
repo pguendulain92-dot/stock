@@ -1,0 +1,17 @@
+<% content_for :title, @supplier.name %>
+<%= render "shared/page_header", title: @supplier.name, subtitle: "CUIT/Tax ID: #{@supplier.tax_id}",
+      actions: (policy(@supplier).update? ? link_to("Editar", edit_supplier_path(@supplier), class: "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm") : nil) %>
+<div class="rounded-xl border border-slate-200 bg-white p-4 text-sm">
+  <dl class="grid gap-3 sm:grid-cols-3">
+    <div><dt class="text-xs text-slate-400">Email</dt><dd><%= @supplier.email || "—" %></dd></div>
+    <div><dt class="text-xs text-slate-400">Teléfono</dt><dd><%= @supplier.phone || "—" %></dd></div>
+    <div><dt class="text-xs text-slate-400">Lead time</dt><dd><%= @supplier.default_lead_time_days %> días</dd></div>
+  </dl>
+</div>
+<h2 class="mt-6 text-sm font-semibold">Productos que provee</h2>
+<ul class="mt-2 divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white text-sm">
+  <% @products.each do |p| %>
+    <li class="px-4 py-2"><%= link_to "#{p.sku} — #{p.name}", product_path(p.sku), class: "hover:underline" %></li>
+  <% end %>
+  <% if @products.empty? %><li class="px-4 py-6 text-center text-slate-500">Sin productos asociados.</li><% end %>
+</ul>

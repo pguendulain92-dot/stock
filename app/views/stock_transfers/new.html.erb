@@ -1,0 +1,52 @@
+<% content_for :title, "Nueva transferencia" %>
+<%= render "shared/page_header", title: "Nueva transferencia" %>
+
+<%# Formulario con líneas dinámicas usando un controller de Stimulus.
+    Stimulus es JS "modesto": no reemplaza el HTML, lo enriquece.
+    Los `data-*-target` son las referencias que el controller usa. %>
+<div class="max-w-3xl rounded-xl border border-slate-200 bg-white p-6"
+     data-controller="transfer-lines">
+  <%= form_with url: stock_transfers_path, method: :post, class: "space-y-5" do |f| %>
+    <div class="grid gap-4 sm:grid-cols-2">
+      <div>
+        <label class="block text-sm font-medium">Depósito de origen</label>
+        <%= select_tag :source_warehouse_code,
+              options_from_collection_for_select(@warehouses, :code, :to_s),
+              class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+      </div>
+      <div>
+        <label class="block text-sm font-medium">Depósito de destino</label>
+        <%= select_tag :destination_warehouse_code,
+              options_from_collection_for_select(@warehouses, :code, :to_s),
+              class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+      </div>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium">Líneas</label>
+      <div data-transfer-lines-target="container" class="mt-2 space-y-2">
+        <div class="flex gap-2">
+          <%= select_tag "lines[][sku]",
+                options_from_collection_for_select(@products, :sku, ->(p) { "#{p.sku} — #{p.name}" }),
+                class: "flex-1 rounded-md border-slate-300 text-sm shadow-sm" %>
+          <%= number_field_tag "lines[][quantity]", 1, min: 1,
+                class: "w-28 rounded-md border-slate-300 text-sm shadow-sm" %>
+        </div>
+      </div>
+      <button type="button" data-action="transfer-lines#add"
+              class="mt-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm hover:bg-slate-50">
+        + Agregar línea
+      </button>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium">Notas</label>
+      <%= text_area_tag :notes, nil, rows: 2, class: "mt-1 w-full rounded-md border-slate-300 text-sm shadow-sm" %>
+    </div>
+
+    <div class="flex gap-2">
+      <%= submit_tag "Crear transferencia", class: "rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700" %>
+      <%= link_to "Cancelar", stock_transfers_path, class: "rounded-md border border-slate-300 bg-white px-4 py-2 text-sm" %>
+    </div>
+  <% end %>
+</div>

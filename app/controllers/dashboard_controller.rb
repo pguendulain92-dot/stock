@@ -1,0 +1,31 @@
+# frozen_string_literal: true
+
+class DashboardController < ApplicationController
+  def index
+    # ── CACHE DE LECTURA ────────────────────────────────────────────────────
+    # El dashboard hace 6 agregaciones. Cachearlas 60 s no cambia nada para el
+    # usuario y le saca un montón de carga a la base cuando 20 operarios lo
+    # tienen abierto en una pantalla.
+    @stats = Rails.cache.fetch("dashboard/stats", expires_in: 60.seconds) { compute_stats }
+
+    @low_stock = StockItems::LowStock.call.limit(10).to_a
+    @recent_movements = StockMovements::Ledger.call(limit: 15).to_a
+    @warehouses = Warehouse.physical.active.order(:code)
+  end
+
+  private
+
+  def compute_stats
+    {
+      products: Product.kept.active.count,
+      warehouses: Warehouse.physical.active.count,
+      total_units: StockItem.sum(:quantity_on_hand),
+      reserved_units: StockItem.sum(:quantity_reserved),
+      low_stock_count: StockItem.where("quantity_available <= reorder_point")
+                                .where.not(reorder_point: 0).count,
+      open_transfers: StockTransfer.open.count,
+      pending_events: OutboxEvent.pending.count,
+      movements_today: StockMovement.where(occurred_at: Time.current.all_day).count
+    }
+  end
+end
