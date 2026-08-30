@@ -78,6 +78,47 @@ RSpec.describe StockItem do
       expect(described_class.find_or_provision!(product:, warehouse:)).to eq(existente)
     end
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # TEST DE REGRESIÓN DE UN BUG REAL.
+    #
+    # Los tres llamadores de find_or_provision! lo invocan DENTRO de una
+    # transacción. En Postgres, una sentencia que falla ABORTA la transacción
+    # entera: el `find_by!` del rescate moría con PG::InFailedSqlTransaction.
+    # El arreglo es el SAVEPOINT (`transaction(requires_new: true)`).
+    #
+    # Simulamos la carrera creando la fila desde OTRA conexión (no se puede
+    # simular con un stub: hace falta que el UNIQUE reviente de verdad).
+    # ─────────────────────────────────────────────────────────────────────────
+    it "sobrevive a la carrera DENTRO de una transacción (savepoint)" do
+      # Creamos el "ganador" en una conexión aparte y commiteada, para que el
+      # find_by inicial no lo vea pero el INSERT sí choque.
+      ganador = nil
+      hilo = Thread.new do
+        ApplicationRecord.connection_pool.with_connection do
+          ganador = described_class.create!(product:, warehouse:)
+        end
+      end
+      hilo.join
+
+      resultado = nil
+      expect {
+        ApplicationRecord.transaction do
+          # Forzamos el camino del rescue: el find_by inicial devuelve nil.
+          allow(described_class).to receive(:find_by).and_call_original
+          allow(described_class).to receive(:find_by)
+            .with(product:, warehouse:).and_return(nil, ganador)
+
+          resultado = described_class.find_or_provision!(product:, warehouse:)
+
+          # La prueba de fuego: después del rescue, la transacción SIGUE VIVA.
+          # Con el bug, esta línea moría con PG::InFailedSqlTransaction.
+          described_class.count
+        end
+      }.not_to raise_error
+
+      expect(resultado).to eq(ganador)
+    end
+
     it "sobrevive a una carrera perdida contra el índice único" do
       # Simulamos que otro proceso insertó entre nuestro `find_by` y el `create!`.
       # Es EXACTAMENTE la race condition de find_or_create_by.

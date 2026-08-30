@@ -87,6 +87,8 @@ class StockTransferForm < ApplicationForm
       }
     )
 
-    Result.success(transfer.reload)
+    # `with_associations` y no `reload` pelado: el serializer que recibe este
+    # objeto recorre las líneas y toca line.product.
+    Result.success(StockTransfer.with_associations.find(transfer.id))
   end
 end

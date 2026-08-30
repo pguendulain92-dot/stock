@@ -76,6 +76,6 @@ class PurchaseOrderForm < ApplicationForm
       )
     end
 
-    Result.success(order.reload)
+    Result.success(PurchaseOrder.with_associations.find(order.id))
   end
 end

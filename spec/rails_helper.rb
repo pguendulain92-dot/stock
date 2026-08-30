@@ -57,18 +57,6 @@ RSpec.configure do |config|
   config.include ApiHelpers, type: :request
   config.include AuthHelpers, type: :system
 
-  # ── Bullet: los N+1 ROMPEN la suite ───────────────────────────────────────
-  # Es la única forma de que un N+1 no se cuele: que el CI falle.
-  if defined?(Bullet)
-    config.before(:each, :n_plus_one) do
-      Bullet.start_request
-    end
-    config.after(:each, :n_plus_one) do
-      Bullet.perform_out_of_channel_notifications if Bullet.notification?
-      Bullet.end_request
-    end
-  end
-
   # Limpia el estado GLOBAL entre ejemplos. Si no lo hacés, un spec que setea
   # Current.user contamina al siguiente y aparecen fallas dependientes del orden
   # —el tipo de bug más frustrante que existe.

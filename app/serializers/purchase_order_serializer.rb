@@ -8,6 +8,7 @@ class PurchaseOrderSerializer < ApplicationSerializer
       status: object.status,
       supplier: { id: object.supplier_id, name: object.supplier.name },
       warehouse: { id: object.warehouse_id, code: object.warehouse.code },
+      created_by: { id: object.created_by_id, name: object.created_by.to_s },
       total: object.total.as_json,
       lines_count: object.lines_count,
       lines: object.lines.map { |line|

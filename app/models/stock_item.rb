@@ -28,7 +28,14 @@ class StockItem < ApplicationRecord
   has_many :stock_reservations, dependent: :restrict_with_error
 
   # `quantity_available` es una COLUMNA GENERADA de Postgres: se puede leer y
-  # filtrar, pero no escribir. Rails la marca como readonly automáticamente.
+  # filtrar, pero no escribir.
+  #
+  # ⚠️ OJO CON CÓMO FALLA: Rails NO la marca como readonly
+  # (`StockItem.readonly_attributes` devuelve []). Si le asignás un valor, el
+  # objeto en memoria lo acepta, `save!` devuelve true SIN excepción y el
+  # UPDATE simplemente omite la columna. El valor falso te sobrevive hasta el
+  # `reload`. O sea: falla en silencio, que es la peor forma de fallar.
+  # Por eso los services hacen `item.reload` después de escribir.
   validates :quantity_on_hand, :quantity_reserved,
             numericality: { greater_than_or_equal_to: 0, only_integer: true }
   validates :reorder_point, :reorder_quantity,
@@ -63,12 +70,16 @@ class StockItem < ApplicationRecord
 
   # --- Escrituras de bajo nivel ------------------------------------------------
   #
-  # Estos dos métodos son los ÚNICOS que tocan las cantidades, y son
-  # deliberadamente "tontos": no validan reglas de negocio ni escriben el
-  # ledger. Eso lo hace el service, que además garantiza el lock.
+  # OJO, PARA QUE NO TE CONFUNDA: en el código de producción NADIE llama a
+  # estos dos métodos. Stock::ApplyMovement asigna las columnas directamente y
+  # los services de reserva usan `update!`. Los dejamos porque son la forma
+  # LEGIBLE de expresar la operación y sirven desde la consola, pero la regla
+  # real es otra: el único código que puede cambiar una cantidad es
+  # `Stock::ApplyMovement` (y los dos services de reserva), porque son los
+  # únicos que toman el lock y escriben el ledger.
   #
-  # `update!` (y no `update_column`) para que corran las validaciones y el
-  # optimistic locking. Si otro proceso tocó la fila, StaleObjectError.
+  # `update!`/`save!` (y no `update_column`) para que corran las validaciones y
+  # el optimistic locking. Si otro proceso tocó la fila, StaleObjectError.
 
   # Aplica un delta con signo al stock físico.
   def apply_delta!(delta)
@@ -113,15 +124,47 @@ class StockItem < ApplicationRecord
     updated == 1
   end
 
+  # ---------------------------------------------------------------------------
+  # find_or_provision! — crear el par (producto, depósito) de forma segura.
+  #
   # `find_or_create_by!` tiene una race condition: dos requests concurrentes
-  # pueden pasar el `find` a la vez y las dos intentar el `create`. Una gana y
-  # la otra recibe PG::UniqueViolation (que Rails traduce a RecordNotUnique).
-  # La forma correcta es CONFIAR EN EL ÍNDICE ÚNICO y rescatar el choque.
-  # Ver docs/10 §find_or_create_by.
+  # pasan el `find` a la vez y las dos intentan el `create`. Una gana y la otra
+  # choca contra el índice único. La forma correcta es CONFIAR EN EL ÍNDICE y
+  # rescatar el choque... pero hay DOS trampas que hacen que el rescue ingenuo
+  # no funcione, y las dos estuvieron vivas en este repo:
+  #
+  # TRAMPA 1 — EL RESCUE DENTRO DE UNA TRANSACCIÓN NO SIRVE.
+  #   Los tres llamadores (Stock::Receive, Transfers::Dispatch,
+  #   Purchasing::ReceiveOrder) invocan esto DENTRO de una transacción. En
+  #   PostgreSQL, cuando una sentencia falla, TODA la transacción queda
+  #   ABORTADA: cualquier consulta posterior muere con
+  #   `PG::InFailedSqlTransaction: current transaction is aborted`.
+  #   O sea que el `find_by!` del rescate explota igual.
+  #
+  #   (Esto es MUY distinto de lo que pasa en MySQL o en la JVM con JDBC, donde
+  #   un error de sentencia no invalida la transacción. Es la diferencia que más
+  #   sorprende a quien viene de otro motor.)
+  #
+  #   La solución es `transaction(requires_new: true)`, que abre un SAVEPOINT:
+  #   al fallar sólo se revierte hasta el savepoint y la transacción externa
+  #   sigue viva y usable.
+  #
+  # TRAMPA 2 — NO SIEMPRE ES RecordNotUnique.
+  #   El modelo también tiene `validates :product_id, uniqueness: ...`. Si el
+  #   ganador commitea justo antes de que corra ESA validación, el perdedor
+  #   recibe RecordInvalid, no RecordNotUnique. Ventana angosta pero real, así
+  #   que rescatamos las dos.
+  # ---------------------------------------------------------------------------
   def self.find_or_provision!(product:, warehouse:)
-    find_by(product:, warehouse:) || create!(product:, warehouse:)
-  rescue ActiveRecord::RecordNotUnique
-    # El otro proceso ganó la carrera: su fila ya está commiteada, la leemos.
+    existing = find_by(product:, warehouse:)
+    return existing if existing
+
+    # requires_new: true -> SAVEPOINT. Sin esto, el rescue de abajo es inútil
+    # cuando ya estamos dentro de una transacción (que es SIEMPRE, en la práctica).
+    transaction(requires_new: true) { create!(product:, warehouse:) }
+  rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid
+    # El otro proceso ganó la carrera y su fila ya está commiteada.
+    # El savepoint se revirtió, así que la conexión sigue usable.
     find_by!(product:, warehouse:)
   end
 

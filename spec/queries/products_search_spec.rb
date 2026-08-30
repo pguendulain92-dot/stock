@@ -62,11 +62,23 @@ RSpec.describe Products::Search do
   end
 
   describe "prevención de N+1", :n_plus_one do
-    it "trae la categoría con includes" do
+    it "trae la categoría con includes (Bullet rompe el test si aparece un N+1)" do
       create_list(:product, 5, :with_category)
 
-      # Con Bullet.raise = true, si esto generara N+1 el test ROMPE.
-      described_class.call.to_a.each { |p| p.category&.name }
+      # `detectando_n_plus_one` abre el request de Bullet DESPUÉS del setup:
+      # si los datos se crean dentro del request, Bullet los marca como
+      # "imposibles" y no detecta nada. Ver spec/support/bullet.rb.
+      expect {
+        detectando_n_plus_one { described_class.call.to_a.each { |p| p.category&.name } }
+      }.not_to raise_error
+    end
+
+    it "sin includes el mismo recorrido SÍ dispara la alarma (control)" do
+      create_list(:product, 5, :with_category)
+
+      expect {
+        detectando_n_plus_one { Product.kept.to_a.each { |p| p.category&.name } }
+      }.to raise_error(Bullet::Notification::UnoptimizedQueryError)
     end
   end
 end

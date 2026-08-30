@@ -85,7 +85,12 @@ gem "mission_control-jobs"
 # Esto es exactamente el punto de Active Job: es una fachada / SPI.
 # ------------------------------------------------------------------------------
 
-gem "sidekiq", "~> 8.0"
+# `require: false` a propósito: sólo hace falta cuando QUEUE_ADAPTER=sidekiq.
+# Sin esto, la gema (y sus dependencias) se cargan en TODOS los procesos —web,
+# workers, consola, tareas rake— aunque nunca las uses. Son megabytes de RAM
+# por proceso y tiempo de boot regalado. El `require "sidekiq"` condicional
+# vive en config/initializers/sidekiq.rb.
+gem "sidekiq", "~> 8.0", require: false
 gem "redis", "~> 5.3"
 
 # ------------------------------------------------------------------------------
@@ -120,8 +125,13 @@ gem "rack-attack", "~> 6.7"
 # no hace COUNT(*) si no se lo pedís). Ver docs/04 sobre keyset pagination.
 gem "pagy", "~> 9.3"
 
-# Parser/serializador JSON en C. Reemplaza el JSON de la stdlib.
-# En APIs con payloads grandes es un free win medible.
+# Parser/serializador JSON en C.
+#
+# OJO: instalar la gema NO ALCANZA. Hay que engancharla explícitamente con
+# `Oj.optimize_rails` (ver config/initializers/oj.rb). Este repo la tuvo
+# cargada y sin enganchar un buen rato: pagabas la memoria y no te llevabas
+# la velocidad. Verificalo con:
+#   ActiveSupport::JSON::Encoding.json_encoder
 gem "oj", "~> 3.16"
 
 # Migraciones seguras: falla en desarrollo si escribís una migración que
@@ -152,6 +162,18 @@ group :development, :test do
 
   # Variables de entorno desde .env en dev/test (12-factor).
   gem "dotenv-rails", "~> 3.1"
+
+  # Detector de N+1 queries y de eager loading innecesario.
+  #
+  # ⚠️ TIENE QUE ESTAR EN `:development, :test`, NO sólo en `:development`.
+  # Este bug estuvo vivo en el repo: con la gema únicamente en development, la
+  # constante `Bullet` no existe en test, los guards `if defined?(Bullet)` de
+  # spec/support/bullet.rb no hacían nada, y los ejemplos marcados
+  # `:n_plus_one` pasaban en verde HUBIERA O NO un N+1.
+  #
+  # Es el peor tipo de falla: una red de seguridad que no atrapa nada y encima
+  # te da confianza. Ver el spec de regresión en spec/support/bullet.rb.
+  gem "bullet", "~> 8.0"
 end
 
 group :development do
@@ -177,10 +199,6 @@ group :development do
   gem "rack-mini-profiler", require: false
   gem "memory_profiler", require: false
   gem "stackprof", require: false
-
-  # Detector de N+1 queries y de eager loading innecesario. Lo activamos en
-  # test para que un N+1 ROMPA la suite. Ver docs/04.
-  gem "bullet", "~> 8.0"
 end
 
 group :test do

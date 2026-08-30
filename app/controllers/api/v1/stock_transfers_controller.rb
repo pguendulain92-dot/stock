@@ -32,14 +32,15 @@ module Api
 
       # `dispatch` es reservado en ActionController. Ver config/routes.rb.
       def dispatch_transfer
-        transfer = StockTransfer.find(params[:id])
+        # includes: el serializer recorre las líneas y toca line.product.
+        transfer = StockTransfer.with_associations.find(params[:id])
         authorize transfer, :dispatch?
         render_result(Stock::Transfers::Dispatch.call(transfer:, user: current_user),
                       serializer: StockTransferSerializer)
       end
 
       def receive_transfer
-        transfer = StockTransfer.find(params[:id])
+        transfer = StockTransfer.with_associations.find(params[:id])
         authorize transfer, :receive?
         render_result(
           Stock::Transfers::Receive.call(transfer:, user: current_user,

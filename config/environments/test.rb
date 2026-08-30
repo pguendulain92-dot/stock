@@ -71,4 +71,45 @@ Rails.application.configure do
   config.after_initialize do
     Rack::Attack.enabled = false
   end
+
+  # ── Bullet: los N+1 ROMPEN la suite ─────────────────────────────────────────
+  #
+  # Va ACÁ y no en un `before(:suite)` de RSpec. `Bullet.enable = true` aplica
+  # los parches sobre ActiveRecord en el momento de la asignación; hacerlo
+  # después de que Rails terminó de bootear llega tarde para algunos de los
+  # ganchos y la detección queda muda. La configuración de entorno corre en el
+  # momento correcto del boot.
+  #
+  # `raise = true` hace que un N+1 levante
+  # Bullet::Notification::UnoptimizedQueryError y el test FALLE. Es la única
+  # forma de que los N+1 no vuelvan: que el CI los rechace.
+  config.after_initialize do
+    Bullet.enable = true
+    Bullet.bullet_logger = false
+    Bullet.rails_logger = false
+    Bullet.raise = true
+
+    # ── Por qué el detector de eager loading INNECESARIO es OPT-IN ────────────
+    #
+    # `unused_eager_loading` avisa cuando hacés `includes(:x)` y después no usás
+    # `:x`. La idea es buena y encontró desperdicio real en este repo (un
+    # `created_by` que ningún serializer mostraba).
+    #
+    # Pero como GATE de CI es contraproducente: cualquier código que precargue
+    # para el camino feliz y corte antes por una validación lo dispara. Ejemplo
+    # real: Purchasing::ReceiveOrder carga `includes(lines: :product)` porque
+    # los necesita para recorrer las líneas, pero si la cantidad recibida es
+    # inválida corta en la primera línea y la precarga "no se usó". No hay nada
+    # que arreglar ahí: no podés saber de antemano si vas a fallar.
+    #
+    # Un chequeo que grita en casos correctos entrena a la gente a ignorarlo, y
+    # ahí perdés también las alertas buenas. Lo dejamos disponible para correrlo
+    # a propósito de vez en cuando:
+    #
+    #     BULLET_UNUSED=1 bundle exec rspec
+    #
+    # El detector de N+1, en cambio, queda SIEMPRE activo: sus hallazgos son
+    # bugs reales, no ruido.
+    Bullet.unused_eager_loading_enable = ENV["BULLET_UNUSED"].present?
+  end
 end

@@ -30,9 +30,16 @@ module StockMovements
     DEFAULT_LIMIT = 50
     MAX_LIMIT = 200
 
+    # `preload:` permite pedir SÓLO las asociaciones que el que llama va a
+    # renderizar. El dashboard, por ejemplo, no muestra el usuario: cargarlo
+    # sería una query de más en cada visita. Un query object compartido entre
+    # varias vistas necesita este parámetro, o precarga de más para unas o de
+    # menos para otras.
+    DEFAULT_PRELOAD = %i[product warehouse user].freeze
+
     def initialize(product_id: nil, warehouse_id: nil, stock_item_id: nil,
                    kinds: nil, from: nil, to: nil, user_id: nil,
-                   cursor: nil, limit: DEFAULT_LIMIT)
+                   cursor: nil, limit: DEFAULT_LIMIT, preload: DEFAULT_PRELOAD)
       @product_id = product_id
       @warehouse_id = warehouse_id
       @stock_item_id = stock_item_id
@@ -42,6 +49,7 @@ module StockMovements
       @user_id = user_id
       @cursor = cursor
       @limit = limit.to_i.clamp(1, MAX_LIMIT)
+      @preload = Array(preload)
     end
 
     def call
@@ -55,7 +63,7 @@ module StockMovements
       relation = relation.where(occurred_at: ..@to) if @to
       relation = apply_cursor(relation)
 
-      relation.includes(:product, :warehouse, :user)
+      relation.includes(*@preload)
               .order(occurred_at: :desc, id: :desc)
               .limit(@limit)
     end

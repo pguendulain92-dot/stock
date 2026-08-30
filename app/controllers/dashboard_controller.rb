@@ -9,7 +9,10 @@ class DashboardController < ApplicationController
     @stats = Rails.cache.fetch("dashboard/stats", expires_in: 60.seconds) { compute_stats }
 
     @low_stock = StockItems::LowStock.call.limit(10).to_a
-    @recent_movements = StockMovements::Ledger.call(limit: 15).to_a
+    # `preload:` sin `:user`: el panel no muestra quién hizo el movimiento, así
+    # que cargarlo sería una query de más en cada visita. Lo detectó Bullet con
+    # BULLET_UNUSED=1.
+    @recent_movements = StockMovements::Ledger.call(limit: 15, preload: %i[product warehouse]).to_a
     @warehouses = Warehouse.physical.active.order(:code)
   end
 

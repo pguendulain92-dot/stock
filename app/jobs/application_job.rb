@@ -38,11 +38,40 @@
 # Si tu job manda un mail o descuenta stock, tenés que poder detectarlo.
 # ==============================================================================
 class ApplicationJob < ActiveJob::Base
+  # ┌──────────────────────────────────────────────────────────────────────────┐
+  # │ ENCOLAR DESPUÉS DEL COMMIT — y por qué acá y no en un initializer.       │
+  # │                                                                          │
+  # │ El problema: `perform_later` dentro de una transacción encola el job     │
+  # │ INMEDIATAMENTE. Si después la transacción hace rollback, el job igual    │
+  # │ se ejecuta y procesa un registro que no existe (o que quedó en otro      │
+  # │ estado). Y al revés: el worker puede tomar el job ANTES de que el COMMIT │
+  # │ termine y no encontrar la fila.                                          │
+  # │                                                                          │
+  # │ ⚠️ TRAMPA QUE TUVIMOS VIVA EN ESTE REPO: escribir                        │
+  # │     config.active_job.enqueue_after_transaction_commit = :always         │
+  # │ en un initializer es un NO-OP en Rails 8.1. El railtie de Active Job     │
+  # │ excluye esa clave a propósito de la configuración global ("This config   │
+  # │ can't be applied globally") y además el valor :always se removió.        │
+  # │ El resultado era el peor posible: parecía configurado y no lo estaba.    │
+  # │ Verificalo con:  ActiveJob::Base.enqueue_after_transaction_commit        │
+  # │                                                                          │
+  # │ La forma correcta es POR CLASE DE JOB, como acá abajo.                   │
+  # │                                                                          │
+  # │ Y ojo: esto NO reemplaza al outbox. Si el proceso muere entre el COMMIT  │
+  # │ y el enqueue, el job se pierde igual y nadie se entera. Para eventos que │
+  # │ no se pueden perder, outbox (ver app/services/outbox/). Para "mandale un │
+  # │ mail al usuario", esto alcanza.                                          │
+  # └──────────────────────────────────────────────────────────────────────────┘
+  self.enqueue_after_transaction_commit = true
+
   # --- Reintentos -------------------------------------------------------------
   #
-  # `wait: :polynomially_longer` (Rails 7.1+) hace backoff exponencial:
-  # los reintentos son a los ~3s, ~18s, ~83s, ~258s... En vez de martillar un
-  # servicio caído cada 5 segundos, le das tiempo a recuperarse.
+  # `wait: :polynomially_longer` (Rails 7.1+) hace backoff POLINÓMICO, no
+  # exponencial: la fórmula es `executions ** 4 + jitter + 2`. Rails renombró
+  # la opción justamente por eso (antes se llamaba `:exponentially_longer` y
+  # el nombre mentía). Los reintentos caen a los ~3s, ~18s, ~83s, ~258s...
+  # En vez de martillar un servicio caído cada 5 segundos, le das tiempo a
+  # recuperarse.
   #
   # En producción real querés además JITTER (ruido aleatorio): si 1000 jobs
   # fallan al mismo tiempo por una caída, con backoff determinístico los 1000

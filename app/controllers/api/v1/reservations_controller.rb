@@ -39,6 +39,11 @@ module Api
 
       # POST /api/v1/reservations/:id/commit — la mercadería sale del depósito
       def commit
+        # SIN includes a propósito: acá hay UNA sola reserva, así que no puede
+        # haber N+1 (hace falta que N > 1). Precargar de más es peor: en los
+        # caminos de error (reserva vencida -> 410) el eager loading no se usa
+        # nunca, y Bullet lo reporta como "AVOID eager loading". Precargá
+        # cuando iterás una colección, no por reflejo.
         reservation = StockReservation.find(params[:id])
         authorize reservation.stock_item, :issue?
 

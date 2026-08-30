@@ -57,18 +57,3 @@ if ENV["QUEUE_ADAPTER"] == "sidekiq"
 
   Sidekiq.configure_client { |config| config.redis = redis_config }
 end
-
-# ------------------------------------------------------------------------------
-# ENCOLAR DESPUÉS DEL COMMIT (Rails 7.2+).
-#
-# Con esto, `perform_later` dentro de una transacción NO encola hasta que el
-# COMMIT sea exitoso. Resuelve el problema descrito arriba para CUALQUIER
-# adapter, y debería estar activado siempre.
-#
-# Ojo: NO reemplaza al patrón outbox. Si el proceso muere entre el COMMIT y el
-# enqueue (una ventana de microsegundos, pero existe), el job se pierde igual y
-# nadie se entera. Para eventos que NO se pueden perder, outbox. Para "mandale
-# un mail al usuario", esto alcanza. Saber dónde está esa línea es la respuesta
-# madura a "¿cuándo usarías un outbox?".
-# ------------------------------------------------------------------------------
-Rails.application.config.active_job.enqueue_after_transaction_commit = :always
