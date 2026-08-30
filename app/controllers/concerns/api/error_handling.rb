@@ -27,6 +27,15 @@ module Api
       rescue_from ActiveRecord::StaleObjectError, with: :render_conflict
       rescue_from ActionController::ParameterMissing, with: :render_parameter_missing
       rescue_from ActionController::UnpermittedParameters, with: :render_unpermitted
+
+      # ⚠️ ESTOS DOS FALTABAN Y EL SÍNTOMA ERA CONFUSO.
+      # Sin rescue_from, una cantidad no numérica o un JSON malformado devolvían
+      # la página HTML public/400.html en desarrollo y un 500 en JSON en
+      # producción — nunca el 400 del contrato. Y el spec pasaba igual, porque
+      # sólo miraba el status en dev. Moraleja: verificá también el
+      # Content-Type y el cuerpo, no sólo el código.
+      rescue_from ActionController::BadRequest, with: :render_bad_request
+      rescue_from ActionDispatch::Http::Parameters::ParseError, with: :render_malformed_body
       rescue_from Pundit::NotAuthorizedError, with: :render_forbidden
       rescue_from ActiveRecord::LockWaitTimeout, with: :render_locked
     end
@@ -91,6 +100,18 @@ module Api
     def render_locked(_exception)
       render_error(:locked, "El recurso está bloqueado por otra operación. Reintentá.",
                    status: :conflict)
+    end
+
+    def render_bad_request(exception)
+      render_error(:bad_request, exception.message.presence || "Solicitud inválida.",
+                   status: :bad_request)
+    end
+
+    def render_malformed_body(_exception)
+      # NO devolvemos el mensaje del parser: filtra el contenido del body y la
+      # posición exacta del error, que le sirve a un atacante para sondear.
+      render_error(:malformed_body, "El cuerpo de la solicitud no es JSON válido.",
+                   status: :bad_request)
     end
 
     def render_parameter_missing(exception)

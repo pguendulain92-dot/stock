@@ -11,7 +11,12 @@ class StockItemsController < ApplicationController
   end
 
   def low_stock
+    # Esta acción es un `index` con otro nombre: el filtrado lo hace el query
+    # object, no un scope de Pundit. Declaramos las DOS exenciones porque la red
+    # de seguridad sólo exige `policy_scope` cuando la acción se llama "index";
+    # para cualquier otro nombre exige `authorize`.
     skip_policy_scope
+    skip_authorization
     @pagy, @stock_items = pagy(StockItems::LowStock.call(warehouse_id: params[:warehouse_id]), limit: 30)
     render :index
   end

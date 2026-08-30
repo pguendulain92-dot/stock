@@ -39,9 +39,25 @@ class ApplicationRecord < ActiveRecord::Base
     raise ActiveRecord::LockWaitTimeout, "#{self.class.name}##{id} está bloqueado por otra operación"
   end
 
-  # Devuelve el plan de ejecución de una relación. Atajo para no tener que ir a
-  # psql: `Product.active.explain(analyze: true)`. Ver docs/04.
+  # ---------------------------------------------------------------------------
+  # Plan de ejecución de una relación, sin salir de la consola de Rails.
+  #
+  # ⚠️ LA FORMA CON HASH NO EXISTE. Esto estaba escrito como
+  # `relation.explain(analyze: true, verbose: true)` y NO funciona: el adapter
+  # de Postgres arma la cláusula con `options.join(", ").upcase`, así que el
+  # hash se interpola como texto y Postgres recibe
+  #     EXPLAIN ({:ANALYZE=>TRUE, :VERBOSE=>TRUE}) SELECT ...
+  # y contesta `PG::SyntaxError: syntax error at or near "{"`.
+  # La forma correcta son SÍMBOLOS POSICIONALES: `.explain(:analyze, :verbose)`.
+  #
+  # Y ojo con el otro detalle: `explain` devuelve un ExplainProxy, no un String.
+  # `puts relation.explain(...)` no imprime el plan; hay que usar `.inspect`
+  # (o dejar que la consola lo inspeccione sola).
+  #
+  # ⚠️ `:analyze` EJECUTA LA QUERY DE VERDAD. Sobre un UPDATE o un DELETE
+  # modifica datos. Para esos casos, envolvelo en una transacción con rollback.
+  # ---------------------------------------------------------------------------
   def self.explain_analyze(relation = all)
-    relation.explain(analyze: true, verbose: true)
+    relation.explain(:analyze, :verbose).inspect
   end
 end

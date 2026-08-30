@@ -73,6 +73,50 @@ RSpec.describe "API v1 · Rate limiting", type: :request do
       Rack::Attack.enabled = false
     end
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # TEST DE REGRESIÓN. El throttle "logins/email" estuvo MUERTO: leía
+    # req.params.dig("session", "email_address") pero el formulario manda los
+    # params PLANOS, así que el discriminador era nil y Rack::Attack no contaba
+    # nada. Un rate limit roto se ve igual que uno que nunca se disparó.
+    # ─────────────────────────────────────────────────────────────────────────
+    it "limita los intentos contra UNA CUENTA aunque cambie la IP" do
+      # 7 intentos desde IPs distintas contra el mismo email. El límite por IP
+      # (5) no los agarra porque cada IP hace uno solo; el límite por email sí.
+      7.times do |i|
+        post "/session",
+             params: { email_address: "victima@stock.test", password: "intento#{i}" },
+             headers: { "REMOTE_ADDR" => "203.0.113.#{i + 1}" }
+      end
+
+      expect(response).to have_http_status(:too_many_requests)
+      expect(response.headers["RateLimit-Limit"]).to eq("6")
+    end
+
+    it "normaliza el email: cambiar el casing no evade el límite" do
+      variantes = %w[Victima@Stock.test VICTIMA@STOCK.TEST victima@stock.test]
+      7.times do |i|
+        post "/session",
+             params: { email_address: variantes[i % 3], password: "x" },
+             headers: { "REMOTE_ADDR" => "198.51.100.#{i + 1}" }
+      end
+
+      expect(response).to have_http_status(:too_many_requests)
+    end
+
+    it "bloquea la fuerza bruta de tokens de API por IP" do
+      # Cada token distinto estrenaba su propio balde de 1000/hora, así que
+      # probar tokens al azar no costaba nada. Ahora Fail2Ban cuenta los 401.
+      12.times do |i|
+        get "/api/v1/products",
+            headers: { "Authorization" => "Bearer stk_intento_#{i}", "REMOTE_ADDR" => "192.0.2.50" }
+      end
+
+      get "/api/v1/products",
+          headers: { "Authorization" => "Bearer stk_otro_mas", "REMOTE_ADDR" => "192.0.2.50" }
+
+      expect(response).to have_http_status(:forbidden)   # blocklist, no 401
+    end
+
     it "limita los intentos de login por IP" do
       6.times do
         post "/session", params: { email_address: "x@y.z", password: "mal" }

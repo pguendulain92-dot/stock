@@ -78,7 +78,14 @@ class ApplicationService
     # se lo devolvemos al cliente para que reintente (HTTP 409).
     Result.failure(:conflict, "El registro fue modificado por otra operación. Reintentá.")
   rescue ActiveRecord::RecordNotUnique => e
-    Result.failure(:duplicate, "Ya existe un registro con esos datos.", detail: e.message)
+    # ⚠️ NO adjuntamos e.message. El mensaje de PG::UniqueViolation incluye el
+    # nombre del índice, el de la tabla y el VALOR que colisionó, y
+    # ErrorSerializer renderiza `details` tal cual: eso llega al cliente en el
+    # 409. Es exactamente la regla que este mismo archivo predica más arriba
+    # ("mensaje genérico para afuera, detalle completo en el log") y que
+    # estábamos violando. Al log sí va todo.
+    Rails.logger.warn(event: "service.duplicate", error: e.message)
+    Result.failure(:duplicate, "Ya existe un registro con esos datos.")
   rescue ActiveRecord::LockWaitTimeout
     Result.failure(:locked, "El recurso está bloqueado por otra operación. Reintentá.")
   end

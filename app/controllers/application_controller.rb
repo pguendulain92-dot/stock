@@ -32,6 +32,18 @@ class ApplicationController < ActionController::Base
 
   rescue_from Pundit::NotAuthorizedError, with: :user_not_authorized
 
+  # ──────────────────────────────────────────────────────────────────────────
+  # RED DE SEGURIDAD DE AUTORIZACIÓN, TAMBIÉN EN LA UI WEB.
+  #
+  # Esto sólo estaba en el BaseController de la API: un controller HTML nuevo
+  # sin `authorize` no disparaba ninguna alarma. El agujero clásico es agregar
+  # una acción, olvidarse el chequeo de permisos, y que quede abierta meses.
+  #
+  # Igual que en la API: en dev/test EXPLOTA para que lo arregles ya; en
+  # producción sólo se loguea, para no tumbar una pantalla por un olvido.
+  # ──────────────────────────────────────────────────────────────────────────
+  after_action :verify_pundit_usage, unless: :devise_or_engine_request?
+
   before_action :set_current_request_context
 
   private
@@ -45,6 +57,22 @@ class ApplicationController < ActionController::Base
   def pundit_user = Current.user
   helper_method :current_user
   def current_user = Current.user
+
+  def verify_pundit_usage
+    action_name == "index" ? verify_policy_scoped : verify_authorized
+  rescue Pundit::AuthorizationNotPerformedError, Pundit::PolicyScopingNotPerformedError => e
+    raise e if Rails.env.local?
+
+    Rails.logger.error(event: "security.authorization_missing",
+                       controller: controller_name, action: action_name, error: e.class.name)
+  end
+
+  # Los controllers de sesión y de reseteo de contraseña son PÚBLICOS por
+  # definición: no hay un recurso que autorizar. Se excluyen explícitamente,
+  # que es mejor que un `skip_after_action` disperso en cada uno.
+  def devise_or_engine_request?
+    controller_name.in?(%w[sessions passwords]) || self.class.module_parent_name.present?
+  end
 
   def user_not_authorized
     redirect_back fallback_location: root_path,

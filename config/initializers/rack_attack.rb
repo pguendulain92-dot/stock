@@ -171,18 +171,36 @@ class Rack::Attack
     req.remote_ip if req.path == "/session" && req.post?
   end
 
+  # ⚠️ EL DISCRIMINADOR TIENE QUE COINCIDIR CON LA FORMA REAL DE LOS PARAMS.
+  # Este throttle estuvo MUERTO en el repo: leía
+  # `req.params.dig("session", "email_address")`, pero el formulario usa
+  # `form_with url:` SIN modelo, así que los params llegan PLANOS
+  # (`email_address`), no anidados bajo "session". El dig devolvía nil, el
+  # discriminador nil hace que Rack::Attack no cuente NADA, y el límite no
+  # existía. Y lo peor: no hay ningún error, ninguna advertencia. Un rate limit
+  # roto se ve exactamente igual que uno que nunca se disparó.
+  #
+  # MORALEJA: todo throttle necesita un test que lo dispare de verdad. Ver
+  # spec/requests/api/v1/rate_limiting_spec.rb.
+  #
+  # Aceptamos las dos formas para que siga funcionando si el form cambia a
+  # `form_with model:`.
   throttle("logins/email", limit: 6, period: 15.minutes) do |req|
     if req.path == "/session" && req.post?
-      # `normalizamos` la clave para que "Ana@X.com" y "ana@x.com " cuenten
-      # juntas; si no, el atacante evade el límite cambiando el casing.
-      req.params.dig("session", "email_address")&.to_s&.downcase&.strip&.presence
+      email = req.params["email_address"] || req.params.dig("session", "email_address")
+      # Normalizamos para que "Ana@X.com" y "ana@x.com " cuenten juntas; si no,
+      # el atacante evade el límite cambiando el casing.
+      email&.to_s&.downcase&.strip&.presence
     end
   end
 
   # Reset de contraseña: mismo razonamiento (y además cada request manda un mail,
   # o sea que es un vector de spam y de costo real).
   throttle("password-resets/email", limit: 3, period: 1.hour) do |req|
-    req.params.dig("password", "email_address")&.to_s&.downcase&.strip&.presence if req.post? && req.path == "/passwords"
+    if req.post? && req.path == "/passwords"
+      email = req.params["email_address"] || req.params.dig("password", "email_address")
+      email&.to_s&.downcase&.strip&.presence
+    end
   end
 
   # ── API: límite POR TOKEN, no por IP ──────────────────────────────────────
@@ -199,6 +217,30 @@ class Rack::Attack
       # Sin token: límite mucho más agresivo por IP. Una API sin credencial no
       # tiene por qué recibir mucho tráfico.
       "anon-#{req.remote_ip}"
+    end
+  end
+
+  # ── AGUJERO QUE TAPA ESTE THROTTLE ────────────────────────────────────────
+  # Un Bearer token inválido devuelve 401 en un `before_action`, lo que CORTA
+  # la cadena de callbacks: el `rate_limit` de la capa 2 (que corre después de
+  # autenticar) NUNCA se ejecuta. Y el throttle "api/token" de arriba discrimina
+  # por el SHA del token, así que CADA token adivinado estrena su propio balde
+  # de 1000/hora. Resultado: la única barrera real contra fuerza bruta de
+  # tokens era el límite genérico por IP.
+  #
+  # Fail2Ban por IP sobre los 401 de la API cierra el agujero: 10 fallos de
+  # autenticación en 5 minutos y esa IP queda bloqueada una hora, sin importar
+  # cuántos tokens distintos pruebe.
+  #
+  # `Fail2Ban.filter` necesita que el bloque devuelva true cuando el evento es
+  # "sospechoso". Como Rack::Attack corre ANTES del controller, no conocemos el
+  # status de la respuesta: marcamos el intento acá y lo confirmamos desde el
+  # controller vía Rack::Attack.cache (ver Api::TokenAuthentication).
+  blocklist("bloquear fuerza bruta de tokens de API") do |req|
+    Rack::Attack::Fail2Ban.filter("api-auth-fail-#{req.remote_ip}",
+                                  maxretry: 10, findtime: 5.minutes, bantime: 1.hour) do
+      # Marcado por el controller cuando la autenticación falla.
+      Rack::Attack.cache.read("api-auth-failed:#{req.remote_ip}").present?
     end
   end
 

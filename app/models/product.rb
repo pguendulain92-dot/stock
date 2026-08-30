@@ -49,6 +49,10 @@ class Product < ApplicationRecord
             format: { with: /\A[A-Z0-9][A-Z0-9._-]{1,31}\z/,
                       message: "2-32 caracteres alfanuméricos ASCII, punto, guion o guion bajo" }
   validates :name, presence: true, length: { maximum: 200 }
+  # La columna es `text` (sin tope en Postgres). Sin validación, un cliente
+  # puede mandar 50 MB en un campo y hacerte pagar memoria, red y disco en
+  # cada lectura. Toda columna de texto libre necesita un máximo.
+  validates :description, length: { maximum: 5_000 }
   validates :unit, inclusion: { in: UNITS }
   validates :currency, format: { with: /\A[A-Z]{3}\z/ }
   validates :cost_cents, :price_cents, numericality: { greater_than_or_equal_to: 0, only_integer: true }

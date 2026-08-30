@@ -131,8 +131,26 @@ module Api
 
       # Paginación offset estándar (para listados que el usuario navega).
       # Para el ledger usamos keyset — ver Api::V1::StockMovementsController.
+      #
+      # ⚠️ EL CLAMP NO ES OPCIONAL. Esto estuvo sin tope y `?limit=1000000` era
+      # un DoS de una línea: instanciás un millón de objetos ActiveRecord y el
+      # worker muere por memoria. Vale para CUALQUIER número que venga del
+      # usuario y controle un recurso: tamaño de página, TTL, cantidad, rango
+      # de fechas. Pagy tiene `max_limit` en su config, pero depende de que la
+      # opción `limit` llegue por su camino: acotarlo acá es explícito y no se
+      # rompe si mañana cambiamos de librería.
+      MAX_PAGE_SIZE = 100
+
       def paginate(scope)
-        pagy(scope, limit: params[:limit])
+        pagy(scope, limit: page_limit)
+      end
+
+      def page_limit
+        return Pagy::DEFAULT[:limit] if params[:limit].blank?
+
+        Integer(params[:limit]).clamp(1, MAX_PAGE_SIZE)
+      rescue ArgumentError, TypeError
+        Pagy::DEFAULT[:limit]
       end
 
       def render_collection(pagy, records, serializer, **options)

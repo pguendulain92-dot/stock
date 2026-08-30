@@ -49,7 +49,19 @@ module Stock
     # rate limit. RemoteIp sólo lo respeta viniendo de un proxy conocido.
     #
     # Mirá el stack completo con: bin/rails middleware
-    config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
+    # `move_after`, NO `insert_after`.
+    #
+    # El railtie de rack-attack YA hace `app.middleware.use(Rack::Attack)` y lo
+    # monta al final del stack. Con `insert_after` queda montado DOS VECES
+    # (comprobalo con `bin/rails middleware`): no hay doble conteo —la gema se
+    # protege con env["rack.attack.called"]— pero es un frame de Rack inútil en
+    # cada request y una trampa para quien lea el stack.
+    #
+    # Y `delete` + `insert_after` TAMPOCO sirve: las operaciones sobre el stack
+    # se acumulan y se aplican en orden al construirlo, así que el delete puede
+    # llevarse el middleware que vos mismo insertaste y quedarte sin ninguno.
+    # `move_after` mueve el que ya existe, que es exactamente lo que queremos.
+    config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
 
     # Configuration for the application, engines, and railties goes here.
     #

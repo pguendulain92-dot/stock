@@ -46,6 +46,14 @@ module Api
       token = ApiToken.authenticate(bearer_token)
 
       if token.nil?
+        # Marcamos el fallo para que Rack::Attack lo cuente en el próximo
+        # request de esta IP. ¿Por qué acá y no en el middleware? Porque
+        # Rack::Attack corre ANTES del controller y no puede saber si el token
+        # era válido. Sin esta marca, un atacante puede probar tokens sin
+        # límite: el 401 corta la cadena de callbacks y el rate_limit de la
+        # capa 2 nunca llega a ejecutarse. Ver config/initializers/rack_attack.rb.
+        record_authentication_failure!
+
         # `WWW-Authenticate` es parte del estándar HTTP para el 401: le dice al
         # cliente CÓMO autenticarse. Muchas APIs se lo olvidan.
         response.set_header("WWW-Authenticate", 'Bearer realm="stock-api"')
@@ -59,6 +67,18 @@ module Api
 
       @current_api_token = token
       token.touch_usage!
+    end
+
+    # Contador de fallos por IP, con TTL corto. Rack::Attack lo lee en el
+    # request siguiente. `increment` con expires_in es atómico en Redis.
+    def record_authentication_failure!
+      key = "api-auth-failed:#{request.remote_ip}"
+      Rack::Attack.cache.write(key, 1, 5.minutes)
+    rescue StandardError => e
+      # Si el store de Rack::Attack está caído, NO rompemos el request: el 401
+      # se devuelve igual. Fallar abierto en la instrumentación, nunca en la
+      # autenticación.
+      Rails.logger.warn("[Auth] no se pudo registrar el fallo de autenticación: #{e.message}")
     end
 
     def bearer_token

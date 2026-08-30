@@ -122,8 +122,32 @@ module Api
                      "Esta clave ya se usó con un cuerpo distinto.",
                      status: :unprocessable_content)
       in { record: IdempotencyKey => fresh }
-        yield
-        persist_response(fresh)
+        # ⚠️ DOS TRAMPAS ENCADENADAS, las dos estuvieron vivas acá.
+        #
+        # (1) `with_idempotency` es un around_action. Si la acción levanta una
+        #     excepción que después atrapa un `rescue_from` (404, 403, 422...),
+        #     el flujo NO vuelve a la línea siguiente al yield: la fila quedaba
+        #     en estado 'processing' para siempre y TODO reintento con esa clave
+        #     recibía 409 durante las 24 h del TTL. Un error transitorio del
+        #     cliente le quemaba la clave.
+        #
+        # (2) El arreglo obvio —envolver en `ensure`— TAMPOCO alcanza, y el
+        #     motivo es sutil: el `ensure` corre mientras la excepción viaja
+        #     hacia arriba, o sea ANTES de que el `rescue_from` renderice. En
+        #     ese momento `response.status` todavía es 200 y marcaríamos la
+        #     clave como 'completed' guardando un cuerpo vacío.
+        #
+        # La forma correcta es `rescue/else`: si hubo excepción marcamos
+        # 'failed' y la RE-LANZAMOS (para que el rescue_from haga su trabajo);
+        # si no la hubo, recién ahí persistimos la respuesta real.
+        begin
+          yield
+        rescue StandardError
+          mark_failed(fresh)
+          raise
+        else
+          persist_response(fresh)
+        end
       end
     end
 
@@ -161,9 +185,17 @@ module Api
       { conflict: true }
     end
 
+    def mark_failed(record)
+      record.update!(status: "failed")
+    rescue StandardError => e
+      Rails.logger.error(event: "idempotency.mark_failed_error", key: record.key, error: e.message)
+    end
+
     def persist_response(record)
       # Sólo cacheamos respuestas EXITOSAS (2xx). Cachear un 500 significaría
       # devolver ese 500 para siempre, aunque el problema ya esté resuelto.
+      # Un 4xx tampoco se cachea: marcamos 'failed' para que el cliente pueda
+      # corregir el pedido y reintentar con la MISMA clave.
       if response.successful?
         record.update!(
           status: "completed",
@@ -173,6 +205,10 @@ module Api
       else
         record.update!(status: "failed", response_status: response.status)
       end
+    rescue StandardError => e
+      # Nunca dejamos que un fallo al persistir la clave tape el error real de
+      # la acción: se loguea y seguimos.
+      Rails.logger.error(event: "idempotency.persist_failed", key: record.key, error: e.message)
     end
 
     def safe_parse(body)

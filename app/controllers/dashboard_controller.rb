@@ -2,6 +2,13 @@
 
 class DashboardController < ApplicationController
   def index
+    # El panel no es un recurso: agrega métricas de varios modelos y no hay un
+    # objeto que autorizar. `skip_policy_scope` lo declara EXPLÍCITAMENTE, que
+    # es lo importante: la red de seguridad de ApplicationController sigue
+    # avisando en cualquier otra acción que se olvide de autorizar.
+    # (El acceso ya está restringido: `require_authentication` corre antes.)
+    skip_policy_scope
+
     # ── CACHE DE LECTURA ────────────────────────────────────────────────────
     # El dashboard hace 6 agregaciones. Cachearlas 60 s no cambia nada para el
     # usuario y le saca un montón de carga a la base cuando 20 operarios lo

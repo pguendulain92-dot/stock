@@ -26,7 +26,14 @@ module Authentication
     end
 
     def find_session_by_cookie
-      Session.find_by(id: cookies.signed[:session_id]) if cookies.signed[:session_id]
+      return nil if cookies.signed[:session_id].blank?
+
+      # `Session.active` y no `Session.find_by` pelado. Este bug estuvo vivo:
+      # la sesión tiene `expires_at` y un scope `active`, pero el lookup no lo
+      # usaba, así que una sesión vencida SEGUÍA AUTENTICANDO para siempre.
+      # Poner el vencimiento en la base y después no filtrarlo es peor que no
+      # tenerlo: da una falsa sensación de que las sesiones expiran.
+      Session.active.find_by(id: cookies.signed[:session_id])
     end
 
     def request_authentication

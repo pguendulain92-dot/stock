@@ -2,6 +2,7 @@
 
 class StockMovementsController < ApplicationController
   def index
+    # El filtrado lo hace el query object; no hay un scope de Pundit que aplicar.
     skip_policy_scope
     @movements = StockMovements::Ledger.call(
       product_id: params[:product_id], warehouse_id: params[:warehouse_id],
