@@ -14,6 +14,13 @@ correrlos contra este repo (Rails 8.1.3.1, Ruby 3.3.6, PostgreSQL 16.13, Kamal
 2.12.0, Puma 8.0.2, Solid Queue 1.7.0, Thruster 0.1.26). Donde algo **no existe**
 en el repo, lo digo explícitamente en vez de inventarlo.
 
+Y una aclaración sobre el tiempo verbal, porque hace a cómo leer varias secciones:
+escribir esta documentación implicó verificar cada afirmación contra el código, y
+esa verificación **encontró defectos reales**. Todos están arreglados hoy. Los
+dejo contados igual —el bug, cómo se veía, cómo se detectó y cómo se arregló—
+porque el modo de falla es lo que se aprende; lo marco con **ESTUVO VIVO** y
+cierro con el archivo del arreglo y, si existe, el spec de regresión.
+
 Documentos hermanos que este da por leídos:
 `docs/03-base-de-datos-y-activerecord.md` (pool, multi-DB, migraciones seguras),
 `docs/07-colas-jobs-y-mensajeria.md` (Solid Queue, outbox),
@@ -67,12 +74,12 @@ No los recito: te digo cómo se resuelve cada uno acá y dónde se rompe.
 | III | Config en el entorno | `.env.example`, `ENV.fetch(...)` en `config/*.yml` | meter la config en `credentials.yml.enc` "porque es más cómodo" (ver §3) |
 | IV | Backing services como recursos adjuntos | `DATABASE_URL`, `REDIS_URL`, `OUTBOX_ADAPTER` intercambiables (`app/services/outbox/publisher.rb:26`) | hardcodear `localhost` |
 | V | Build / release / run separados | build de la imagen ≠ `kamal deploy` ≠ contenedor corriendo | precompilar assets **en runtime** dentro del contenedor |
-| VI | Procesos sin estado | sesiones en Postgres (`sessions`), cache en Solid Cache, jobs en Postgres | ⚠️ `config.active_storage.service = :local` (`config/environments/production.rb:25`) guarda **archivos en el disco del contenedor** |
+| VI | Procesos sin estado | sesiones en Postgres (`sessions`), cache en Solid Cache, jobs en Postgres | ⚠️ Active Storage en `:local` guarda **archivos en el disco del contenedor**; hoy el backend sale de `ACTIVE_STORAGE_SERVICE` (`config/environments/production.rb:29`) y `local` es sólo el default |
 | VII | Port binding | Thruster escucha 80/443 y le habla a Puma en 3000 | — |
 | VIII | Concurrencia por procesos | `WEB_CONCURRENCY` (Puma) + `config/queue.yml` (workers) | subir threads en vez de procesos |
 | IX | Desechabilidad | SIGTERM graceful en Puma y en Solid Queue (§10) | jobs largos sin checkpoint |
 | X | Dev/prod lo más parecidos posible | Solid Cache **también** en dev (`config/environments/development.rb:29-33`), Postgres 16 en CI (`.github/workflows/ci.yml`) | `:memory_store` en dev y Redis en prod |
-| XI | Logs como stream de eventos | `config.logger = ActiveSupport::TaggedLogging.logger(STDOUT)` (`production.rb:38`) | escribir a `log/production.log` dentro del contenedor |
+| XI | Logs como stream de eventos | `config.logger = ActiveSupport::TaggedLogging.logger(STDOUT)` (`production.rb:51`) | escribir a `log/production.log` dentro del contenedor |
 | XII | Admin como procesos one-off | `bin/rails runner`, `bin/rails console`, `kamal app exec` | correr tareas de mantenimiento desde el proceso web |
 
 Dos comentarios sobre el factor X, que es el que más rinde en una entrevista.
@@ -81,12 +88,26 @@ en producción**. El comentario en `config/environments/development.rb:29-31` lo
 explica: con `:memory_store` en dev, un bug de serialización del cache aparece
 recién en prod. Lo mismo con Postgres: el CI levanta `postgres:16`, no SQLite.
 
-Y el factor VI merece un ⚠️ grande en este repo: `config.active_storage.service =
-:local` con `config/storage.yml` apuntando a `Rails.root.join("storage")`. Eso
-está bien para desarrollo, pero en un contenedor significa que **los archivos
-subidos desaparecen en el próximo deploy**. El arreglo es un volumen persistente
-(el `config/deploy.yml` de este repo ya declara
+Y el factor VI merece un ⚠️ en este repo. Con `config.active_storage.service =
+:local` y `config/storage.yml` apuntando a `Rails.root.join("storage")`, en un
+contenedor **los archivos subidos desaparecen en el próximo deploy**. El arreglo
+es un volumen persistente (el `config/deploy.yml` de este repo ya declara
 `volumes: ["stock_storage:/rails/storage"]`) o, mejor, S3.
+
+**Acá había un problema de factor III además del VI, y ya está corregido.** El
+valor estaba **hardcodeado** como `:local` en `production.rb`: cambiar a S3 exigía
+tocar código y redeployar la imagen, que es exactamente lo que el factor III dice
+que no hagas. Hoy sale del entorno:
+
+```ruby
+# config/environments/production.rb:29
+config.active_storage.service = ENV.fetch("ACTIVE_STORAGE_SERVICE", "local").to_sym
+```
+
+El default sigue siendo `local` —así arranca sin configurar nada— pero pasar a S3
+es una variable de entorno y un servicio más en `config/storage.yml`, sin rebuild.
+El ⚠️ operativo no desaparece: si no seteás la variable, seguís con disco efímero;
+lo que cambió es que ahora **es una decisión de deploy**, no una de código.
 
 ---
 
@@ -130,10 +151,11 @@ Valores tomados de los tres archivos del repo:
 | `active_record.attributes_for_inspect` | `:all` | `:all` | `[:id]` |
 | deprecaciones | `active_support.deprecation = :log` | `= :stderr` | `report_deprecations = false` |
 | `silence_healthcheck_path` | — | — | `/up` |
-| `force_ssl` | — | — | **comentado** (`production.rb:31`) |
-| `hosts` | `.localhost`, `.test` y cualquier IP | — | **comentado** (`production.rb:83`) |
+| `assume_ssl` | — | — | `true` (`production.rb:35`) |
+| `force_ssl` | — | — | `true` (`production.rb:45`) — **estuvo comentado**, ver abajo |
+| `hosts` | `.localhost`, `.test` y cualquier IP | — | **comentado** (`production.rb:99`) |
 
-Cinco cosas de esa tabla que hay que poder explicar:
+Seis cosas de esa tabla que hay que poder explicar:
 
 **`eager_load`.** En dev, Rails carga las clases *lazy* vía Zeitwerk: la primera
 vez que nombrás `Stock::ApplyMovement`, el autoloader busca
@@ -155,23 +177,88 @@ segundos. Sin esto, el 90% de tus logs son healthchecks.
 **Las deprecaciones son dos opciones distintas y se confunden todo el tiempo.**
 `config.active_support.deprecation` elige el *comportamiento* (`:log` en dev,
 `:stderr` en test, y podés poner `:raise` para que una deprecación rompa el
-build). `config.active_support.report_deprecations = false` (`production.rb:47`)
+build). `config.active_support.report_deprecations = false` (`production.rb:60`)
 es otra cosa: apaga el reporte entero. No son intercambiables.
 
-**`force_ssl` comentado.** Está así porque el generador de Rails lo deja
-comentado, y este repo no lo tocó. En un deploy real hay que decidir: si
-terminás TLS en un proxy (kamal-proxy, ALB), ponés `config.assume_ssl = true` y
-`config.force_ssl = true`. Y **si prendés `force_ssl`, acordate de la línea 34**:
+**`force_ssl`: ESTUVO comentado, y era el único hallazgo de confianza alta de
+Brakeman.** El generador de Rails lo deja comentado y este repo lo había dejado
+así. Sin `force_ssl` no hay redirect HTTP→HTTPS, no hay HSTS y —lo que más
+importa— **la cookie de sesión sale sin el flag `secure`**: viaja en claro en
+cuanto alguien pega una vez por HTTP, y con `same_site: lax` eso alcanza para
+robarla desde la misma red. `brakeman -A` lo cantaba como *"The application does
+not force use of HTTPS"*.
+
+Hoy están las dos líneas puestas, y van juntas por una razón:
 
 ```ruby
-# config/environments/production.rb:34
+# config/environments/production.rb:35 y :45
+config.assume_ssl = true
+config.force_ssl  = true
+```
+
+`assume_ssl` sola no fuerza nada; `force_ssl` sola, detrás de un proxy que ya
+terminó TLS, entra en **loop infinito de redirects** (Rails ve `http`, redirige a
+`https`, el proxy vuelve a entregar `http`…). El orden en el stack es lo que lo
+resuelve, y se ve corriendo `bin/rails middleware` con `RAILS_ENV=production`:
+
+```text
+use ActionDispatch::AssumeSSL     # 1º: marca la request como HTTPS
+use ActionDispatch::SSL           # 2º: force_ssl, ya no tiene nada que redirigir
+```
+
+`AssumeSSL` es cuatro líneas (`actionpack-8.1.3.1/lib/action_dispatch/middleware/assume_ssl.rb`):
+setea `HTTPS=on`, `HTTP_X_FORWARDED_PROTO=https` y `rack.url_scheme=https`. Corre
+**antes** que `ActionDispatch::SSL`, así que cuando `force_ssl` mira la request ya
+la ve segura: no redirige, pero sí manda HSTS y sí marca las cookies como
+`secure`, que es lo que queríamos.
+
+**El corolario, y es la parte que hay que saber:** por eso la exclusión del
+healthcheck sigue —correctamente— comentada:
+
+```ruby
+# config/environments/production.rb:47
 # config.ssl_options = { redirect: { exclude: ->(request) { request.path == "/up" } } }
 ```
 
-Sin esa exclusión, el healthcheck por HTTP recibe un `301` en vez de `200`, el
-balanceador marca el contenedor como no sano y **el deploy nunca termina**. Es un
-clásico y está literalmente escrito en el archivo generado; la gente lo borra sin
-leerlo.
+Con `assume_ssl = true` **no hay redirect que excluir**: `/up` por HTTP devuelve
+200 igual. La línea es la red de seguridad para el día que alguien saque
+`assume_ssl` (por ejemplo, porque movió el TLS al propio contenedor): ahí sí,
+`force_ssl` sin la exclusión le contesta `301` al balanceador, el contenedor nunca
+queda sano y **el deploy nunca termina**. Es un clásico, está literalmente escrito
+en el archivo generado, y la gente lo borra sin leerlo.
+
+**`hosts` también se corrigió.** Estaba comentado (el generador de Rails 8.1 lo
+deja como `config.hosts = [...]`, no como `config.hosts << ...`, detalle que hizo
+que un primer intento de arreglo no tomara). Hoy se arma desde el entorno:
+
+```ruby
+config.hosts = []
+config.hosts << ENV["APP_HOST"] if ENV["APP_HOST"].present?
+config.hosts << /.*\.#{Regexp.escape(ENV["APP_DOMAIN"])}\z/ if ENV["APP_DOMAIN"].present?
+config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
+```
+
+La excepción del `/up` no es opcional: el health check del balanceador llega por
+IP, sin un `Host` válido. Si no lo exceptuás, la protección marca la instancia
+como caída y te saca de rotación — la defensa te tumba el servicio sola.
+
+```ruby
+# config/environments/production.rb:99-105 — todavía comentado
+# config.hosts = [ "example.com", /.*\.example\.com/ ]
+# config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
+```
+
+Sin `config.hosts`, Rails **no monta** `ActionDispatch::HostAuthorization` en
+producción. Comprobalo comparando los dos stacks completos: en
+`RAILS_ENV=production bin/rails middleware` el primer middleware es
+`ActionDispatch::AssumeSSL`, mientras que en desarrollo —donde `hosts` sí tiene
+valores (`.localhost`, `.test`)— arriba de todo aparece
+`use ActionDispatch::HostAuthorization`. O sea que hoy no hay protección contra
+DNS rebinding ni contra `Host` falsificado. Para llenarlo hace falta el dominio
+real, que en este
+repo es un placeholder (`stock.tu-dominio.test`); cuando lo tengas, va con la
+exclusión de `/up`, porque el balanceador pega por IP y sin esa excepción el
+healthcheck se come un `403 Blocked hosts`.
 
 ### 2.2 "Anda en dev, rompe en prod": las 5 causas típicas
 
@@ -188,15 +275,57 @@ Hold on, I am eager loading the application.
 All is good!
 ```
 
-Metelo en el CI. Este repo no lo tiene todavía en `.github/workflows/ci.yml`, y es
-lo primero que le agregaría (§12).
+**Metelo en el CI.** Este repo no lo tenía, era la primera cosa que faltaba, y ya
+está puesto: el job `test` de `.github/workflows/ci.yml` corre el step
+`Check Zeitwerk autoloading` entre `db:test:prepare` y `rspec`, con el comentario
+que explica por qué (§12).
+
+```yaml
+- name: Check Zeitwerk autoloading
+  run: bin/rails zeitwerk:check
+```
+
+Va **antes** de los tests a propósito: si el autoloading está roto, querés
+enterarte en 10 segundos y no después de 358 ejemplos.
 
 **2. Una gema en el grupo equivocado.** Si usás algo de un grupo `:development` en
 código que corre en producción, en tu máquina anda (todos los grupos están
 cargados) y en el contenedor tira `NameError`. El `Dockerfile:27` pone
-`BUNDLE_WITHOUT="development"`, así que la gema **no está instalada**. Este repo
-tiene `bullet` en el stack de middleware de desarrollo (lo ves en `bin/rails
-middleware`), y por eso mismo no puede referenciarse desde código de dominio.
+`BUNDLE_WITHOUT="development"`, así que la gema **no está instalada**. En este
+repo `bullet` se monta como middleware (`use Bullet::Rack` en el `bin/rails
+middleware` de desarrollo) y por eso mismo no puede referenciarse desde código de
+dominio.
+
+⚠️ **Y acá hay un caso ESTUVO VIVO que es la variante más cara del mismo error:
+la gema en el grupo equivocado no siempre explota — a veces se calla.** `bullet`
+estaba declarada sólo en `group :development`. En `test` la constante `Bullet` no
+existía, y toda la configuración de `spec/support/bullet.rb` estaba envuelta en
+`if defined?(Bullet)`: la guarda daba `false`, el archivo no hacía nada, y los
+ejemplos marcados `:n_plus_one` pasaban en verde **hubiera o no un N+1**. Una red
+de seguridad que no atrapa nada y encima te da confianza — el peor tipo de falla,
+porque el `NameError` al menos te avisa.
+
+Cómo quedó, y vale por lo que enseña de dónde va cada cosa:
+
+- La gema pasó a `group :development, :test` (`Gemfile:183`, con el comentario que
+  cuenta el bug).
+- **La configuración se movió a `config/environments/test.rb`**, dentro de un
+  `after_initialize`, no a un `before(:suite)` de RSpec. El motivo es concreto:
+  `Bullet.enable = true` aplica los parches sobre ActiveRecord **en el momento de
+  la asignación**, así que hacerlo después de que Rails terminó de bootear llega
+  tarde para algunos ganchos y la detección queda muda. `spec/support/bullet.rb`
+  hoy sólo maneja el ciclo `start_request`/`end_request` y expone el helper
+  `detectando_n_plus_one`.
+- Se agregó `spec/n_plus_one_guard_spec.rb`, que **testea la herramienta** con un
+  control positivo: provoca un N+1 a propósito y verifica que Bullet lo levante.
+  Es la única forma de saber que el detector detecta.
+- El detector de eager loading **innecesario** quedó opt-in con `BULLET_UNUSED=1`
+  (`test.rb:113`): da falsos positivos cuando un camino precarga para el caso feliz
+  y corta antes por una validación. El de N+1 sigue siempre activo, porque sus
+  hallazgos son bugs de verdad.
+
+Con Bullet efectivamente encendido aparecieron N+1 reales en los serializers; el
+detalle del arreglo está en `docs/13-observabilidad-y-performance.md`.
 
 **3. Cache y perform_caching.** En dev, `config.action_controller.perform_caching`
 es `false` salvo que exista `tmp/caching-dev.txt`. Todo lo que se apoya en cache
@@ -555,15 +684,39 @@ suficiente" en un binario que no tenés que configurar y que vive **dentro del
 mismo contenedor**, lo cual mantiene el modelo de un contenedor = un servicio.
 
 **Consecuencia para el rate limiting:** con Thruster (o kamal-proxy, o un ALB)
-delante, `request.ip` sin más es la IP del proxy. Por eso `config/application.rb:52`
-inserta `Rack::Attack` **después** de `ActionDispatch::RemoteIp` y no en la
-posición 0. El middleware stack real lo confirmás con `bin/rails middleware`:
+delante, `request.ip` sin más es la IP del proxy. Si `Rack::Attack` corre antes de
+`ActionDispatch::RemoteIp`, **todos tus usuarios comparten un único contador** y
+el primero que se pase deja afuera a todo el mundo. Por eso
+`config/application.rb:64` lo ubica **después** de `RemoteIp` y no en la posición
+0. El middleware stack real lo confirmás con `bin/rails middleware`:
 
 ```text
 use ActionDispatch::RequestId
 use ActionDispatch::RemoteIp
-use Rack::Attack          # <- acá
+use Rack::Attack          # <- acá, una sola vez
 ```
+
+⚠️ **Ese "una sola vez" ESTUVO mal, y el detalle es de manual.** La línea era
+`config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack`, y el
+railtie de la gema **ya hace** `app.middleware.use(Rack::Attack)` por su cuenta,
+montándolo al final del stack. Con `insert_after` quedaba montado **dos veces**:
+`bin/rails middleware` mostraba dos `use Rack::Attack`. No había doble conteo —la
+gema se protege con `env["rack.attack.called"]`— pero era un frame de Rack inútil
+en cada request y una trampa para cualquiera que leyera el stack y concluyera que
+los límites cortaban a la mitad.
+
+El arreglo es una palabra, y la alternativa obvia **no** funciona:
+
+```ruby
+# config/application.rb:64
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+`move_after` mueve el que ya existe, que es exactamente lo que querés.
+`delete` + `insert_after` **no** sirve: las operaciones sobre el stack se acumulan
+y se aplican en orden al construirlo, así que el `delete` puede llevarse el
+middleware que vos mismo insertaste y dejarte sin ninguno — que es peor que
+tenerlo dos veces.
 
 ⚠️ `MAX_REQUEST_BODY=0` (el default) significa **sin límite de tamaño de body**.
 En una API pública eso es un vector de DoS trivial. Ponele un número.
@@ -574,7 +727,7 @@ En una API pública eso es un vector de DoS trivial. Ponele un número.
 
 ### 6.1 Estado real en este repo
 
-La gema está en el `Gemfile:231` (`kamal 2.12.0`, `require: false`) y la
+La gema está en el `Gemfile:256` (`kamal 2.12.0`, `require: false`) y la
 configuración **existe y es válida**:
 
 ```bash
@@ -584,6 +737,7 @@ config/deploy.yml
 .kamal/:
 hooks
 secrets
+secrets.example
 
 $ bundle exec kamal config
 ---
@@ -594,15 +748,19 @@ $ bundle exec kamal config
 - 192.168.0.2
 - 192.168.0.1
 :primary_host: 192.168.0.1
-:version: 7a036ef0bfe149583e0060146b43e30faed66acd
+:version: 3f31451b3ca18bdede8667e9785099ed861d80e5
 :repository: tu-usuario/stock
+:absolute_image: tu-usuario/stock:3f31451b3ca18bdede8667e9785099ed861d80e5
 ...
 ```
 
 Tres detalles del estado real que hay que tener presentes:
 
-- `config/deploy.yml` **está commiteado**; `.kamal/secrets` **no** (`.gitignore:49`).
-  Eso es lo correcto: la config es pública, los secretos no.
+- `config/deploy.yml` **está commiteado**; `.kamal/secrets` **no**
+  (`.gitignore:49` y `:52`). Lo que sí se versiona es `.kamal/secrets.example`,
+  que documenta *qué* variables hacen falta sin sus valores. Eso es lo correcto:
+  la config es pública, los secretos no, y la lista de secretos tampoco es un
+  secreto.
 - `.kamal/hooks/` sólo tiene los `*.sample` que genera `kamal init`. Kamal busca
   el archivo con el nombre exacto (`hook_exists?` hace
   `File.join(hooks_path, "pre-deploy")`, sin sufijo), así que **hoy no corre
@@ -612,8 +770,8 @@ Tres detalles del estado real que hay que tener presentes:
   placeholders. La config parsea y valida, pero un `kamal deploy` contra esos
   valores no llega a ningún lado.
 
-Lo que falta para deployar de verdad: reemplazar esos placeholders y **descomentar
-algo en `.kamal/secrets`**, que hoy está entero comentado (§6.3).
+Lo que falta para deployar de verdad es reemplazar esos placeholders. Lo que
+**faltaba** era el archivo de secretos, y eso ya está resuelto (§6.3).
 
 ### 6.2 Qué es
 
@@ -668,7 +826,8 @@ env:
     RAILS_ENV: production
     RAILS_MAX_THREADS: 5
     WEB_CONCURRENCY: 2
-    SOLID_QUEUE_IN_PUMA: false   # ⚠️ ver §7.4: esto NO hace lo que parece
+    # ⚠️ Acá VIVÍA `SOLID_QUEUE_IN_PUMA: false`. Ya no está, y en su lugar hay
+    # un comentario largo explicando por qué no puede volver. Ver §7.4.
     QUEUE_ADAPTER: solid_queue
     OUTBOX_ADAPTER: webhook
   secret:
@@ -699,8 +858,8 @@ Dos observaciones sobre este archivo concreto:
 - **`accessories` está comentado**, y es lo correcto para producción: un Postgres
   en un contenedor gestionado por Kamal no tiene backups automáticos ni failover
   (§6.8).
-- **`SOLID_QUEUE_IN_PUMA: false` no apaga nada.** Es la trampa más cara del
-  archivo y la desarmo en §7.4.
+- **`SOLID_QUEUE_IN_PUMA: false` no apagaba nada, y por eso ya no está.** Era la
+  trampa más cara del archivo; la desarmo entera en §7.4.
 
 ### 6.3 Secretos
 
@@ -713,18 +872,24 @@ De ahí salen los nombres que `deploy.yml` declara bajo `registry/password`,
 archivo lo dice en mayúsculas: *"DO NOT ENTER RAW CREDENTIALS HERE! This file
 needs to be safe for git."*
 
-⚠️ **En este repo el archivo existe pero está entero comentado.** Con cuatro
-variables declaradas como `secret` en `deploy.yml` y nada que las resuelva, el
-deploy corta con:
+⚠️ **ESTUVO VIVO: el archivo existía pero estaba ENTERO COMENTADO.** Con cuatro
+variables declaradas como `secret` en `deploy.yml` y nada que las resolviera, el
+deploy no llegaba ni a conectarse por SSH: cortaba al parsear la config, con
 
 ```text
 Kamal::ConfigurationError: Secret 'RAILS_MASTER_KEY' not found in .kamal/secrets
 ```
 
-Hay que descomentar una de las tres formas:
+Es un buen ejemplo de por qué "la config valida" no significa "el deploy anda":
+`kamal config` renderiza el YAML sin resolver los secretos, así que pasaba en
+verde mientras el deploy real era imposible.
+
+**Cómo quedó.** `.kamal/secrets` tiene hoy las cuatro variables resueltas, y se
+agregó `.kamal/secrets.example` —idéntico pero versionado— para que cualquiera que
+clone el repo sepa qué tiene que completar:
 
 ```bash
-# .kamal/secrets
+# .kamal/secrets  (gitignored)  ·  .kamal/secrets.example  (commiteado)
 
 # Opción 1: desde el entorno (lo que usás en el CI: GitHub Actions inyecta el secret)
 KAMAL_REGISTRY_PASSWORD=$KAMAL_REGISTRY_PASSWORD
@@ -732,6 +897,14 @@ KAMAL_REGISTRY_PASSWORD=$KAMAL_REGISTRY_PASSWORD
 # Opción 2: vía comando
 RAILS_MASTER_KEY=$(cat config/master.key)
 
+DATABASE_URL=$DATABASE_URL
+OUTBOX_WEBHOOK_URL=$OUTBOX_WEBHOOK_URL
+OUTBOX_WEBHOOK_SECRET=$OUTBOX_WEBHOOK_SECRET
+```
+
+Y queda la tercera forma, que es la que querés en un equipo:
+
+```bash
 # Opción 3: vía adapters. Kamal 2.12.0 trae 1Password, Bitwarden (y Bitwarden
 # Secrets Manager), LastPass, Doppler, Enpass, Passbolt, AWS Secrets Manager y
 # GCP Secret Manager — están en kamal-2.12.0/lib/kamal/secrets/adapters/.
@@ -743,6 +916,10 @@ RAILS_MASTER_KEY=$(kamal secrets extract RAILS_MASTER_KEY $SECRETS)
 La opción 2 es cómoda y tiene una trampa: `cat config/master.key` sólo funciona
 desde una máquina que tenga el archivo. En el CI no lo tenés (está gitignoreado),
 así que ahí va sí o sí la opción 1 o la 3.
+
+El patrón `archivo real gitignoreado + archivo .example versionado` es el mismo de
+`.env` / `.env.example`, y vale la pena nombrarlo así en una entrevista: lo que se
+versiona no es el secreto, es **el contrato** de qué secretos hacen falta.
 
 Con destinos (`kamal deploy -d staging`) hay `.kamal/secrets-common` para lo
 compartido y `.kamal/secrets.staging` para lo específico; `.kamal/secrets` se usa
@@ -952,7 +1129,7 @@ require "solid_queue/cli"
 SolidQueue::Cli.start(ARGV)
 ```
 
-Y la configuración de producción de `config/queue.yml:60-74` es explícita sobre
+Y la configuración de producción de `config/queue.yml:66-80` es explícita sobre
 cómo se reparte:
 
 ```yaml
@@ -1015,10 +1192,27 @@ cleanup:              { class: Cleanup::ExpiredRecordsJob,    schedule: every da
 ```
 
 La ventaja grande sobre `cron` del sistema está escrita en el propio archivo
-(`config/recurring.yml:6-8`): **corre en una sola instancia aunque tengas 10
-servidores**, porque Solid Queue elige un líder con un lock. Con `crontab` en 10
-máquinas, `ReconcileBalancesJob` corre 10 veces en paralelo. Es el equivalente
-Rails de `ShedLock` en Spring, y viene incluido.
+(`config/recurring.yml:4-16`): **corre en una sola instancia aunque tengas 10
+servidores**. Con `crontab` en 10 máquinas, `ReconcileBalancesJob` corre 10 veces
+en paralelo. Es el equivalente Rails de `ShedLock` en Spring, y viene incluido.
+
+⚠️ **Cuidado con CÓMO lo logra, porque el comentario de este archivo lo decía mal
+y ya está corregido.** Decía que Solid Queue **elige un líder**, que es lo que
+todo el mundo asume y lo que suena bien en una entrevista. No hay elección de
+líder, ni consenso, ni lock distribuido. El mecanismo es más simple y más robusto:
+
+> cada scheduler intenta **INSERTAR** una fila en `solid_queue_recurring_executions`,
+> que tiene un **índice único sobre `(task_key, run_at)`**. El primero gana; los
+> demás se comen una violación de unicidad que Solid Queue traduce a
+> `RecurringExecution::AlreadyRecorded` y siguen de largo.
+
+Es el mismo truco que usa este repo para la idempotencia de la API: **un índice
+único como lock distribuido**, sin coordinación ni protocolo. La diferencia
+práctica importa: una elección de líder tiene estado, tiene un período de
+inestabilidad cuando el líder muere y hay que razonar sobre particiones de red; un
+`INSERT` que choca contra un índice único es atómico y no tiene ninguna de esas
+propiedades. Decir "elige un líder" no sólo es incorrecto: describe un sistema más
+frágil que el que hay.
 
 ⚠️ **La zona horaria**: el schedule se interpreta en `Time.zone` de la app.
 `config/application.rb` **no** setea `config.time_zone`, así que es UTC. "3am" es
@@ -1054,7 +1248,8 @@ $ ruby -e 'ENV["Y"]="";      puts ENV["Y"] ? "TRUTHY" : "falsy"'
 TRUTHY
 ```
 
-Y ahora el `config/deploy.yml` de este repo, rol `web`:
+Y ahora el bug. ⚠️ **ESTUVO VIVO: el `config/deploy.yml` de este repo tenía esto
+en el rol `web`:**
 
 ```yaml
 env:
@@ -1062,27 +1257,46 @@ env:
     SOLID_QUEUE_IN_PUMA: false
 ```
 
-Kamal serializa `clear` con `--env CLAVE=valor`, así que el contenedor arranca con
-`SOLID_QUEUE_IN_PUMA=false`, Puma lee el string `"false"`, lo evalúa como
-verdadero y **carga el plugin igual**. Resultado: el supervisor de Solid Queue
-corre adentro de los contenedores `web` *además* de en el rol `job`. Los mismos
-jobs los toman dos flotas distintas, las conexiones se duplican (§7.2) y la
-latencia del web se ensucia con trabajo de background — el escenario exacto que la
-línea pretendía evitar.
+Kamal serializa `clear` con `--env CLAVE=valor`, así que el contenedor arrancaba
+con `SOLID_QUEUE_IN_PUMA=false`, Puma leía el string `"false"`, lo evaluaba como
+verdadero y **cargaba el plugin igual**. Resultado: el supervisor de Solid Queue
+corriendo adentro de los contenedores `web` *además* de en el rol `job`. Los
+mismos jobs tomados por dos flotas distintas, las conexiones duplicadas (§7.2) y
+la latencia del web ensuciada con trabajo de background — el escenario exacto que
+la línea pretendía evitar. Y lo peor: el YAML **se leía como si estuviera
+apagado**, así que nadie iba a mirar ahí.
 
-Lo verificás sin desplegar nada:
+**El arreglo es sacar la clave del bloque `clear`**, no ponerla en `false`: una
+variable de entorno no tiene forma de decir "no". En su lugar quedó un comentario
+largo en `config/deploy.yml` explicando por qué no puede volver — porque el
+próximo que lea el archivo va a querer "documentar" que está apagada, que es
+justamente cómo llegó ahí la primera vez.
+
+Lo verificás sin desplegar nada, y hoy da esto:
 
 ```bash
 $ bundle exec ruby -e 'require "kamal"
   c = Kamal::Configuration.create_from(config_file: Pathname.new("config/deploy.yml"))
   puts c.role(:web).env("192.168.0.1").clear.inspect'
-{"RAILS_ENV"=>"production", ..., "SOLID_QUEUE_IN_PUMA"=>false, ...}
+{"RAILS_ENV"=>"production", "RAILS_MAX_THREADS"=>5, "WEB_CONCURRENCY"=>2,
+ "QUEUE_ADAPTER"=>"solid_queue", "OUTBOX_ADAPTER"=>"webhook"}
 ```
 
-**El arreglo correcto es sacar la clave del bloque `clear`**, no ponerla en
-`false`: una variable de entorno no tiene forma de decir "no". La alternativa, si
-querés dejarla documentada en el YAML, es que `config/puma.rb` interprete el
-valor:
+La clave ya no aparece, así que `ENV["SOLID_QUEUE_IN_PUMA"]` es `nil` en el
+contenedor web y el plugin no se carga.
+
+⚠️ Ojo con un detalle de ese output, porque es la otra mitad de la lección: cuando
+la clave estaba, Kamal la reportaba como `"SOLID_QUEUE_IN_PUMA"=>false` — el
+**booleano** de YAML, no el string. Mirando esa línea uno concluye "está bien, es
+`false`". El string aparece recién en el contenedor, después de que Docker
+serializa el `--env`. La representación intermedia te miente; lo único que
+importa es lo que ve `ENV[...]` del otro lado.
+
+Nótese que `config/puma.rb:38` **quedó igual**: sigue diciendo
+`plugin :solid_queue if ENV["SOLID_QUEUE_IN_PUMA"]`. Es deliberado — el bug estaba
+en el `deploy.yml`, no acá, y arreglar el consumidor no arregla la clase de
+problema. Pero si querés blindarlo de todos modos, la alternativa es que
+`config/puma.rb` interprete el valor:
 
 ```ruby
 plugin :solid_queue if %w[1 true].include?(ENV["SOLID_QUEUE_IN_PUMA"].to_s.downcase)
@@ -1192,6 +1406,52 @@ estado **`INVALID`**: hay que borrarlo (`DROP INDEX`) y rehacerlo. Chequealo con
 SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
 ```
 
+**Y ese ejemplo dejó de ser hipotético: el repo tiene la migración de verdad.**
+`db/migrate/20260830220000_add_ledger_global_index.rb` agrega el índice
+`(occurred_at DESC, id DESC)` sobre `stock_movements`, con `disable_ddl_transaction!`
+y `algorithm: :concurrently`:
+
+```ruby
+class AddLedgerGlobalIndex < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!
+
+  def change
+    add_index :stock_movements, [ :occurred_at, :id ],
+              order: { occurred_at: :desc, id: :desc },
+              algorithm: :concurrently,
+              if_not_exists: true,
+              name: "index_stock_movements_global_ledger"
+  end
+end
+```
+
+El hallazgo que la motivó vale por sí solo: los tres índices que tenía
+`stock_movements` empezaban por otra columna (`stock_item_id`, `product_id`,
+`warehouse_id`), y un B-tree sólo sirve si la query usa un **prefijo izquierdo**
+de sus columnas. O sea que el ledger *sin filtros* —el del panel y el de
+`GET /api/v1/stock_movements`— no tenía ningún índice utilizable y hacía Seq Scan
++ Sort sobre la tabla que más crece del sistema. El `id` no es decorativo:
+desempata y es lo que habilita la comparación de tuplas de la paginación por
+keyset (`WHERE (occurred_at, id) < (?, ?)`).
+
+Dos detalles operativos que están en el comentario de la migración y que conviene
+retener. Uno: el timestamp `20260830220000` es **posterior** a
+`StrongMigrations.start_after`, así que esta migración sí pasa por el linter — de
+ahí que venga con `CONCURRENTLY` de fábrica y no como un agregado posterior. Dos:
+verificarlo en desarrollo **no** te va a mostrar el índice en uso, porque con 109
+filas el planner elige Seq Scan y **tiene razón** (leer la tabla entera es más
+barato que saltar por el índice). Para comprobar que el índice sirve hay que
+forzarlo:
+
+```sql
+SET enable_seqscan = off;
+EXPLAIN SELECT * FROM stock_movements ORDER BY occurred_at DESC, id DESC LIMIT 50;
+--  Index Scan using index_stock_movements_global_ledger ...
+```
+
+Medir performance sobre una base de juguete y concluir que un índice "no se usa"
+es de los errores más comunes que hay.
+
 ### 8.4 Expand-contract, con el caso concreto de este repo
 
 Supongamos que hay que renombrar `stock_movements.reason` a
@@ -1293,7 +1553,7 @@ deploy:
   `CREATE TABLE stock_movements_reason_backup AS SELECT id, reason FROM stock_movements`.
 
 Y `config.active_record.dump_schema_after_migration = false` en
-`production.rb:77`: en producción no se regenera `db/schema.rb` (el contenedor no
+`production.rb:93`: en producción no se regenera `db/schema.rb` (el contenedor no
 debería escribir en el repo). En dev sí, y **el `schema.rb` se commitea**: el CI de
 este repo corre `bin/rails db:test:prepare`, que carga el schema en vez de correr
 las migraciones una por una — lo cual, además de ser más rápido, **detecta si
@@ -1497,7 +1757,7 @@ Solid Queue maneja las señales así
 | `TERM` / `INT` | `stop` + **terminación graceful**: espera a que los jobs en curso terminen |
 | `QUIT` | terminación **inmediata** |
 
-Y el default que hay que conocer (`lib/solid_queue.rb:35`):
+Y el default de la gema, que hay que conocer (`lib/solid_queue.rb:35`):
 
 ```ruby
 mattr_accessor :shutdown_timeout, default: 5.seconds
@@ -1507,7 +1767,12 @@ mattr_accessor :shutdown_timeout, default: 5.seconds
 `shutdown_timeout_exceeded` y mata los procesos
 (`supervisor.rb:114-122`). Si tus jobs tardan más de 5 segundos —y en esta app,
 `Outbox::PublishPendingJob` con un webhook de `timeout: 5` puede tardar
-tranquilamente más— **te van a matar jobs a mitad de camino en cada deploy**.
+tranquilamente más— **te matan jobs a mitad de camino en cada deploy**.
+
+⚠️ **ESTUVO VIVO: este repo corría con ese default.** No había ningún lugar donde
+se subiera, así que cada deploy cortaba a los 5 segundos. Ya está resuelto —el
+detalle del arreglo, en §10.3.1— pero el default sigue siendo 5 y es el número
+que hay que saber en una entrevista.
 
 ¿Qué pasa con un job matado a la mitad? Solid Queue lo tiene resuelto, pero con
 una latencia que hay que saber:
@@ -1531,15 +1796,59 @@ ser idempotentes**, porque `at-least-once` es la garantía real. El comentario d
 delivery no existe; lo que existe es at-least-once delivery + idempotent
 processing"*.
 
-Para el deploy, tres cosas concretas:
+### 10.3.1 Cómo quedó configurado
+
+El archivo **existe** y es nuevo: `config/initializers/solid_queue.rb`.
 
 ```ruby
-# config/initializers/solid_queue.rb  (NO existe todavía en este repo)
-SolidQueue.shutdown_timeout = 25.seconds   # menor que el SIGKILL del orquestador
+# config/initializers/solid_queue.rb
+Rails.application.configure do
+  config.solid_queue.shutdown_timeout = ENV.fetch("SOLID_QUEUE_SHUTDOWN_TIMEOUT", 25).to_i.seconds
+  config.solid_queue.silence_polling  = true   # el polling ensucia el log de SQL
+end
 ```
 
+Verificado contra el repo, no leído del archivo:
+
+```bash
+$ bin/rails runner 'puts SolidQueue.shutdown_timeout.inspect'
+25 seconds
+```
+
+Tres cosas de esas dos líneas:
+
+- **Va por `config.solid_queue.*`, no por `SolidQueue.shutdown_timeout =`
+  directo**, y el motivo es el orden de los initializers. El engine de Solid Queue
+  registra uno (`solid_queue.config`, en
+  `solid_queue-1.7.0/lib/solid_queue/engine.rb:13-17`) que hace
+  `config.solid_queue.each { |name, value| SolidQueue.public_send("#{name}=", value) }`.
+  Ese initializer corre **después** de que Rails carga `config/initializers/*.rb`,
+  cosa que se verifica sin adivinar:
+
+  ```bash
+  $ bin/rails runner 'n = Rails.application.initializers.map { _1.name.to_s }
+    puts "load_config_initializers=#{n.index("load_config_initializers")} " \
+         "solid_queue.config=#{n.index("solid_queue.config")}"'
+  load_config_initializers=116 solid_queue.config=271
+  ```
+
+  O sea: nuestro archivo deja el valor en `config.solid_queue`, y el engine lo
+  copia a la constante 155 pasos después. Escribir sobre `SolidQueue.x` a mano
+  también anda, pero te ata a que la gema no pise ese atributo; la forma
+  `config.solid_queue.x` es el contrato público. El `bin/rails runner` de arriba
+  es lo que confirma que el valor efectivamente llegó.
+- **25 segundos, y el número no es arbitrario:** tiene que ser mayor que tu job
+  p99 y **menor** que el plazo que te da el orquestador antes del `SIGKILL`. Con
+  el `drain_timeout` de Kamal en 30 s (§6.4), 25 entra justo con margen. Si lo
+  ponés en 40, el orquestador te mata igual y perdés toda la ventaja de haberlo
+  configurado.
+- **Sale de `SOLID_QUEUE_SHUTDOWN_TIMEOUT`** con 25 de default, así que se ajusta
+  por entorno sin rebuild (factor III).
+
+Para el deploy, tres cosas concretas:
+
 1. Subí `shutdown_timeout` a algo mayor que tu job p99 y **menor** que el plazo
-   que te da el orquestador antes del `SIGKILL`.
+   que te da el orquestador antes del `SIGKILL`. (Hecho: 25 s.)
 2. Partí los jobs largos en pasos chicos con checkpoint.
 3. Ordená el rollout: **primero** los workers, **después** el web. Si deployás el
    web primero, hay una ventana en la que workers viejos toman jobs con payloads
@@ -1550,16 +1859,24 @@ SolidQueue.shutdown_timeout = 25.seconds   # menor que el SIGKILL del orquestado
 
 ### 10.4 Checklist de un deploy sin downtime
 
+Los `[x]` son los que este repo ya tiene resueltos en el código; los `[ ]`
+dependen de cada deploy y hay que mirarlos cada vez.
+
 ```text
 [ ] La migración es compatible hacia atrás (§8.2)
 [ ] Ninguna firma de job cambió de forma incompatible
 [ ] deploy_timeout > tiempo de boot (eager_load + db:prepare)
 [ ] drain_timeout > request p99
-[ ] shutdown_timeout de Solid Queue > job p99
-[ ] asset_path configurado (bridge de assets)
-[ ] Ningún flag booleano pasado por ENV como "false" (§7.4)
-[ ] El healthcheck no está detrás de force_ssl sin exclusión
+[x] shutdown_timeout de Solid Queue > job p99
+      config/initializers/solid_queue.rb, 25 s (era el default de 5) — §10.3.1
+[x] asset_path configurado (bridge de assets)
+      config/deploy.yml
+[x] Ningún flag booleano pasado por ENV como "false" (§7.4)
+      SOLID_QUEUE_IN_PUMA sacado de env.clear
+[x] El healthcheck no está detrás de force_ssl sin exclusión
+      force_ssl ON, pero con assume_ssl delante no hay redirect que excluir (§2.1)
 [ ] Sabés cómo hacer rollback y probaste que funciona
+[ ] config.hosts poblado con el dominio real, con exclusión de /up (§2.1)
 ```
 
 ---
@@ -1589,7 +1906,7 @@ Nota específica de este dominio: `stock_movements` es un **ledger append-only**
 proyección `stock_items` se corrompe, **la podés reconstruir sumando el ledger**,
 que es exactamente lo que hace `Stock::ReconcileBalancesJob`
 (`app/jobs/stock/reconcile_balances_job.rb`, agendado a las 3 AM en
-`config/recurring.yml:32-34`). El backup te protege del "perdí el ledger"; el
+`config/recurring.yml:40-42`). El backup te protege del "perdí el ledger"; el
 ledger te protege del "se desincronizó la proyección". Son dos capas distintas y
 poder distinguirlas es una buena señal.
 
@@ -1600,7 +1917,7 @@ $ time pg_dump -Fc -d stock_development -f /tmp/stock.dump
 real    0m0.143s
 
 $ ls -lh /tmp/stock.dump
--rw-r--r-- 1 root root 103K /tmp/stock.dump
+-rw-r--r-- 1 root root 104K /tmp/stock.dump
 ```
 
 `-Fc` (formato custom) es lo que querés casi siempre: comprimido, y permite
@@ -1629,6 +1946,24 @@ Los 109 movimientos volvieron y —el punto importante— **la columna generada 
 como columna generada**, no como una columna común con valores copiados. Si eso no
 funcionara, la invariante `quantity_available = on_hand - reserved` dejaría de
 mantenerse sola y nadie se enteraría hasta que los números no cerraran.
+
+Los índices también viajan, incluido el que se creó con `CONCURRENTLY` (§8.3):
+
+```bash
+$ psql -d stock_restore_test -c "select indexname from pg_indexes
+    where tablename='stock_movements' order by 1;"
+                        indexname
+----------------------------------------------------------
+ index_stock_movements_global_ledger
+ index_stock_movements_ledger
+ index_stock_movements_on_idempotency_key
+ ...
+```
+
+Detalle no obvio: `pg_dump` emite el `CREATE INDEX` **sin** `CONCURRENTLY`. Tiene
+sentido —la base destino está vacía y nadie la está escribiendo— pero significa
+que el tiempo de restore incluye construir todos los índices en serie, y es una
+de las razones por las que un restore tarda mucho más que el dump.
 
 ### 11.3 Por qué HAY que probar el restore
 
@@ -1668,10 +2003,29 @@ mejor.
 | `scan_ruby` | `bin/brakeman --no-pager` y `bin/bundler-audit` | análisis estático de seguridad + CVEs en gemas |
 | `scan_js` | `bin/importmap audit` | CVEs en las dependencias JS del importmap |
 | `lint` | `bin/rubocop -f github` (con cache) | estilo |
-| `test` | `bin/rails db:test:prepare` + `bundle exec rspec` | la suite |
+| `test` | `db:test:prepare` + **`zeitwerk:check`** + `rspec` (358 ejemplos) + lint de factories | la suite |
 
-Tres detalles del job `test` que están bien pensados y explicados en el propio
-archivo:
+El job `test` corre, en este orden:
+
+```yaml
+- name: Prepare database
+  run: bin/rails db:test:prepare
+- name: Check Zeitwerk autoloading      # ← agregado; ver §2.2
+  run: bin/rails zeitwerk:check
+- name: Run tests
+  env: { COVERAGE: "1", CHROME_BIN: /usr/bin/google-chrome }
+  run: bundle exec rspec
+- name: Verify factories are all valid
+  env: { LINT_FACTORIES: "1" }
+  run: bundle exec rspec spec/lib
+```
+
+El lint de factories va **en un step aparte** y no dentro de la suite normal: es
+caro (instancia y valida cada factory con todos sus traits) y no tiene por qué
+correr en cada `rspec` local, pero en CI querés que una factory rota falle en un
+step con nombre propio y no escondida entre 358 ejemplos.
+
+Tres detalles del job que están bien pensados y explicados en el propio archivo:
 
 ```yaml
 services:
@@ -1680,11 +2034,20 @@ services:
     options: >-
       --health-cmd="pg_isready -U postgres"
       --health-interval=10s --health-timeout=5s --health-retries=5
+
+  redis:
+    image: redis:7
+    options: >-
+      --health-cmd="redis-cli ping"
+      --health-interval=10s --health-timeout=5s --health-retries=5
 ```
 
 **El `--health-cmd` es crítico.** Sin él, el job arranca antes de que Postgres
 acepte conexiones y falla de forma intermitente: el clásico test *flaky* que "sólo
-falla en CI".
+falla en CI". Redis va al lado por el mismo criterio de paridad dev/prod del
+factor X: es el store de `Rack::Attack`, y los specs de rate limiting (§8 de
+`docs/08-rate-limiting.md`) necesitan contadores compartidos de verdad, no un
+`MemoryStore` que se resetea por proceso.
 
 ```yaml
 env:
@@ -1718,8 +2081,10 @@ end
 
 ### Qué le agregaría, en orden de valor
 
-1. **`bin/rails zeitwerk:check`.** Segundos de costo, y atrapa la causa #1 de "anda
-   en dev, rompe en prod" (§2.2). Es lo primero.
+1. ~~**`bin/rails zeitwerk:check`.**~~ ✅ **YA ESTÁ.** Era el primero de la lista y
+   se agregó: step `Check Zeitwerk autoloading` en el job `test`, entre
+   `db:test:prepare` y `rspec`. Segundos de costo, y atrapa la causa #1 de "anda en
+   dev, rompe en prod" (§2.2).
 2. **Un job de build de la imagen Docker en los PRs.** Hoy el `Dockerfile` no se
    valida nunca en CI. Un cambio en el `Gemfile` que rompa `bundle install` bajo
    `BUNDLE_DEPLOYMENT=1`, o una plataforma faltante en el lock, se descubre recién
@@ -1735,8 +2100,10 @@ end
 6. **`concurrency: cancel-in-progress`.** Hoy cada push a un PR arranca los cuatro
    jobs completos sin cancelar los anteriores.
 7. **Deploy automático desde `main`** con `kamal deploy`. `config/deploy.yml` ya
-   existe y valida; lo que falta es el step del workflow y el
-   `KAMAL_REGISTRY_PASSWORD` como secret del repo (§6.3, opción 1).
+   existe y valida, y `.kamal/secrets` ya resuelve las cuatro variables (eso
+   faltaba y se arregló, §6.3); lo que queda es el step del workflow, el
+   `KAMAL_REGISTRY_PASSWORD` como secret del repo (§6.3, opción 1) y reemplazar
+   las IPs placeholder por servidores reales.
 
 ---
 
@@ -1882,7 +2249,7 @@ GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 20;
 **Diagnóstico, en orden:**
 
 1. **¿Está corriendo el job?** `publish_outbox` está agendado *every minute* en
-   `config/recurring.yml:24-26` y `queue_as :outbox`. Si el worker de la cola
+   `config/recurring.yml:32-34` y `queue_as :outbox`. Si el worker de la cola
    `outbox` no está levantado (`config/queue.yml` define `processes: 2` para ella
    en producción), no publica nadie. Chequealo con la query de heartbeats de (b).
 2. **¿El adapter es el correcto?** `OUTBOX_ADAPTER` por defecto es **`log`**
@@ -1922,23 +2289,33 @@ hace 30 segundos es un pico normal; 3 pendientes de hace 4 horas es un incidente
 
 ## Errores que ves en producción
 
+Las filas marcadas **✅ CORREGIDO** son defectos que **estuvieron vivos en este
+repo** y que la verificación de esta documentación encontró. Las dejo con el
+síntoma y la causa intactos porque el modo de falla es lo que se aprende; la
+tercera columna dice cómo quedaron. Las demás son la clase general, sin
+antecedentes acá.
+
 | Síntoma | Causa | Arreglo |
 |---|---|---|
 | `ActiveSupport::MessageEncryptor::InvalidMessage` en el boot, sin más mensaje | la `RAILS_MASTER_KEY` del server no corresponde al `credentials.yml.enc` de la imagen | poner la llave correcta; si rotaste, actualizá el secreto **antes** de deployar |
 | `ActiveSupport::EncryptedFile::MissingKeyError` | no hay `RAILS_MASTER_KEY` ni `config/master.key` (el `.dockerignore:14` la excluye de la imagen a propósito) | inyectarla por ENV en runtime |
-| Booteaba en dev y en prod `NameError: uninitialized constant` | `eager_load = true` toca todo; archivo mal nombrado para Zeitwerk, o gema del grupo `development` (`BUNDLE_WITHOUT`) | `bin/rails zeitwerk:check` en el CI; revisar en qué grupo está la gema |
+| Booteaba en dev y en prod `NameError: uninitialized constant` | `eager_load = true` toca todo; archivo mal nombrado para Zeitwerk, o gema del grupo `development` (`BUNDLE_WITHOUT`) | ✅ **CORREGIDO** el lado del CI — step `Check Zeitwerk autoloading` en `.github/workflows/ci.yml`, antes de `rspec` (§2.2) |
+| Un guard `if defined?(Gema)` que nunca se cumple: el chequeo pasa en verde sin chequear nada | `bullet` declarado sólo en `group :development`; en `test` la constante no existía y `spec/support/bullet.rb` era código muerto. Los ejemplos `:n_plus_one` pasaban **hubiera o no** un N+1 | ✅ **CORREGIDO** — `group :development, :test` (`Gemfile:183`), config en `config/environments/test.rb` dentro de `after_initialize` (`Bullet.enable = true` parchea AR en el momento de la asignación). Control positivo en `spec/n_plus_one_guard_spec.rb` (§2.2) |
 | `PG::ConnectionBad: FATAL: sorry, too many clients already` | procesos x threads x **4 bases** supera `max_connections` (§7.2) | PgBouncer, o bajar `WEB_CONCURRENCY`/`processes` |
 | `ActiveRecord::ConcurrentMigrationError` en el deploy | varios contenedores corriendo `db:prepare` desde `bin/docker-entrypoint` a la vez | migrar una sola vez en un paso aparte (`kamal app exec 'bin/rails db:migrate'`) |
 | El deploy se queda colgado y hace rollback solo | el boot tarda más que `deploy_timeout` (default **30 s** en Kamal) | subir `deploy_timeout`; sacar `db:prepare` del entrypoint |
-| El healthcheck da 301 y el contenedor nunca queda sano | `force_ssl` prendido sin la exclusión de `/up` (`production.rb:34`) | descomentar `config.ssl_options` con el `exclude` |
+| Cookie de sesión sin flag `secure`, sin HSTS, sin redirect a HTTPS. Brakeman: *"The application does not force use of HTTPS"* | `config.force_ssl` venía comentado del generador y nadie lo tocó | ✅ **CORREGIDO** — `config.assume_ssl = true` (`production.rb:35`) + `config.force_ssl = true` (`:45`). Los dos juntos: sin `assume_ssl`, detrás de un proxy que ya terminó TLS, `force_ssl` entra en loop de redirects (§2.1) |
+| El healthcheck da 301 y el contenedor nunca queda sano | `force_ssl` prendido sin la exclusión de `/up` (`production.rb:47`) | no aplica hoy: `AssumeSSL` corre **antes** que `ActionDispatch::SSL`, así que no hay redirect que excluir. La línea sigue comentada como red de seguridad para el día que se saque `assume_ssl` (§2.1) |
+| `403 Blocked hosts` en el healthcheck, o DNS rebinding sin protección | `config.hosts` vacío ⇒ `ActionDispatch::HostAuthorization` **ni se monta** en producción | ⏳ **PENDIENTE** — `production.rb:99-105` sigue comentado; falta el dominio real. Cuando se llene, va con `host_authorization exclude` para `/up` (§2.1) |
 | Assets 404 justo después del deploy, la página queda sin estilos | el HTML viejo pide `application-AAAA.css` y los contenedores nuevos sólo tienen `BBBB` | `asset_path` en `deploy.yml` (Kamal fusiona versiones), o CDN con retención |
 | `PG::UndefinedColumn` unos segundos después de una migración | `remove_column` sin `ignored_columns` en un deploy previo; el esquema quedó cacheado en los procesos vivos | expand-contract: `ignored_columns` primero, `remove_column` en el deploy siguiente |
-| Jobs que se pierden o se rehacen en cada deploy | `shutdown_timeout` de Solid Queue es **5 s** por default; los jobs se matan a la mitad y tardan hasta 5 min (`process_alive_threshold`) en liberarse | subir `shutdown_timeout`, hacer los jobs idempotentes, deployar workers antes que web |
+| Jobs que se pierden o se rehacen en cada deploy | `shutdown_timeout` de Solid Queue es **5 s** por default, y este repo corría con el default; los jobs se matan a la mitad y tardan hasta 5 min (`process_alive_threshold`) en liberarse | ✅ **CORREGIDO** — `config/initializers/solid_queue.rb` (nuevo) lo sube a **25 s**, por debajo del `drain_timeout` de 30 s de Kamal. Verificado: `SolidQueue.shutdown_timeout # => 25 seconds`. Sigue valiendo: jobs idempotentes y workers antes que web (§10.3.1) |
 | 502 durante el rollout | el proxy mandó `SIGTERM` antes de cortar el tráfico, o `exec` faltante en el entrypoint y la señal no llegó a Puma | respetar el orden (cortar tráfico → TERM → drenar); `exec "${@}"` |
-| Archivos subidos que desaparecen | `active_storage.service = :local` en `production.rb:25`, disco efímero del contenedor | volumen persistente, o S3 |
-| Un job "cron" corre N veces | crontab replicado en N máquinas | `config/recurring.yml` de Solid Queue (elige líder con lock) |
-| Los workers procesan cada job dos veces y el web tiene latencia rara | `SOLID_QUEUE_IN_PUMA: false` en `env.clear` de `deploy.yml`: `"false"` es un string **truthy**, así que `config/puma.rb:38` carga el plugin igual (§7.4) | borrar la clave del bloque `clear`, no ponerla en `false` |
-| El deploy aborta al resolver los secretos | `.kamal/secrets` existe pero está entero comentado, y `deploy.yml` declara 4 variables como `secret` | descomentar una de las tres opciones de §6.3 |
+| Archivos subidos que desaparecen | Active Storage en `:local` + disco efímero del contenedor. Además el valor estaba **hardcodeado**: pasar a S3 exigía tocar código y redeployar | ✅ **CORREGIDO a medias** — el backend sale de `ACTIVE_STORAGE_SERVICE` (`production.rb:29`), con `local` de default. El riesgo operativo sigue si no seteás la variable; lo que cambió es que ahora es decisión de deploy y no de código (§1). Volumen persistente ya declarado en `deploy.yml`; lo correcto es S3 |
+| Un job "cron" corre N veces | crontab replicado en N máquinas | `config/recurring.yml` de Solid Queue. ⚠️ El comentario del archivo decía que **elige un líder**: era falso y está corregido — es un `INSERT` contra un índice único sobre `(task_key, run_at)` (§7.3) |
+| Los workers procesan cada job dos veces y el web tiene latencia rara | `SOLID_QUEUE_IN_PUMA: false` en `env.clear` de `deploy.yml`: `"false"` es un string **truthy**, así que `config/puma.rb:38` cargaba el plugin igual (§7.4) | ✅ **CORREGIDO** — la clave se borró del bloque `clear` (no se puso en `false`: una variable de entorno no tiene forma de decir "no"), y quedó un comentario en `config/deploy.yml` explicando por qué no puede volver. Verificado con `kamal config`: la clave ya no está en el env del rol `web` |
+| El deploy aborta al resolver los secretos, antes de conectarse por SSH | `.kamal/secrets` existía pero estaba **entero comentado**, y `deploy.yml` declara 4 variables como `secret`. `kamal config` pasaba en verde porque no resuelve secretos | ✅ **CORREGIDO** — `.kamal/secrets` con las 4 variables resueltas, más `.kamal/secrets.example` versionado (`.gitignore:49` y `:52`) para documentar el contrato sin filtrar valores (§6.3) |
+| Un índice que "no se usa": el `EXPLAIN` en tu máquina muestra Seq Scan igual | con 109 filas el planner elige Seq Scan y **tiene razón** — no es que falte el índice | `SET enable_seqscan = off` para comprobar que el índice sirve, y medir sobre datos realistas. El ledger global sí carecía de índice utilizable: `db/migrate/20260830220000_add_ledger_global_index.rb` (§8.3) |
 | El outbox "publica" pero no llega nada | `OUTBOX_ADAPTER` sin setear ⇒ `log`, que marca los eventos como publicados | setear `OUTBOX_ADAPTER=webhook` y alertar sobre `OutboxEvent.stuck` |
 | Migración que tumba el sitio antes de empezar | un `ALTER` esperando un lock encola a todos los `SELECT` detrás suyo | `StrongMigrations.lock_timeout = 10.seconds` (ya está); `CONCURRENTLY` para índices |
 | El restore falla en la primera línea | `CREATE EXTENSION citext` necesita superusuario; sin `citext` no se crea ni la tabla `products` | probar el restore periódicamente con el usuario real |
@@ -2016,6 +2393,11 @@ real es **at-least-once**, así que los jobs tienen que ser idempotentes, punto.
 *Trade-off:* subir `shutdown_timeout` reduce las interrupciones pero alarga cada
 deploy y te acerca al `SIGKILL` del orquestador. La solución de fondo no es el
 timeout: es partir los jobs largos en pasos con checkpoint.
+*Y el dato concreto que cierra la respuesta:* este repo corría con el default de 5
+segundos hasta que se lo miró; hoy `config/initializers/solid_queue.rb` lo pone en
+**25 s**, elegidos para quedar por debajo del `drain_timeout` de 30 s de Kamal.
+Nombrar los dos números y la relación entre ellos es lo que muestra que entendés
+el mecanismo y no memorizaste un default.
 
 **7. "¿Cómo respaldás Postgres?"**
 

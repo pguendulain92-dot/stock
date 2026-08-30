@@ -95,12 +95,23 @@ Rails.application.configure do
   # Only use :id for inspections in production.
   config.active_record.attributes_for_inspect = [ :id ]
 
-  # Enable DNS rebinding protection and other `Host` header attacks.
-  # config.hosts = [
-  #   "example.com",     # Allow requests from example.com
-  #   /.*\.example\.com/ # Allow requests from subdomains like `www.example.com`
-  # ]
+  # ── Protección contra DNS rebinding y ataques por cabecera Host ────────────
   #
-  # Skip DNS rebinding protection for the default health check endpoint.
-  # config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
+  # EL ATAQUE: el atacante apunta `malicioso.test` a TU IP. La víctima entra a
+  # ese dominio, el browser le manda la request a tu servidor con
+  # `Host: malicioso.test`, y tu app responde normalmente. Ahora el JS del
+  # atacante corre en un origen que él controla pero hablando con tu app: se
+  # saltea la política de mismo origen. Además, cualquier URL absoluta que
+  # generes (los links de los mails, los redirects) sale con SU dominio.
+  #
+  # Rails compara el Host contra esta lista y rechaza lo que no coincida.
+  # Sale del entorno para no tener que tocar código al cambiar de dominio.
+  config.hosts = []
+  config.hosts << ENV["APP_HOST"] if ENV["APP_HOST"].present?
+  config.hosts << /.*\.#{Regexp.escape(ENV["APP_DOMAIN"])}\z/ if ENV["APP_DOMAIN"].present?
+
+  # El health check del balanceador llega por IP, sin un Host válido. Si no lo
+  # exceptuás, el balanceador marca la instancia como caída y te saca de
+  # rotación: la protección te tumba el servicio sola.
+  config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
 end

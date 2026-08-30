@@ -41,7 +41,7 @@ escribas a `log/development.log` **y** a STDOUT sin duplicar código. En Java
 serías vos configurando dos appenders en Logback; acá es un objeto que envuelve
 a otros objetos.
 
-En producción el logger se reemplaza entero (`config/environments/production.rb:37-44`):
+En producción el logger se reemplaza entero (`config/environments/production.rb:49-57`):
 
 ```ruby
 config.log_tags = [ :request_id ]
@@ -107,7 +107,7 @@ Regla: si construir el mensaje cuesta algo (`inspect`, `to_json`, un `map`),
 
 ### 1.3 Logging estructurado: lo que este repo hace y lo que le falta
 
-El repo loguea con hashes en todos lados. Por ejemplo `app/jobs/application_job.rb:68-73`:
+El repo loguea con hashes en todos lados. Por ejemplo `app/jobs/application_job.rb:97-102`:
 
 ```ruby
 around_perform do |job, block|
@@ -268,10 +268,10 @@ Tres piezas, que en este repo ya están:
 | Riesgo | Mitigación en este repo | Archivo |
 |---|---|---|
 | Passwords, tokens, emails en params | `filter_parameters += [:passw, :email, :secret, :token, :_key, :crypt, :salt, ...]` | `config/initializers/filter_parameter_logging.rb` |
-| Un `inspect` de modelo que vuelca toda la fila | `config.active_record.attributes_for_inspect = [ :id ]` | `config/environments/production.rb:80` |
-| Ruido del health check | `config.silence_healthcheck_path = "/up"` | `config/environments/production.rb:44` |
+| Un `inspect` de modelo que vuelca toda la fila | `config.active_record.attributes_for_inspect = [ :id ]` | `config/environments/production.rb:96` |
+| Ruido del health check | `config.silence_healthcheck_path = "/up"` | `config/environments/production.rb:57` |
 | Assets | `config.assets.quiet = true` | `config/environments/development.rb:67` |
-| Backtraces enormes en cada error | `backtrace: exception.backtrace&.first(15)` | `app/controllers/concerns/api/error_handling.rb:116-120` |
+| Backtraces enormes en cada error | `backtrace: exception.backtrace&.first(15)` | `app/controllers/concerns/api/error_handling.rb:137-141` |
 
 El filtro por `:email` es más agresivo de lo que parece: cualquier parámetro que
 **contenga** "email" se reemplaza por `[FILTERED]`, incluido `email_address` del
@@ -352,7 +352,7 @@ ActiveSupport::Notifications.subscribe("sql.active_record") do |event|
 end
 
 # b) Suscriptor "crudo" (5 argumentos). Es lo que usa este repo en
-#    config/initializers/rack_attack.rb:268 — funciona, pero te obliga a
+#    config/initializers/rack_attack.rb:316 — funciona, pero te obliga a
 #    calcular la duración a mano.
 ActiveSupport::Notifications.subscribe(/rack_attack/) do |name, start, finish, id, payload|
 end
@@ -434,6 +434,17 @@ idle_time             34.95    # ms
 `queries_count` y `cached_queries_count` son de Rails 8.1 y son **la métrica
 anti-N+1 más barata que existe**: alertar cuando `queries_count > 30` en un
 endpoint te encuentra los N+1 antes que cualquier herramienta.
+
+Y no es un ejemplo de manual: **este repo tuvo un N+1 real ahí**. Los
+serializers de órdenes de compra y de transferencias recorren las líneas
+tocando `line.product`, y durante un buen rato lo hacían sin precarga: una query
+por línea. El arreglo, para las órdenes de compra, está en el método privado
+`serialize` de `app/controllers/api/v1/purchase_orders_controller.rb` y usa
+`ActiveRecord::Associations::Preloader` **en el momento de serializar**, no un
+`includes` al buscar — los caminos de error cortan antes de serializar y ese
+`includes` habría sido trabajo tirado. `StockMovements::Ledger` resolvió lo
+mismo con un parámetro `preload:` (el dashboard pide sólo
+`%i[product warehouse]`, porque no muestra el usuario).
 
 `sql.active_record`:
 
@@ -631,7 +642,7 @@ oculta que el servicio se está cayendo.
 | `db_runtime` / `duration` | mismo evento | > 60% = el problema es la base |
 | `queries_count` por acción | mismo evento (Rails 8.1) | > 30 en un `index` ⇒ N+1 |
 | Tasa de 5xx | mismo evento, `payload[:status]` | > 0.1% sostenido |
-| Tasa de 429 | `throttle.rack_attack` (suscrito en `config/initializers/rack_attack.rb:268`) + `rate_limit.action_controller` | un pico ⇒ o hay ataque, o le rompiste la integración a un cliente |
+| Tasa de 429 | `throttle.rack_attack` (suscrito en `config/initializers/rack_attack.rb:316`) + `rate_limit.action_controller` | un pico ⇒ o hay ataque, o le rompiste la integración a un cliente |
 | Pool de conexiones | `ActiveRecord::Base.connection_pool.stat` | `waiting > 0` sostenido = saturación |
 | Profundidad de cola | `solid_queue_ready_executions` | crecimiento monótono = los workers no dan abasto |
 | **Latencia** de cola | `now() - min(created_at)` de los ready | \> `polling_interval × 10` |
@@ -946,6 +957,13 @@ distinción entre allocation rate y live set, pero acá la tenés en una línea.
   "¿por qué mi proceso arranca en 300 MB?" — te lo desglosa gema por gema. Con
   este `Gemfile` (que trae Sidekiq **y** Solid Queue a propósito para poder
   comparar) sería la forma correcta de medir cuánto cuesta esa comodidad.
+  Ahora bien, `bundle:mem` cobra el costo del `require`, y Sidekiq hoy está
+  declarado `require: false` en el `Gemfile` (el `require "sidekiq"` es
+  condicional y vive en `config/initializers/sidekiq.rb`, adentro de
+  `if ENV["QUEUE_ADAPTER"] == "sidekiq"`), así que no lo vas a ver en el
+  desglose salvo que midas con esa variable puesta. Ese es justamente el punto
+  de `require: false`: la gema está instalada y no le cuesta un byte a los
+  procesos que no la usan.
 * **`benchmark-ips`**: itera hasta estabilizar y reporta **iteraciones por
   segundo con desvío**, más comparación estadística entre candidatos. Es lo que
   hay que usar para micro-benchmarks; `Benchmark.realtime` de la stdlib (lo que
@@ -1457,10 +1475,29 @@ base de verdad. Convertiste un hipo en un incidente.
    explica por qué: si lo limitás, el balanceador saca la instancia y **te caés
    solo**.
 5. **Excluí `/up` del redirect a HTTPS y de la verificación de host**, porque el
-   probe pega por IP y sin TLS. Las dos líneas están en
-   `config/environments/production.rb`, **comentadas** (`config.ssl_options` en
-   la 34, `config.host_authorization` en la 89): hay que descomentarlas el día
-   que prendas `force_ssl` o `config.hosts`, no antes.
+   probe pega por IP y sin TLS. Ojo que acá el repo cambió: `force_ssl` y
+   `assume_ssl` **ya están prendidos** en `config/environments/production.rb`
+   (líneas 45 y 35; hasta hace poco estaban las dos comentadas, y era el único
+   hallazgo de confianza alta de Brakeman). `config.hosts`, en cambio, sigue
+   comentado (línea 99).
+
+   Las dos exclusiones de `/up` siguen comentadas (`config.ssl_options` en la
+   47, `config.host_authorization` en la 105) y hoy no rompen nada, por una
+   razón concreta: con `assume_ssl = true` Rails monta
+   `ActionDispatch::AssumeSSL` **antes** de `ActionDispatch::SSL`, así que toda
+   request entra marcada como HTTPS y el redirect no llega a dispararse.
+   Verificado:
+
+   ```bash
+   $ SECRET_KEY_BASE=x RAILS_ENV=production bin/rails middleware | head -2
+   use ActionDispatch::AssumeSSL
+   use ActionDispatch::SSL
+   ```
+
+   El día que termines TLS en la propia app (sin proxy adelante, o sea sin
+   `assume_ssl`) o que prendas `config.hosts`, descomentá esas dos líneas
+   **antes** de deployar: si no, el probe se come un 301 o un 403, el
+   balanceador saca la instancia sana y te caés solo.
 
 Un readiness razonable para este repo (no existe todavía):
 
@@ -1531,7 +1568,7 @@ para los cuatro no significa nada.
 | **Latencia** de cola > 10 min | Los jobs no se están ejecutando |
 | Lag del outbox > 5 min | Los otros sistemas están viendo datos viejos |
 | `ReconcileBalancesJob` con `DRIFT_DETECTED` | **Siempre es un bug**: alguien escribió stock sin pasar por `ApplyMovement` |
-| `security.authorization_missing` | Endpoint sin control de acceso (`base_controller.rb:127`) |
+| `security.authorization_missing` | Endpoint sin control de acceso. Lo emiten la API (`api/v1/base_controller.rb:127`) y, desde que se agregó `after_action :verify_pundit_usage`, también la UI web (`application_controller.rb:66`) |
 | `pool.stat[:waiting] > 0` sostenido | Saturación del pool: la próxima es `ConnectionTimeoutError` |
 | `checkpoints_req` creciendo | Predice picos de latencia |
 
@@ -1623,7 +1660,7 @@ SELECT name, kind, now() - last_heartbeat_at AS antiguedad FROM solid_queue_proc
 Un worker con heartbeat de minutos = proceso muerto o colgado; el supervisor lo
 debería reemplazar. Si la cola crece y los workers están vivos, o los jobs son
 más lentos que antes o el volumen subió: mirá `job.finish` / `duration_ms` del
-log estructurado de `app/jobs/application_job.rb:72`.
+log estructurado de `app/jobs/application_job.rb:101`.
 
 ### Paso 4 — ¿Es Ruby?
 
@@ -1656,15 +1693,34 @@ El 80% de los "de golpe está lento" son un deploy: una migración que agregó u
 índice mal, un `includes` que se sacó, un middleware nuevo, un feature flag.
 **Mirá el diff antes de mirar el profiler.**
 
-Un detalle de `bin/rails middleware` en este repo que asusta al principio:
-**`Rack::Attack` aparece DOS veces**. Una la inserta `config/application.rb`
+Un detalle de `bin/rails middleware` que **estuvo mal en este repo y ya está
+arreglado**, y que sirve como ejercicio de lectura del stack: `Rack::Attack`
+aparecía **DOS veces**. Una la insertaba `config/application.rb`
 (`insert_after ActionDispatch::RemoteIp`) y la otra el railtie de la gema, que
-hace `app.middleware.use(Rack::Attack)` sin condición. **No duplica los
+hace `app.middleware.use(Rack::Attack)` sin condición. **No duplicaba los
 contadores**: `Rack::Attack#call` arranca con
 `return @app.call(env) if !self.class.enabled || env["rack.attack.called"]` y
-setea esa clave en la línea siguiente, así que la segunda instancia es un no-op. Lo verifiqué con `curl`: con `logins/ip` en 5 por 20 s,
-el 429 llega en el intento **6**, no en el 3. Contraste útil: el `rate_limit` de
-controller **no** tiene esa protección — dos declaraciones sin `name:` distinto
+setea esa clave en la línea siguiente, así que la segunda instancia era un
+no-op. Se verificó con `curl`: con `logins/ip` en 5 por 20 s, el 429 llegaba en
+el intento **6**, no en el 3. O sea: no era un bug de conteo, era un frame de
+Rack inútil en cada request y una trampa para el que leyera el stack.
+
+**El arreglo** está en `config/application.rb` y es cambiar una palabra:
+`move_after` en vez de `insert_after`. `move_after` **mueve** el middleware que
+el railtie ya montó, en vez de agregar un segundo. Y ojo con la alternativa que
+parece obvia: `delete` + `insert_after` **tampoco** sirve, porque las
+operaciones sobre el stack se acumulan y se aplican en orden al construirlo, así
+que el `delete` puede llevarse el middleware que vos mismo insertaste y dejarte
+sin ninguno. Hoy la salida es una sola línea, justo después de `RemoteIp`:
+
+```bash
+$ bin/rails middleware | grep -n -i "attack\|RemoteIp"
+11:use ActionDispatch::RemoteIp
+12:use Rack::Attack
+```
+
+Contraste útil, y este sigue vigente: el `rate_limit` de controller **no** tiene
+la protección de `rack.attack.called` — dos declaraciones sin `name:` distinto
 sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
 `app/controllers/api/v1/base_controller.rb:59-74`.
 
@@ -1753,7 +1809,7 @@ sí comparten clave y cuentan doble, que es exactamente la trampa documentada en
     *Causa*: escribir a STDOUT es una syscall bloqueante, y con el GVL bloquea al
     proceso, no sólo al thread. Además `debug` loguea los binds de cada query.
     *Arreglo*: `RAILS_LOG_LEVEL` por instancia (ya está parametrizado en
-    `config/environments/production.rb:41`) y volverlo atrás.
+    `config/environments/production.rb:54`) y volverlo atrás.
 
 12. **Checkpoints forzados como picos "inexplicables" de p99.**
     *Síntoma*: la latencia se dispara cada pocos minutos sin correlación con el

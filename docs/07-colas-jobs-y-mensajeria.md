@@ -299,6 +299,32 @@ mismo escenario **pierde el job y no queda rastro** (§4.3).
 Corolario operativo: alertá sobre `solid_queue_failed_executions`. Después de un
 OOM kill, ahí están los jobs que no corrieron y nadie los va a levantar por vos.
 
+#### La baja ordenada tiene reloj: `shutdown_timeout`
+
+El camino bueno —el `SIGTERM` que devuelve los jobs a `ready`— sólo llega hasta
+donde llega el reloj. Ante un `SIGTERM`, Solid Queue deja de tomar jobs nuevos y
+espera `shutdown_timeout` a que terminen los que están en vuelo; pasado ese
+tiempo, los mata. El default de la gema son **5 segundos**
+(`solid_queue-1.7.0/lib/solid_queue.rb:35`: `mattr_accessor :shutdown_timeout,
+default: 5.seconds`), que no alcanza para casi ningún job real: con eso, cada
+deploy corta jobs a la mitad. Este repo lo sube en
+`config/initializers/solid_queue.rb`:
+
+```ruby
+config.solid_queue.shutdown_timeout = ENV.fetch("SOLID_QUEUE_SHUTDOWN_TIMEOUT", 25).to_i.seconds
+```
+
+```console
+$ bin/rails runner 'puts SolidQueue.shutdown_timeout.inspect'
+25 seconds
+```
+
+La regla para elegir el número: tiene que quedar **por debajo** del grace period
+del orquestador (`terminationGracePeriodSeconds` en Kubernetes, el drain del
+proxy en Kamal). Si es mayor, el `SIGKILL` llega antes de que Solid Queue
+termine su apagado ordenado y volvés al caso feo de arriba —jobs en
+`failed_executions`— justo en cada deploy.
+
 ### 3.3 `FOR UPDATE SKIP LOCKED`: la primitiva
 
 Esta cláusula (Postgres 9.5+) es la razón por la que se puede hacer una cola
@@ -558,6 +584,13 @@ rescue RecurringExecution::AlreadyRecorded
 Es mejor que un líder: no hay lease que renovar, no hay split-brain, no hay
 ventana en la que nadie es líder. La base decide, y decide una sola vez.
 
+Un detalle de este repo, porque es el mismo error contado desde adentro:
+`config/recurring.yml` decía "Solid Queue usa un lock para elegir el líder".
+Era falso y estaba en un comentario que la gente lee como documentación. Hoy el
+archivo explica el índice único sobre `(task_key, run_at)` y la
+`RecurringExecution::AlreadyRecorded`. Un comentario equivocado envejece peor
+que código equivocado: nadie lo testea.
+
 Comparalo con `crontab` en 10 máquinas: el job corre 10 veces. Es el bug de
 producción clásico y carísimo ("mandamos el mail 10 veces", "cobramos 10
 veces"). En Java lo resolvés con Quartz + `JDBCJobStore` + `isClustered=true`,
@@ -603,6 +636,11 @@ sólo por `priority ASC, job_id ASC`. Si querés prioridad real entre esas colas
 sacá el `*` y listá las colas explícitamente (asumiendo el riesgo de que una
 cola nueva no la atienda nadie), o usá `priority` numérica.
 
+El comentario de `config/queue.yml` afirmaba lo contrario —"el orden del array
+ES la prioridad: primero default, después mailers, después maintenance"— hasta
+que se verificó con el `QueueSelector` de arriba. Ahora el mismo comentario
+marca la excepción del comodín, que es la que aplica en esta config.
+
 Y ojo con el peor caso combinado: si alguien pausa una cola desde Mission
 Control, `all?` deja de ser verdadero, el selector cae al camino de
 `all_queues` (un `SELECT DISTINCT queue_name`) y el comportamiento de orden
@@ -614,8 +652,11 @@ cambia sin que hayas tocado nada.
 
 La gema está en el `Gemfile` (`sidekiq ~> 8.0`, resuelta a 8.1.7) a propósito:
 para poder correr **los mismos jobs** sobre el otro backend cambiando una env
-var. Se configura sólo si `QUEUE_ADAPTER=sidekiq`
-(`config/initializers/sidekiq.rb:35`).
+var. Va declarada con `require: false`, así que no se carga en los procesos que
+no la usan —web, workers de Solid Queue, consola, rake—; el `require "sidekiq"`
+lo hace el initializer y sólo si `QUEUE_ADAPTER=sidekiq`
+(`config/initializers/sidekiq.rb:35`). Tener la gema cargada en todos lados
+"por las dudas" es RAM y tiempo de boot regalados en cada proceso.
 
 ### 4.1 BRPOP: por qué la latencia es otra liga
 
@@ -867,7 +908,7 @@ casi siempre es "no hacer nada y salir bien", no "explotar").
 Por eso `ApplicationJob` descarta explícitamente ese error:
 
 ```ruby
-# app/jobs/application_job.rb:63
+# app/jobs/application_job.rb:92
 discard_on ActiveJob::DeserializationError do |job, error|
   Rails.logger.warn(event: "job.discarded", job: job.class.name,
                     reason: "registro inexistente", error: error.message)
@@ -935,9 +976,10 @@ end
   cualquiera tira `SerializationError` **al encolar**, que al menos falla
   temprano.
 - **Duración**: un job de 40 minutos ocupa un thread 40 minutos, no se puede
-  deployar sin cortarlo (el `SIGTERM` tiene timeout) y si falla al minuto 39
-  repetís todo. Partilo: un job coordinador que encola N jobs chicos, o el
-  patrón de auto-reencolado que usa el relay (§8.4).
+  deployar sin cortarlo (el `SIGTERM` tiene timeout: `shutdown_timeout`, 25 s en
+  este repo — §3.2) y si falla al minuto 39 repetís todo. Partilo: un job
+  coordinador que encola N jobs chicos, o el patrón de auto-reencolado que usa
+  el relay (§8.4).
 - **`statement_timeout`**: este repo mata cualquier query de más de 15 s
   (`config/database.yml:53`). Un job que hace un `UPDATE` masivo se va a comer
   ese timeout. Es a propósito: te obliga a lotear.
@@ -949,12 +991,12 @@ end
 ### 7.1 `retry_on` vs `discard_on`
 
 ```ruby
-# app/jobs/application_job.rb:52
+# app/jobs/application_job.rb:81
 retry_on ActiveRecord::Deadlocked,               wait: :polynomially_longer, attempts: 5
 retry_on ActiveRecord::LockWaitTimeout,          wait: :polynomially_longer, attempts: 5
 retry_on ActiveRecord::ConnectionNotEstablished, wait: :polynomially_longer, attempts: 5
 
-# ...y en :63
+# ...y en :92
 discard_on ActiveJob::DeserializationError do |job, error|
   Rails.logger.warn(event: "job.discarded", job: job.class.name,
                     reason: "registro inexistente", error: error.message)
@@ -981,8 +1023,10 @@ Dos detalles finos:
 
 ### 7.2 `:polynomially_longer` no es exponencial
 
-Esto lo dice mal medio internet, incluido algún comentario de este repo. La
-fórmula real de Rails 8.1:
+Esto lo dice mal medio internet, y lo decía mal un comentario de este repo:
+`app/jobs/application_job.rb` afirmaba "hace backoff exponencial". Hoy dice
+"backoff POLINÓMICO, no exponencial" y trae la fórmula, que es la real de
+Rails 8.1:
 
 ```ruby
 # activejob-8.1.3.1/lib/active_job/exceptions.rb:177
@@ -992,7 +1036,9 @@ delay + delay_jitter + 2
 ```
 
 Es **polinómica** (grado 4), no exponencial — Rails renombró la opción
-justamente por eso (antes se llamaba `:exponentially_longer`).
+justamente por eso (antes se llamaba `:exponentially_longer`). El comentario del
+repo arrastraba el nombre viejo; ahora explica la fórmula, que es lo único que
+no envejece.
 
 | Intento | Base `n⁴ + 2` | Con jitter 15% |
 |---|---|---|
@@ -1481,16 +1527,24 @@ La línea es:
 | "no puede correr sobre datos que hicieron rollback" | `enqueue_after_transaction_commit = true` |
 | "no se puede perder nunca, y hay otro sistema esperándolo" | outbox |
 
-### ⚠️ Dos trampas reales de este repo, verificadas
+### ⚠️ Dos trampas reales de este repo, y cómo se arreglaron
+
+Las dos las encontró la verificación de esta misma documentación, con la app
+corriendo. Estuvieron vivas acá y hoy están corregidas: lo que sigue es cómo se
+veían, cómo se detectaron y dónde quedó el arreglo. El diff final es chico —una
+línea que se borró y una que se agregó—; el procedimiento para llegar hasta
+ellas es lo que hay que llevarse.
 
 **(1) `config.active_job.enqueue_after_transaction_commit` fue REMOVIDA en
-Rails 8.1.** `config/initializers/sidekiq.rb:74` tiene:
+Rails 8.1.** `config/initializers/sidekiq.rb` tenía, al final del archivo:
 
 ```ruby
+# ❌ como estaba: un no-op silencioso en Rails 8.1
 Rails.application.config.active_job.enqueue_after_transaction_commit = :always
 ```
 
-Eso funcionaba en Rails 7.2/8.0. En 8.1 no hace nada — y no avisa:
+Eso funcionaba en Rails 7.2/8.0. En 8.1 no hace nada — y no avisa. Así se
+detectó, leyendo el **valor efectivo** en vez del initializer:
 
 ```console
 $ bin/rails runner 'puts ActiveJob::Base.enqueue_after_transaction_commit.inspect'
@@ -1525,7 +1579,30 @@ options = options.except(
 
 Y el otro camino (`config.after_initialize`) sólo aplica la opción
 `if ActiveJob.respond_to?(k)`, que acá da `false`. Por los dos lados la línea
-del initializer se descarta en silencio. La lección general:
+del initializer se descartaba en silencio.
+
+**El arreglo**: se borró la línea de `config/initializers/sidekiq.rb` y la
+configuración pasó a la clase base de los jobs, que es el único lugar donde
+Rails 8.1 la lee:
+
+```ruby
+# app/jobs/application_job.rb:65
+self.enqueue_after_transaction_commit = true
+```
+
+Hoy el valor efectivo es el que corresponde: el global sigue en `false` —porque
+esta opción no se puede aplicar globalmente— y el que manda es el de la clase:
+
+```console
+$ bin/rails runner 'puts ActiveJob::Base.enqueue_after_transaction_commit.inspect'
+false
+$ bin/rails runner 'puts ApplicationJob.enqueue_after_transaction_commit.inspect'
+true
+```
+
+El comentario que quedó arriba de esa línea en `app/jobs/application_job.rb`
+cuenta la trampa completa, para que a nadie se le ocurra volver a moverla a un
+initializer. La lección general, que sobrevive al arreglo:
 **una opción de configuración que "no toma" casi siempre es un problema de orden
 de boot o de una API removida; verificalo leyendo el valor efectivo, no el
 initializer.**
@@ -1540,8 +1617,30 @@ comparte base con tus datos**. Acá no:
 config.solid_queue.connects_to = { database: { writing: :queue } }
 ```
 
-`stock_development_queue` es otra base, otra conexión, otra transacción.
-Demostrado:
+`stock_development_queue` es otra base, otra conexión, otra transacción. Y como
+la trampa (1) dejaba el `enqueue_after_transaction_commit` en `false`, el
+resultado era este. Se reproduce hoy poniendo el flag en `false` a mano, que es
+exactamente cómo estaba el repo:
+
+```console
+$ bin/rails runner '
+  ApplicationJob.enqueue_after_transaction_commit = false   # así estaba el repo
+  before = SolidQueue::Job.count
+  begin
+    ActiveRecord::Base.transaction do
+      Product.first.touch
+      Outbox::PublishPendingJob.perform_later
+      raise "boom"
+    end
+  rescue => e; puts "rollback por: #{e.message}"; end
+  puts "antes=#{before} despues=#{SolidQueue::Job.count}"'
+
+rollback por: boom
+antes=670 despues=671    ← el job quedó encolado PESE al rollback
+```
+
+Con el repo como está hoy —sin tocar el flag, porque `ApplicationJob` ya lo trae
+en `true`— el mismo script no encola nada:
 
 ```console
 $ bin/rails runner '
@@ -1556,19 +1655,20 @@ $ bin/rails runner '
   puts "antes=#{before} despues=#{SolidQueue::Job.count}"'
 
 rollback por: boom
-antes=366 despues=367    ← el job quedó encolado PESE al rollback
+antes=668 despues=668    ← el enqueue esperó al COMMIT, que nunca llegó
 ```
 
-Con `ApplicationJob.enqueue_after_transaction_commit = true` al principio del
-mismo script el resultado es `antes=379 despues=379`: no se encola. (Los
-absolutos varían porque hay un worker corriendo; lo que importa es el delta.) La
-corrección son dos líneas en `app/jobs/application_job.rb`; el diagnóstico es lo
-que vale.
+(Los absolutos varían con lo que haya en la base y con el worker corriendo; lo
+que importa es el delta.) La corrección fue una línea en
+`app/jobs/application_job.rb`; el diagnóstico —un script de 8 líneas que compara
+el conteo antes y después de un rollback— es lo que vale, y es el que tenés que
+saber escribir en una entrevista.
 
 Moraleja: **"Solid Queue es transaccional" es cierto sólo con base compartida.**
 Si separás bases (que es el default de Rails 8 y lo correcto para no
 contaminar el `VACUUM` de la base de negocio), volvés a tener el mismo problema
-que con Sidekiq, y `enqueue_after_transaction_commit` deja de ser opcional.
+que con Sidekiq, y `enqueue_after_transaction_commit` deja de ser opcional. Acá
+dejó de serlo: lo activa `ApplicationJob` para todos los jobs del proyecto.
 
 ---
 
@@ -1659,7 +1759,7 @@ Dos consejos que valen más que las métricas:
   jobs" es normal durante un import y catastrófico un martes a las 3 AM. La
   derivada distingue las dos cosas; el umbral no.
 - **Loggeá estructurado y con duración.** `ApplicationJob` ya lo hace en un
-  `around_perform` (`app/jobs/application_job.rb:68`): emite `job.start` y
+  `around_perform` (`app/jobs/application_job.rb:97`): emite `job.start` y
   `job.finish` con `duration_ms`, `jid` y `queue`. Con eso armás los percentiles
   por clase de job sin instrumentar nada más. El mismo bloque hace
   `Current.reset` en el `ensure`: los jobs corren en threads reutilizados y sin
@@ -1761,7 +1861,7 @@ máquina). El thread pool vive en memoria del proceso web. *Arreglo*: fijar
 *Síntoma*: pico de jobs descartados después de una limpieza de datos.
 *Causa*: `perform_later(objeto)` en vez de `perform_later(objeto.id)`; el
 registro se borró entre el encolado y la ejecución. *Arreglo*: pasar ids
-siempre; el `discard_on` de `app/jobs/application_job.rb:63` evita que se
+siempre; el `discard_on` de `app/jobs/application_job.rb:92` evita que se
 reintenten 25 veces, pero el bug es el argumento.
 
 **3. El job corre sobre datos que hicieron rollback.**
@@ -1769,7 +1869,10 @@ reintenten 25 veces, pero el bug es el argumento.
 que no pasó. *Causa*: `perform_later` dentro de una transacción, con el enqueue
 yendo a Redis (Sidekiq) o a **otra base** (Solid Queue con base `queue`
 separada — §9). *Arreglo*: `self.enqueue_after_transaction_commit = true` en
-`ApplicationJob`. Y si el evento no se puede perder, outbox.
+`ApplicationJob`. Y si el evento no se puede perder, outbox. **Este repo lo
+tuvo**: la config estaba en un initializer, donde en Rails 8.1 es un no-op; hoy
+está en `app/jobs/application_job.rb:65` y el rollback ya no deja jobs
+encolados (§9).
 
 **4. Una opción de config que "no toma".**
 *Síntoma*: pusiste la línea en un initializer, el comportamiento no cambia y no
@@ -1777,7 +1880,9 @@ hay error. *Causa*: o corre después del `before_initialize` del engine (caso
 Mission Control, ver `config/initializers/mission_control.rb`), o la opción fue
 removida (caso `config.active_job.enqueue_after_transaction_commit` en Rails
 8.1). *Arreglo*: leer el **valor efectivo** con `bin/rails runner`, no el
-initializer. Y `bin/rails initializers` para ver el orden real.
+initializer. Y `bin/rails initializers` para ver el orden real. Los dos casos
+son de este repo, y el segundo estuvo vivo: se encontró leyendo el valor
+efectivo y se arregló moviendo la config a `ApplicationJob` (§9).
 
 **5. La cola tapada por un poison message.**
 *Síntoma*: la profundidad de la cola sube, el throughput es cero, el mismo
@@ -1831,8 +1936,11 @@ y no genera tuplas muertas.
 
 **12. Un job de 40 minutos que nunca termina de deployar.**
 *Síntoma*: los deploys tardan o matan trabajo a la mitad. *Causa*: jobs largos +
-timeout de `SIGTERM`. *Arreglo*: partir en lotes con auto-reencolado, como
-`Outbox::PublishPendingJob` cuando llena el lote.
+timeout de `SIGTERM` (`shutdown_timeout`, 5 s por default en Solid Queue).
+*Arreglo*: partir en lotes con auto-reencolado, como `Outbox::PublishPendingJob`
+cuando llena el lote, y subir `shutdown_timeout` —acá 25 s en
+`config/initializers/solid_queue.rb`— a un valor menor que el grace period del
+orquestador (§3.2).
 
 ---
 
@@ -1942,6 +2050,10 @@ sistema con outbox, el lag del outbox y la cantidad de eventos stuck.
 - `docs/05-solid-y-patrones.md` — por qué `Outbox::Publisher` y
   `Outbox::NullRecorder` son el ejemplo de DIP del proyecto.
 - Los comentarios de `app/jobs/application_job.rb`,
-  `app/services/outbox/recorder.rb`, `config/queue.yml`, `config/recurring.yml`
-  y `db/migrate/20260830161100_create_outbox_events.rb`: son la fuente de
-  verdad, y este documento los amplía.
+  `app/services/outbox/recorder.rb`, `config/queue.yml`, `config/recurring.yml`,
+  `config/initializers/solid_queue.rb` y
+  `db/migrate/20260830161100_create_outbox_events.rb`: son la fuente de verdad,
+  y este documento los amplía. Los de `application_job.rb`, `queue.yml` y
+  `recurring.yml` documentan además las tres trampas que este repo tuvo vivas:
+  la config global que no toma (§9), el `"*"` que anula el orden de colas (§3.7)
+  y el "líder" que no existe (§3.6).

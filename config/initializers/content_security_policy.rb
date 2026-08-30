@@ -39,8 +39,19 @@ Rails.application.configure do
     policy.frame_ancestors :none
   end
 
-  # Nonce por respuesta para los scripts inline que Rails necesita.
-  config.content_security_policy_nonce_generator = ->(request) { request.session.id.to_s }
+  # ── EL NONCE TIENE QUE SER ALEATORIO POR RESPUESTA ─────────────────────────
+  #
+  # El generador que sugiere la documentación de Rails es
+  # `->(request) { request.session.id.to_s }`, y es una MALA idea:
+  # el id de sesión es CONSTANTE durante toda la sesión del usuario. Un nonce
+  # que no cambia no es un nonce: si un atacante lo consigue una vez (le basta
+  # con leer el HTML de cualquier página), puede inyectar scripts con ese valor
+  # durante todo lo que dure la sesión. La CSP queda de adorno.
+  #
+  # Un valor aleatorio por respuesta no se puede predecir ni reutilizar. Rails
+  # memoiza el resultado por request, así que la etiqueta y la cabecera reciben
+  # el mismo valor sin que tengas que hacer nada.
+  config.content_security_policy_nonce_generator = ->(_request) { SecureRandom.base64(16) }
   config.content_security_policy_nonce_directives = %w[script-src]
 
   # ⚠️ ARRANCÁ EN REPORT-ONLY. Poné CSP_ENFORCE=1 recién cuando los reportes

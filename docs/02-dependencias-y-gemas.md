@@ -7,9 +7,11 @@ grupos, `require: false`— porque ahí es donde un javero traduce mal desde Mav
 
 Todos los números salen de correr los comandos contra este repo (Ruby 3.3.6, Rails 8.1.3.1,
 Bundler 4.0.9, PostgreSQL 16.13). Cuando una medición contradice lo que dice el comentario
-del código, lo digo: hay **tres lugares en este repo** donde lo que se afirma no aguanta la
-medición —`oj` (§17), el comentario del `Gemfile` sobre el `COUNT(*)` de pagy (§18) y la
-config de `bullet` en test (§27)—, y los tres están marcados. Los comentarios del `Gemfile` y de `config/` son la
+del código, lo digo. Verificando este documento aparecieron **tres lugares** donde lo que se
+afirmaba no aguantaba la medición —`oj` sin enganchar (§17), el comentario del `Gemfile` sobre
+el `COUNT(*)` de pagy (§18) y la config de `bullet` en test (§27)—. **Los tres ya están
+arreglados en el repo**, y cada sección cuenta cómo se veía el bug, cómo se detectó y cómo
+quedó: el hallazgo vale más que el parche. Los comentarios del `Gemfile` y de `config/` son la
 fuente de verdad del *por qué*; este documento agrega el *cómo se comprueba*.
 
 ---
@@ -26,11 +28,11 @@ Todo medido acá adentro, no copiado de un blog:
 | Boot con bootsnap caliente | **1.23 s** | `time bin/rails runner nil` |
 | Primer boot con bootsnap (cache frío) | **3.23 s** | idem, tras borrar `tmp/cache/bootsnap` |
 | Tamaño del cache de bootsnap | **16 MB** | `du -sh tmp/cache/bootsnap` |
-| Archivos cargados al bootear (dev) | **2137** | `$LOADED_FEATURES.size` |
+| Archivos cargados al bootear (dev) | **2115** | `$LOADED_FEATURES.size` |
 | RSS de un proceso booteado (dev) | **94 MB** | `/proc/self/status` |
 | Costo de cargar rubocop + brakeman | **+16 MB, +404 archivos** | `require` a mano y medir |
 | Un hash de bcrypt (cost 12) | **233 ms** | `Benchmark.realtime` |
-| Suite de RuboCop | 188 archivos, 0 ofensas | `bin/rubocop` |
+| Suite de RuboCop | 194 archivos, 0 ofensas | `bin/rubocop` |
 | Brakeman | 20 controllers, 22 models, 0 warnings, 1.5 s | `bin/brakeman --quiet` |
 | bundler-audit | 1237 advisories, 0 vulnerabilidades | `bin/bundler-audit check` |
 
@@ -161,17 +163,24 @@ con `bin/rails runner`, sin haber escrito un solo `require` en el código de la 
 ```text
 pagy cargado?     SI      <- grupo default
 oj cargado?       SI      <- grupo default
-sidekiq cargado?  SI      <- grupo default (aunque QUEUE_ADAPTER sea solid_queue)
+redis cargado?    SI      <- grupo default
+sidekiq cargado?  NO      <- grupo default, pero con require: false
 rubocop cargado?  NO      <- require: false
 brakeman cargado? NO      <- require: false
 kamal cargado?    NO      <- require: false
 bootsnap cargado? SI      <- lo carga config/boot.rb a mano, antes de todo
+bullet cargado?   SI      <- grupo :development, :test
 ```
 
-Dos cosas para notar. Primero: **`sidekiq` se carga aunque no lo uses**. Está en el grupo
-`default` a propósito (para poder comparar los dos adapters con el mismo código de jobs),
-y el precio es RAM en cada proceso web. En una app real, si Sidekiq es la alternativa que no
-usás, va con `require: false` y se carga sólo en el proceso worker.
+Dos cosas para notar. Primero, **`sidekiq` estuvo cargándose en todos los procesos sin que
+nadie lo usara**, y esa línea decía `sidekiq cargado? SI`. Está en el grupo `default` a
+propósito (para poder comparar los dos adapters con el mismo código de jobs), pero el
+`QUEUE_ADAPTER` por defecto es `solid_queue`: era RAM y tiempo de boot regalados en el
+proceso web, en el worker, en la consola y en cada tarea rake. Hoy la declaración es
+`gem "sidekiq", "~> 8.0", require: false` y la carga la hace el `require` condicional del
+initializer sólo cuando corresponde (el detalle completo en §1.5). Fijate que `redis` **sí**
+sigue cargándose: es la que usa `Rack::Attack` para el store de contadores, así que ahí no
+hay nada que ahorrar.
 
 Segundo: las gemas de `:development` **están instaladas en producción salvo que lo impidas**.
 Quien lo impide es el `BUNDLE_WITHOUT` del `Dockerfile`:
@@ -223,11 +232,24 @@ Casos donde `require: false` es obligatorio y no opcional:
   `config/boot.rb:4`, antes que `config/application.rb`);
 - gemas que se cargan a mano y condicionalmente.
 
-El tercer caso está a medio hacer en este repo, y sirve de ejemplo. `config/initializers/sidekiq.rb:36`
-hace `require "sidekiq"` sólo si `QUEUE_ADAPTER == "sidekiq"`... pero el `Gemfile` la declara
-sin `require: false`, así que Bundler ya la cargó en **todos** los procesos antes de llegar
-ahí (medido en §1.4: `sidekiq cargado? SI`). El `require` condicional del initializer no
-ahorra nada mientras la declaración del `Gemfile` no lo acompañe. Las dos mitades van juntas.
+El tercer caso **estuvo a medio hacer en este repo**, y es el mejor ejemplo del documento.
+`config/initializers/sidekiq.rb:36` hace `require "sidekiq"` sólo si
+`QUEUE_ADAPTER == "sidekiq"`... pero el `Gemfile` la declaraba **sin** `require: false`, así
+que Bundler ya la había cargado en **todos** los procesos antes de llegar ahí. La medición de
+§1.4 lo mostraba en una línea: `sidekiq cargado? SI`. El `require` condicional del initializer
+no ahorraba nada, porque **una optimización partida entre dos archivos no funciona si sólo
+escribís una mitad**. Las dos mitades van juntas.
+
+Arreglado: hoy el `Gemfile` dice
+
+```ruby
+gem "sidekiq", "~> 8.0", require: false
+```
+
+y la misma comprobación devuelve `sidekiq cargado? NO` con `QUEUE_ADAPTER=solid_queue`, que es
+el default. La regla para llevarse: **el `require: false` y el `require` a mano son un solo
+cambio en dos lugares**; verificá el resultado con `Object.const_defined?`, no leyendo el
+`Gemfile`.
 
 Y el caso donde `require: false` te muerde: la gema tiene un railtie que hace algo
 importante y al no cargarla no pasa nada... en silencio. Si una gema "no anda" y estás
@@ -366,8 +388,9 @@ El criterio que usamos, en orden. Si falla el primero, no seguís:
    mucho. Es el mismo razonamiento que envolver un cliente HTTP de terceros detrás de una
    interfaz en Spring.
 
-Aplicado a este repo: por ese criterio, **`oj` no debería estar** (§17), y `faker` está al
-límite. Todo lo demás pasa.
+Aplicado a este repo: por ese criterio **`oj` estuvo a punto de salir** —entró por
+performance, y durante un buen rato ni siquiera estaba enganchado (§17)—; hoy se queda, pero
+con la ganancia medida y acotada, no por fe. `faker` está al límite. Todo lo demás pasa.
 
 ---
 
@@ -483,6 +506,16 @@ lindo: te deja correr el supervisor de jobs **dentro** del proceso web para un d
 un solo servidor. En Java sería meter un scheduler de Quartz adentro del Tomcat; funciona,
 tiene el mismo trade-off (un job pesado te come CPU del web) y la misma ventaja (una cosa
 menos que operar).
+
+Ojo con esa condición, porque **este repo tuvo el bug**: `config/deploy.yml` la traía en
+`env.clear` con el valor `false`, pensando que la apagaba. Kamal serializa eso como
+`--env SOLID_QUEUE_IN_PUMA=false`, o sea que el contenedor recibe **el string `"false"`**, y
+en Ruby cualquier string es *truthy*: la condición daba `true` y el supervisor de Solid Queue
+arrancaba dentro de **cada contenedor web**, además del rol `job`. Workers de más peleándose
+los mismos jobs y comiéndose conexiones a la base. La variable se sacó de `deploy.yml`
+directamente. La regla, que vale para toda variable de entorno booleana:
+**`ENV["X"]` devuelve un string o `nil`, nunca un booleano** — o preguntás por presencia y no
+la seteás nunca, o la comparás explícitamente (`ENV["X"] == "true"`).
 
 ### 3.3 Cluster mode: workers, `preload_app!`, copy-on-write
 
@@ -814,11 +847,23 @@ El costo, dicho también: **cada base abre su propio pool por proceso**.
 
 - **solid_queue** — backend de Active Job. Los jobs son filas; los workers hacen polling con
   `SELECT ... FOR UPDATE SKIP LOCKED`. `config/queue.yml` define tres grupos de workers
-  (critical con `polling_interval: 0.1`, outbox con 0.5, y un catch-all con `"*"`).
-  `config/recurring.yml` le agrega cron **con elección de líder**: el job corre una vez
-  aunque tengas diez servidores. Esa es la diferencia grande contra `crontab` en N máquinas,
-  que ejecuta N veces; en Java es Quartz con JDBCJobStore en modo cluster, misma idea y
-  bastante más configuración.
+  (critical con `polling_interval: 0.1`, outbox con 0.5, y un catch-all con `"*"`). Ojo con
+  ese `"*"`: el orden del array parece definir prioridad, y **con el comodín adentro no la
+  define**, porque el selector colapsa a un `SELECT` sin filtro de cola ordenado sólo por
+  `(priority, job_id)`. El comentario de `config/queue.yml` decía lo contrario y está
+  corregido.
+  `config/recurring.yml` le agrega cron: el job corre una vez aunque tengas diez servidores.
+  **Y no es por elección de líder** —eso es lo que todo el mundo asume, y este documento lo
+  afirmaba—. El mecanismo es más simple: cada scheduler intenta `INSERT`ar una fila en
+  `solid_queue_recurring_executions`, que tiene un **índice único sobre `(task_key, run_at)`**;
+  el primero gana y los demás se comen una violación de unicidad que Solid Queue traduce a
+  `RecurringExecution::AlreadyRecorded`. Es el mismo truco que la idempotencia de la API: un
+  índice único haciendo de lock distribuido, sin consenso ni coordinación. Vale saber la
+  diferencia porque cambia el modo de falla: no hay líder que se caiga ni failover que
+  esperar. Contra `crontab` en N máquinas, que ejecuta N veces, la ventaja es la misma; en
+  Java es Quartz con JDBCJobStore en modo cluster, misma idea y bastante más configuración.
+  (`config/initializers/solid_queue.rb` fija además `shutdown_timeout` en 25 s: el default de
+  5 s corta a la mitad cualquier job que dure más en cada deploy.)
 - **solid_cache** — `Rails.cache` sobre disco. `config/cache.yml` fija `max_size: 256 MB`.
   Contraintuitivo si venís de Redis: es un cache **en disco**, así que es más lento por
   lectura pero muchísimo más grande y barato, y sobrevive reinicios. Para fragmentos de HTML
@@ -852,21 +897,55 @@ QUEUE_ADAPTER=sidekiq bin/rails s
 ```
 
 Ése es el punto de Active Job: es una SPI, igual que JMS abstrae ActiveMQ de RabbitMQ. Tu
-código depende de `ActiveJob::Base`, no del backend.
+código depende de `ActiveJob::Base`, no del backend. Fijate la asimetría en el `Gemfile`:
+`sidekiq` va con **`require: false`** (§1.5) y `redis` no, porque a `redis` la usa además
+`Rack::Attack` para el store de contadores.
 
 La tabla comparativa completa (latencia, throughput, durabilidad, transaccionalidad) está en
-`config/initializers/sidekiq.rb`; no la repito. Lo que sí conviene agregar, porque es lo que
-se pregunta:
+`config/initializers/sidekiq.rb`; no la repito, pero **leele la fila "Transaccional" con el
+matiz de abajo puesto**. Lo que sí conviene agregar, porque es lo que se pregunta:
 
 **El punto transaccional es el que decide.** Con Sidekiq, `perform_later` escribe en Redis
 *ya*; si tu transacción hace rollback después, el job quedó encolado para una fila que no
-existe. Con Solid Queue el `INSERT` del job va **en tu misma transacción** y el problema
-desaparece por construcción. Rails 7.2+ trae la mitigación general, y este repo la tiene
-prendida:
+existe.
+
+Acá venía la afirmación que **todo el mundo repite y que en este repo era falsa**: "con Solid
+Queue el `INSERT` del job va en tu misma transacción y el problema desaparece por
+construcción". Es cierto **sólo si la cola comparte base con tus datos**. Y no la comparte:
 
 ```ruby
-# config/initializers/sidekiq.rb, última línea
+# config/initializers/active_job.rb:38
+config.solid_queue.connects_to = { database: { writing: :queue } }
+```
+
+`stock_development_queue` es **otra base, otra conexión, otra transacción**: un rollback de tu
+transacción de negocio deja el job encolado igual. La demostración corrida (encolar dentro de
+una transacción que después revienta, y contar `SolidQueue::Job`) está en docs/07. La
+conclusión: el argumento transaccional de Solid Queue es real, pero es una propiedad de la
+**topología de bases**, no de la gema.
+
+Lo que sí arregla el rollback en los dos backends es `enqueue_after_transaction_commit`
+(Rails 7.2+), y ahí hubo un segundo bug, de los buenos. Estaba escrito así:
+
+```ruby
+# config/initializers/sidekiq.rb — ASÍ ESTABA, y era un NO-OP
 Rails.application.config.active_job.enqueue_after_transaction_commit = :always
+```
+
+Parecía configurado y no lo estaba. En Rails 8.1 el railtie de Active Job **excluye esa clave**
+de la config global ("this config can't be applied globally") y además el valor `:always`
+se removió: la línea se descartaba en silencio, que es el peor resultado posible. Se
+comprueba en una línea, y por eso conviene leer el valor efectivo y no el initializer:
+
+```ruby
+ActiveJob::Base.enqueue_after_transaction_commit   # => lo que realmente rige
+```
+
+Hoy está donde corresponde, **por clase de job**, en `app/jobs/application_job.rb`:
+
+```ruby
+class ApplicationJob < ActiveJob::Base
+  self.enqueue_after_transaction_commit = true
 ```
 
 Y el matiz que separa una respuesta buena de una excelente: eso **no reemplaza al outbox**.
@@ -875,8 +954,11 @@ pierde y nadie se entera. Para eventos que no se pueden perder, outbox (por eso 
 tiene `outbox_events` y `Outbox::PublishPendingJob`). Para "mandale un mail", `enqueue_after_transaction_commit`
 alcanza. Saber dónde está esa línea es la respuesta madura a "¿cuándo usarías un outbox?".
 
-Costo de tenerlo en el `Gemfile` sin usarlo: Sidekiq se carga en **todos** los procesos
-(comprobado: `sidekiq cargado? SI`). En una app real iría con `require: false`.
+Costo de tenerlo en el `Gemfile` sin usarlo: durante un buen rato Sidekiq se cargó en
+**todos** los procesos aunque el adapter fuera `solid_queue` (§1.4 lo medía:
+`sidekiq cargado? SI`). Ya no: la declaración es `gem "sidekiq", "~> 8.0", require: false` y
+la misma comprobación devuelve `NO`. El `require "sidekiq"` real lo hace
+`config/initializers/sidekiq.rb:36`, sólo cuando `QUEUE_ADAPTER == "sidekiq"`.
 
 ---
 
@@ -962,11 +1044,12 @@ Middleware Rack — o sea, un `javax.servlet.Filter`. Cuatro primitivas: `safeli
 controller, por qué el store importa, por qué `track` antes de `throttle`) está en
 `config/initializers/rack_attack.rb`.
 
-Lo que agrego acá es una observación de la ejecución real. Mirá `bin/rails middleware`:
+Lo que agrego acá es una observación de la ejecución real, que además destapó un bug.
+**Así se veía `bin/rails middleware` antes:**
 
 ```text
 use ActionDispatch::RemoteIp
-use Rack::Attack          <- el nuestro (config/application.rb:52)
+use Rack::Attack          <- el nuestro (insert_after)
 use Propshaft::QuietAssets
 ...
 use Rack::TempfileReaper
@@ -974,7 +1057,7 @@ use Rack::Attack          <- ¿¿otro??
 use Bullet::Rack
 ```
 
-**Rack::Attack aparece dos veces.** El motivo es que la gema trae un railtie que se agrega
+**Rack::Attack aparecía dos veces.** El motivo es que la gema trae un railtie que se agrega
 sola al final del stack:
 
 ```ruby
@@ -984,9 +1067,9 @@ initializer "rack-attack.middleware" do |app|
 end
 ```
 
-y nuestro `config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack`
-(`config/application.rb:52`) inserta una **segunda** copia más arriba, para que corra después
-de que `RemoteIp` resuelva el `X-Forwarded-For`.
+y `config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack` insertaba una
+**segunda** copia más arriba, para que corriera después de que `RemoteIp` resuelva el
+`X-Forwarded-For`.
 
 El instinto correcto es "esto cuenta cada request dos veces y mi límite real es la mitad".
 Fui a leer la gema, y no:
@@ -999,12 +1082,35 @@ def call(env)
   ...
 ```
 
-La propia gema se defiende con un flag en el `env`. La segunda instancia es un no-op. Vale la
-pena saberlo por dos razones: porque un stack duplicado **parece** un bug y no lo es, y
-porque si querés dejarlo prolijo, la forma es `config.middleware.delete Rack::Attack` antes
-del `insert_after`. Y sobre todo: **verificá el orden del stack con `bin/rails middleware`,
-no lo supongas**. Un rate limiter arriba de `RemoteIp` cuenta todas las requests contra la IP
-del balanceador, y el primero que haga 300 pedidos deja afuera a todo el mundo.
+La propia gema se defiende con un flag en el `env`, así que la segunda instancia era un no-op
+funcional: no había doble conteo. Pero sí era un frame de Rack inútil en cada request y, peor,
+una trampa para cualquiera que leyera el stack.
+
+**Cómo quedó.** El arreglo es una palabra, `move_after` en vez de `insert_after`
+(`config/application.rb`):
+
+```ruby
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+`move_after` **mueve el que el railtie ya montó** en vez de agregar otro. Y el intento obvio
+—`delete` seguido de `insert_after`— **no sirve**: las operaciones sobre el stack se acumulan
+y se aplican en orden al construirlo, así que el `delete` puede llevarse justo el middleware
+que vos insertaste y dejarte sin ninguno. Un rate limiter que desaparece del stack es un
+fallo de seguridad silencioso, que es exactamente el tema de este documento.
+
+Comprobado hoy con `bin/rails middleware`, y ahora aparece una sola vez y en el lugar correcto:
+
+```text
+use ActionDispatch::RequestId
+use ActionDispatch::RemoteIp
+use Rack::Attack          <- una sola, y después de RemoteIp
+use Propshaft::QuietAssets
+```
+
+La moraleja se sostiene igual: **verificá el orden del stack con `bin/rails middleware`, no lo
+supongas**. Un rate limiter arriba de `RemoteIp` cuenta todas las requests contra la IP del
+balanceador, y el primero que haga 300 pedidos deja afuera a todo el mundo.
 
 Segunda capa: `rate_limit` nativo de Rails 8, en el controller, con contexto de negocio
 (por usuario, por plan). Está en `app/controllers/api/v1/base_controller.rb`, y ahí también
@@ -1017,57 +1123,89 @@ nunca se cumple. Es un fallo silencioso de seguridad. Por eso `RATE_LIMIT_STORE`
 
 # Parte VII — Datos y performance
 
-## 17. `oj` (3.17.6) — el caso donde la medición cambia la decisión
+## 17. `oj` (3.17.6) — la gema de performance que no serializaba un solo byte
 
 La justificación estándar de `oj` es "parser JSON en C, reemplaza el de la stdlib, free win
-en APIs con payloads grandes". La verifiqué. **No se sostiene en este repo, por dos motivos
-independientes.**
+en APIs con payloads grandes". La fui a verificar y me encontré con **el mejor bug del repo**:
+la gema estaba instalada, cargada en todos los procesos, sumando RAM... y **desenchufada**.
 
-**Motivo 1: no está conectado.** Comprobado en la consola:
+**Así se veía.** Comprobado en la consola de aquel momento:
 
 ```ruby
-defined?(Oj)                                    # => "constant"   (cargado)
-ActiveSupport::JSON::Encoding.json_encoder      # => ActiveSupport::JSON::Encoding::JSONGemCoderEncoder
+defined?(Oj)                                    # => "constant"   (cargada)
+ActiveSupport::JSON::Encoding.json_encoder      # => ActiveSupport::JSON::Encoding::JSONGemEncoder
 ```
 
-`render json:` usa `ActiveSupport::JSON.encode`, que usa el `json` de la stdlib. Oj **no se
-engancha solo**: hace falta `Oj.optimize_rails` (o `Oj::Rails.set_encoder`) en un
-initializer, y en este repo no existe. Un `grep -rn "Oj" app/ config/ lib/` no devuelve nada.
-O sea: la gema se carga en cada proceso, suma RAM, y no serializa un solo byte.
+`render json:` usa `ActiveSupport::JSON.encode`, que usa el encoder que diga
+`ActiveSupport::JSON::Encoding.json_encoder`. Oj **no se engancha solo**: hace falta
+`Oj.optimize_rails` (o `Oj::Rails.set_encoder`) en un initializer, y ese archivo no existía.
+`grep -rn "Oj" app/ config/ lib/` no devolvía **nada**. O sea: pagabas la memoria y no te
+llevabas la velocidad. Síntoma: ninguno. Ése es exactamente el problema —una optimización
+apagada no rompe nada, sólo no sirve—.
 
-**Motivo 2: aunque lo conectaras, hoy es más lento.** Benchmark real, 2000 objetos serializados
-100 veces, con calentamiento previo:
+**Cómo quedó.** Se agregó `config/initializers/oj.rb`:
+
+```ruby
+require "oj"
+
+Oj.default_options = { mode: :rails }
+Oj.optimize_rails
+```
+
+y ahora la misma comprobación devuelve otra cosa:
+
+```ruby
+ActiveSupport::JSON::Encoding.json_encoder      # => Oj::Rails::Encoder
+```
+
+`mode: :rails` **no es opcional**: los otros modos (`:compat`, `:object`, `:strict`)
+serializan distinto las fechas y los `BigDecimal`, o sea que te cambian el contrato de la API
+en silencio. Cambiar de serializador JSON no es una optimización interna, es un cambio de
+formato de salida.
+
+**Y ahora la parte que importa: ¿cuánto ganás?** Medido en este repo, comparando el encoder de
+hoy contra el que estaba antes (con calentamiento previo, forzando `json_encoder` a mano para
+comparar los dos en el mismo proceso):
 
 ```text
 json gem: 2.21.2 / oj: 3.17.6 / ruby 3.3.6
 
-  JSON.generate (gem json puro)                             1.15 ms/iter
-  ActiveSupport::JSON.encode (lo que usa render json:)       1.46 ms/iter
-  Oj.dump(mode: :compat)                                     3.15 ms/iter
-  Oj.dump(mode: :rails)                                     17.05 ms/iter
+  una PÁGINA de la API (25 objetos, el caso real acá)
+    Oj::Rails::Encoder (hoy)          0.082 ms/iter
+    JSONGemEncoder (el de antes)      0.212 ms/iter
+
+  un export grande (5000 objetos)
+    Oj::Rails::Encoder (hoy)         15.95  ms/iter
+    JSONGemEncoder (el de antes)     41.49  ms/iter
 ```
 
-El `json` de la stdlib ganó: más de 2x contra `mode: :compat` y más de 10x contra
-`mode: :rails`, que es el modo que emula la semántica de ActiveSupport y es justamente el
-más caro. La razón es histórica: entre 2023 y 2025 el gem `json` se reescribió y optimizó
-fuerte (acá corre 2.21.2, contra la 2.7.2 que Ruby 3.3 trae por defecto). La ventaja de Oj,
-que era real en la época de `json` 1.x, se evaporó.
+~2.6x, consistente en los dos tamaños. Pero mirá los valores absolutos y sacá la conclusión
+honesta: en una página de 25 objetos ganás **0.13 ms** sobre una request que cuesta varios
+milisegundos entre SQL, autorización y middleware. Es ruido. En un export de 5000 objetos
+ganás 25 ms, y ahí sí empieza a valer. Por eso el comentario del `Gemfile` ahora aclara que
+**la ganancia depende del tamaño del payload**, en vez de venderla como un free win.
 
-**Conclusión:** `oj` es candidato a salir del `Gemfile`. Y la lección general vale más que la
-gema: **una dependencia que entró por una razón de performance necesita que revalides esa
-razón**. El consejo de 2016 sigue circulando en blogs y en Stack Overflow mucho después de
-haber dejado de ser cierto.
+Dos cosas más para no sacar la conclusión equivocada:
 
-Si tuvieras que conectarlo, es una línea en un initializer:
+- El `json` de la stdlib **no es el que era**. Entre 2023 y 2025 se reescribió y se optimizó
+  fuerte: acá corre 2.21.2 (Bundler sombrea la 2.7.2 que trae Ruby 3.3, ver §31), y por eso
+  `JSON.generate` a secas es competitivo. Buena parte de la ventaja histórica de Oj se evaporó;
+  lo que queda es que `JSONGemEncoder` de ActiveSupport hace bastante trabajo Ruby encima del
+  `json` puro, y **eso** es lo que Oj se saltea.
+- Medir `Oj.dump(...)` suelto no te dice nada sobre tu app. Lo que corre en producción es
+  `ActiveSupport::JSON.encode` a través del `json_encoder` configurado, y `Oj.optimize_rails`
+  además parchea `to_json`/`as_json`. Benchmarkeá **el camino real**, no la función de la gema.
+
+**La lección, que vale más que la gema:** una dependencia que entró por una razón de
+performance necesita dos verificaciones, no una. Primero **que esté enganchada** —lo obvio, y
+lo que faltaba acá—, y después **que la razón siga siendo cierta**, porque el consejo de 2016
+sigue circulando en blogs y en Stack Overflow mucho después de haber dejado de aplicar. El
+comando que las cubre a las dos es una línea, y conviene tenerlo a mano antes de una
+entrevista sobre tu propio repo:
 
 ```ruby
-# config/initializers/oj.rb — NO existe en este repo, es lo que faltaría
-require "oj"
-Oj.optimize_rails
+ActiveSupport::JSON::Encoding.json_encoder   # => Oj::Rails::Encoder
 ```
-
-Que este `grep` no devuelva nada es exactamente el tipo de cosa que conviene chequear antes
-de una entrevista sobre tu propio repo.
 
 ## 18. `pagy` (9.4.0) vs `kaminari` vs `will_paginate`
 
@@ -1099,10 +1237,14 @@ Pagy::DEFAULT[:headers] = { page: "Current-Page", limit: "Page-Items",
 ```
 
 Ese `max_limit` es una regla de seguridad, no de UX: **cualquier parámetro de paginación que
-venga del usuario tiene que estar acotado**, o te lo usan como vector de DoS.
+venga del usuario tiene que estar acotado**, o te lo usan como vector de DoS. Y no queda
+delegado sólo a pagy: `Api::V1::BaseController#paginate` acota el `limit` que llega por
+`params` antes de pasárselo, con `MAX_PAGE_SIZE = 100` y un `page_limit` que hace
+`Integer(params[:limit]).clamp(1, MAX_PAGE_SIZE)`. Dos cotas para lo mismo no es redundancia
+inútil: la del controller es la que sobrevive si mañana alguien pagina a mano.
 
-**Corrección importante a lo que dice el comentario del `Gemfile`.** Ahí se lee que pagy
-"no hace `COUNT(*)` si no se lo pedís". Instrumenté las queries y no es así:
+**Corrección al comentario del `Gemfile`, que estuvo mal escrito.** Ahí se leía que pagy
+"no hace `COUNT(*)` si no se lo pedís". Instrumenté las queries y es al revés:
 
 ```ruby
 pagy, recs = pagy(Product.all)
@@ -1113,9 +1255,13 @@ SELECT "products".* FROM "products" LIMIT 25 OFFSET 0
 ```
 
 El `pagy` por defecto **sí cuenta**, porque necesita `pages` y `count` para armar la
-paginación. Lo que evita el COUNT es el extra `countless`, que hay que requerir
-explícitamente (`require "pagy/extras/countless"`, y usar `pagy_countless`); comprobado que
-en este repo **no** está cargado. El initializer sólo requiere `overflow` y `headers`.
+paginación (y para las cabeceras `Total-Count` / `Total-Pages` que expone este repo). Lo que
+evita el COUNT es el extra `countless`, que hay que requerir explícitamente
+(`require "pagy/extras/countless"`, y usar `pagy_countless`); comprobado que en este repo
+**no** está cargado —el initializer sólo requiere `overflow` y `headers`—. El comentario del
+`Gemfile` ya dice esto último, que es lo correcto. La moraleja es aburrida y útil: **un
+comentario sobre qué SQL emite una gema se verifica suscribiéndose a `sql.active_record`, no
+recordando la documentación.**
 
 Y cuando el COUNT y el OFFSET duelen de verdad —tablas grandes—, la salida no es una gema
 sino cambiar de técnica: **keyset pagination** (cursor). Es lo que hace el ledger acá, porque
@@ -1283,7 +1429,18 @@ Tres cosas que separan una suite sana de una lenta:
 - **`FactoryBot.lint`**, configurado en `spec/support/factory_bot.rb`: verifica que **todas**
   las factories generen objetos válidos. Corre con `LINT_FACTORIES=1 bundle exec rspec`.
   Sin esto, una factory rota se descubre seis meses después cuando agregás un test nuevo y no
-  entendés por qué falla.
+  entendés por qué falla. Acá encontró una de verdad, y la causa es una que sorprende: los
+  **traits automáticos de enum**. Desde factory_bot 6.x,
+  `automatically_define_enum_traits` viene en `true` y la gema inventa un trait por cada valor
+  de cada `enum` de ActiveRecord. Esos traits **ignoran las invariantes del modelo**: generaba
+  un `stock_reservation` con status `expired` pero sin `released_at`, que viola el CHECK
+  constraint `stock_reservations_released_at_present`, y el lint reventaba con
+  `PG::CheckViolation` por traits que nadie había escrito. Peor todavía, colisionaban en
+  silencio con los traits propios (la factory `:stock_movement` tenía `issue` dos veces y cuál
+  ganaba dependía del orden de carga). Hoy `spec/support/factory_bot.rb` los apaga con
+  `FactoryBot.automatically_define_enum_traits = false` y los estados que hacen falta están
+  escritos a mano en `spec/factories/stock.rb`, con todos los campos que la máquina de estados
+  exige. Que es justamente lo que querés en un dominio con invariantes.
 - **Cuidado con las asociaciones.** Una factory que crea asociaciones que crean asociaciones
   termina insertando 30 filas para probar una suma. Se controla con traits y con
   `association ..., strategy: :build`.
@@ -1420,24 +1577,24 @@ también habla CDP y por eso arranca más rápido y es más estable.
 ## 27. Análisis estático y auditoría
 
 Las tres que corren en CI (`config/ci.rb`) van con `require: false` y nunca se cargan dentro
-de la app: `rubocop`, `brakeman` y `bundler-audit`. `bullet` es la excepción y conviene mirarla
-de cerca, porque ahí hay una trampa.
+de la app: `rubocop`, `brakeman` y `bundler-audit`. `bullet` es la excepción, y conviene
+mirarla de cerca: el bug que tuvo es el más instructivo del repo.
 
-**`bullet` (8.2.0)** — detector de N+1 y de eager loading innecesario. Se declara **sin**
-`require: false` y **sólo en `group :development`**, así que en desarrollo se carga entero
-(aparece como `Bullet::Rack` al final del stack de `bin/rails middleware`).
+**`bullet` (8.2.0) — la red de seguridad que no atrapaba nada.** Detector de N+1 y de eager
+loading innecesario. Se declara **sin** `require: false` porque
+tiene que parchear ActiveRecord; en desarrollo aparece como `Bullet::Rack` en el stack de
+`bin/rails middleware`.
 
-La intención de `spec/support/bullet.rb` es que un N+1 rompa la suite:
+**Así estaba.** La gema se declaraba **sólo en `group :development`**, y la intención de
+`spec/support/bullet.rb` era que un N+1 rompiera la suite:
 
 ```ruby
 Bullet.raise = true                        # el N+1 ROMPE el test
 Bullet.unused_eager_loading_enable = true  # detecta el problema INVERSO
 ```
 
-**Pero hoy ese archivo no hace nada**, y es exactamente el tipo de cosa que hay que
-comprobar en vez de asumir. Tanto `spec/support/bullet.rb` como el hook de
-`spec/rails_helper.rb` están guardados con `if defined?(Bullet)`, y en el entorno de test la
-constante no existe:
+**Ese archivo no hacía nada.** Tanto él como el hook de `spec/rails_helper.rb` estaban
+guardados con `if defined?(Bullet)`, y en el entorno de test la constante no existía:
 
 ```text
 $ RAILS_ENV=test bin/rails runner 'p Rails.groups; p Object.const_defined?(:Bullet)'
@@ -1445,21 +1602,76 @@ $ RAILS_ENV=test bin/rails runner 'p Rails.groups; p Object.const_defined?(:Bull
 false
 ```
 
-`Bundler.require(*Rails.groups)` carga `:default` + el grupo del entorno; con `bullet` sólo
-en `:development`, en test nunca se hace el `require`, el `defined?` da falso y la
-configuración se saltea en silencio. El arreglo es de una línea en el `Gemfile`
-(`group :development, :test do` para bullet), y es el mismo patrón que el `require`
-condicional de sidekiq de §1.5: **una optimización a medio aplicar, partida entre el
-`Gemfile` y otro archivo, no hace nada.**
+`Bundler.require(*Rails.groups)` carga `:default` + el grupo del entorno; con `bullet` sólo en
+`:development`, en test nunca se hacía el `require`, el `defined?` daba falso y toda la
+configuración se salteaba en silencio. Los ejemplos marcados `:n_plus_one` pasaban en verde
+**hubiera o no un N+1**. Es la peor clase de bug de testing: un chequeo verde que no verifica
+nada es peor que no tener chequeo, porque te saca las ganas de mirar. Y es el mismo patrón que
+el `require` condicional de sidekiq de §1.5: **una configuración partida entre el `Gemfile` y
+otro archivo no hace nada si sólo escribís una mitad.**
 
-Suponiendo que estuviera cargado, el diseño del hook es el correcto: sólo se activa en los
-ejemplos marcados con `:n_plus_one` (`config.before(:each, :n_plus_one)` en
-`spec/rails_helper.rb`). Activarlo globalmente genera falsos positivos en specs unitarios
-donde la query repetida es intencional, la gente empieza a silenciarlos, y ahí perdés la
-herramienta. Es una lección de tooling más general que de Bullet.
+**Cómo quedó.** Cuatro cambios, y el obvio es sólo el primero:
 
-El `unused_eager_loading` importa igual que el N+1 y casi nadie lo mira: un `includes` que
-después no usás es una query de más y objetos que se cargan y se tiran.
+1. **`Gemfile`:** `group :development, :test do` para bullet. Hoy
+   `RAILS_ENV=test ... Object.const_defined?(:Bullet)` devuelve `true`.
+2. **La configuración se mudó a `config/environments/test.rb`**, dentro de un
+   `after_initialize`. No es cosmético: `Bullet.enable = true` **aplica los parches sobre
+   ActiveRecord en el momento de la asignación**, así que hacerlo desde un `before(:suite)` de
+   RSpec llega tarde para algunos ganchos y la detección queda muda. La configuración de
+   entorno corre en el momento correcto del boot.
+3. **`spec/support/bullet.rb` quedó sólo con el ciclo de vida** (`start_request` /
+   `end_request`) y con el helper `detectando_n_plus_one`, que existe por una trampa fina:
+   Bullet marca como "imposibles" los objetos cargados de a uno o recién creados, así que si
+   hacés el `create_list` **dentro** del request de Bullet la detección se vuelve muda aunque
+   el N+1 exista. El helper cierra y reabre el request para que sólo se audite la consulta que
+   te importa. (Y resetea el colector al salir, porque
+   `perform_out_of_channel_notifications` notifica pero **no** limpia, y si no lo hacés el
+   `after` hook vuelve a levantar la misma excepción y RSpec marca el ejemplo como fallado
+   aunque tu `expect { }.to raise_error` la haya capturado.)
+4. **Se agregó `spec/n_plus_one_guard_spec.rb`**, que testea **la herramienta, no el código**,
+   con un control positivo: verifica que `Bullet` esté cargado, que
+   `UniformNotifier::Raise` esté entre los notificadores activos (`Bullet.raise` no tiene
+   getter, choca con `Kernel#raise`), y que un N+1 escrito a propósito **efectivamente**
+   levante `Bullet::Notification::UnoptimizedQueryError`.
+
+Ese punto 4 es la regla general que vale llevarse: **cuando una herramienta de test puede
+desactivarse en silencio** —un linter, un detector, un mock que no se aplica— **escribí un
+test que verifique que está activa**. Cuesta cinco líneas y es lo único que distingue una red
+de seguridad de un adorno.
+
+**Qué apareció apenas se prendió.** N+1 reales, que es exactamente para lo que estaba: los
+serializers de órdenes de compra y de transferencias recorrían las líneas tocando
+`line.product` sin precarga. El arreglo tiene su propio matiz: **no** es un `includes` al
+buscar, sino `ActiveRecord::Associations::Preloader` en el momento de serializar (el método
+privado `serialize` de `Api::V1::PurchaseOrdersController`), porque los caminos de error
+cortan antes de serializar y el `includes` habría precargado para nada. Por lo mismo,
+`StockMovements::Ledger` ahora acepta un parámetro `preload:` y el dashboard le pasa
+`%i[product warehouse]` —no el usuario, que no muestra—. Quien decide qué precargar es el que
+sabe qué va a leer.
+
+**Y el detector inverso quedó OPT-IN, a propósito.** `unused_eager_loading` avisa cuando hacés
+`includes(:x)` y después no usás `:x`; la idea es buena y acá encontró desperdicio real. Pero
+como **gate de CI es contraproducente**: cualquier código que precargue para el camino feliz y
+corte antes por una validación lo dispara. Caso real de este repo:
+`Purchasing::ReceiveOrder` carga `includes(lines: :product)` porque los necesita para recorrer
+las líneas, pero si la cantidad recibida es inválida corta en la primera línea y la precarga
+"no se usó". No hay nada que arreglar ahí: **no podés saber de antemano si vas a fallar**. Un
+chequeo que grita en casos correctos entrena a la gente a ignorarlo, y ahí perdés también las
+alertas buenas. Por eso `config/environments/test.rb` lo deja detrás de una variable:
+
+```ruby
+Bullet.unused_eager_loading_enable = ENV["BULLET_UNUSED"].present?   # BULLET_UNUSED=1 bundle exec rspec
+```
+
+El de N+1, en cambio, queda **siempre activo**: sus hallazgos son bugs reales, no ruido. Esa
+distinción —qué chequeo merece ser gate y cuál merece ser reporte— es una lección de tooling
+mucho más general que Bullet.
+
+El hook sigue activándose **sólo en los ejemplos marcados** con `:n_plus_one`
+(`config.before(:each, :n_plus_one)`, hoy en `spec/support/bullet.rb`; `spec/rails_helper.rb`
+ya no menciona a Bullet), por la misma razón: activarlo globalmente genera falsos positivos en
+specs unitarios donde la query repetida es intencional, la gente empieza a silenciarlos, y ahí
+perdés la herramienta.
 
 Java: es el `LazyInitializationException` / `hibernate.generate_statistics` del mundo JPA,
 pero al revés — acá el lazy loading **funciona** silenciosamente y por eso el N+1 pasa
@@ -1494,7 +1706,7 @@ personal; discutir comillas simples contra dobles en un code review es tiempo pe
 inherit_gem: { rubocop-rails-omakase: rubocop.yml }
 ```
 
-Corrida real: **188 archivos inspeccionados, 0 ofensas**. El workflow de CI cachea
+Corrida real: **194 archivos inspeccionados, 0 ofensas**. El workflow de CI cachea
 `RUBOCOP_CACHE_ROOT` (`tmp/rubocop`) con una clave derivada de `.ruby-version` +
 `.rubocop.yml` + `.rubocop_todo.yml` + `Gemfile.lock`, que es la forma correcta: la clave del
 cache tiene que incluir todo lo que invalida el resultado.
@@ -1691,8 +1903,11 @@ por defecto exactamente por esto.
 *Síntoma:* un usuario hace 300 requests y todo el mundo recibe 429.
 *Causa:* `Rack::Attack` corriendo **antes** de `ActionDispatch::RemoteIp`, así que
 `request.ip` es la IP del balanceador.
-*Arreglo:* `insert_after ActionDispatch::RemoteIp` (`config/application.rb:52`) y configurar
-`trusted_proxies`. Verificá con `bin/rails middleware`, no supongas.
+*Arreglo:* montarlo después de `RemoteIp` y configurar `trusted_proxies`. En este repo es
+`config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack` en
+`config/application.rb`. **CORREGIDO acá:** estaba con `insert_after`, que no mueve nada sino
+que agrega una segunda copia encima de la que monta el railtie de la gema — el stack tenía
+`Rack::Attack` dos veces (§16). Verificá con `bin/rails middleware`, no supongas.
 
 **5. `bundle install` falla en Docker pero anda en tu máquina.**
 *Síntoma:* `Could not find gem 'pg-1.6.3-x86_64-linux' in locally installed gems`.
@@ -1709,7 +1924,9 @@ imagen final sólo necesita `postgresql-client`.
 **7. Producción usa 16 MB más por proceso de lo esperado.**
 *Causa:* una gema de herramientas sin `require: false`, o `BUNDLE_WITHOUT` mal configurado.
 *Arreglo:* `bin/rails runner 'puts defined?(RuboCop)'` en producción. Si dice algo distinto
-de `nil`, ahí está.
+de `nil`, ahí está. **PASÓ ACÁ, con `sidekiq`:** el initializer tenía el `require` condicional
+pero el `Gemfile` la declaraba sin `require: false`, así que se cargaba en todos los procesos
+aunque el adapter fuera Solid Queue. Corregido (§1.5); hoy `sidekiq cargado?` da `NO`.
 
 **8. `PG::UnableToSend` / respuestas cruzadas después de activar `preload_app!`.**
 *Causa:* las conexiones abiertas antes del `fork()` quedan compartidas entre workers.
@@ -1741,8 +1958,11 @@ en la imagen del CI. Acá pasó con Chromium 141 vs ChromeDriver 147.
 
 **13. El job recurrente corre N veces, una por servidor.**
 *Causa:* `crontab` replicado en cada máquina.
-*Arreglo:* `config/recurring.yml` de Solid Queue, que elige líder y ejecuta una sola vez.
-Además queda versionado con el código y visible en Mission Control.
+*Arreglo:* `config/recurring.yml` de Solid Queue, que ejecuta una sola vez. **CORREGIDO acá:**
+este documento decía que lo lograba "eligiendo líder", y no es así — no hay elección de líder.
+Cada scheduler intenta `INSERT`ar en `solid_queue_recurring_executions`, que tiene un índice
+único sobre `(task_key, run_at)`: el primero gana y los demás se comen la violación de
+unicidad (§11). Además queda versionado con el código y visible en Mission Control.
 
 **14. Un cliente pide `?limit=100000` y el proceso muere.**
 *Causa:* parámetro de paginación sin cota.
@@ -1751,11 +1971,14 @@ colecciones que sólo crecen, keyset en vez de offset.
 
 **15. Una gema de performance que no hace nada.**
 *Síntoma:* ninguno, ése es el problema.
-*Causa:* la gema necesitaba un initializer que nadie escribió. Acá: `oj` está cargado en
-todos los procesos y `ActiveSupport::JSON::Encoding.json_encoder` sigue siendo el de la
-stdlib.
-*Arreglo:* verificá que la optimización esté activa **y medila**. En este caso la medición
-dice que además ya no hace falta.
+*Causa:* la gema necesitaba un initializer que nadie escribió. **PASÓ ACÁ:** `oj` estaba
+cargado en todos los procesos y `ActiveSupport::JSON::Encoding.json_encoder` seguía siendo
+`JSONGemEncoder`, el de la stdlib.
+*Arreglo (aplicado):* `config/initializers/oj.rb` con `Oj.default_options = { mode: :rails }`
+y `Oj.optimize_rails`; hoy `json_encoder` devuelve `Oj::Rails::Encoder` (§17). Y la segunda
+mitad de la lección: **medí después de enchufarla**. Acá la ganancia real es ~2.6x sobre el
+encoder anterior, que son 0.13 ms en una página de 25 objetos (ruido) y 25 ms en un export de
+5000 (ahí sí). El comentario del `Gemfile` lo dice así ahora, en vez de venderla como free win.
 
 ---
 
@@ -1781,6 +2004,10 @@ procesos. Lo medí en este repo: cargar rubocop y brakeman son **+16 MB y +404 a
 proceso. Con 4 workers son ~64 MB para dos herramientas que nunca corren dentro de la app.
 *Trade-off:* tenés que acordarte de `bundle exec` o de cargarla a mano, y si una gema tiene un
 railtie que hace algo importante, con `require: false` deja de funcionar en silencio.
+*El caso concreto de este repo:* `sidekiq` tenía el `require` condicional en el initializer
+pero no el `require: false` en el `Gemfile`, así que se cargaba igual en todos los procesos —
+la mitad de la optimización escrita, cero beneficio. Se detecta con
+`Object.const_defined?(:Sidekiq)`, no leyendo el `Gemfile`.
 *Contraste con Java:* el problema no existe porque el classloader es perezoso; un jar en el
 classpath que nadie referencia no cuesta nada.
 
@@ -1829,16 +2056,29 @@ ritmo de Rails? ¿cuánta superficie de API me obliga a adoptar? ¿cuánto pesa 
 La tercera es la que más se subestima: `pagy` te da un objeto y un método, así que sacarlo
 toca los controllers; `kaminari` agrega `.page` a **todos** los `ActiveRecord::Relation` y
 sacarlo es un refactor. Preferí lo que se enchufa sobre lo que se inyecta.
-*Y el caso concreto:* en este repo apliqué el criterio y **`oj` no pasa**. Medí que ni
-siquiera está conectado (`ActiveSupport::JSON::Encoding.json_encoder` sigue siendo el de la
-stdlib) y que, aun conectándolo, hoy es **2x más lento** que el gem `json` 2.21.2, que se
-reescribió y se optimizó fuerte. Es la lección general: una dependencia que entró por
-performance necesita que **revalides la medición**, porque el consejo de hace ocho años
-sigue circulando mucho después de dejar de ser cierto.
+*Y el caso concreto:* apliqué el criterio a `oj` y encontré que **ni siquiera estaba
+conectado** — `ActiveSupport::JSON::Encoding.json_encoder` devolvía `JSONGemEncoder`, el de la
+stdlib, porque faltaba el `Oj.optimize_rails` de un initializer. Pagábamos la RAM en todos los
+procesos y no serializábamos un solo byte con ella. Se enchufó
+(`config/initializers/oj.rb`, con `mode: :rails`, que es obligatorio porque los otros modos te
+cambian el formato de fechas y `BigDecimal` en silencio) y recién ahí medí: ~2.6x contra el
+encoder anterior, o sea 0.13 ms de ganancia en una página de 25 objetos y 25 ms en un export
+de 5000. Se queda, con la ganancia acotada y escrita en el `Gemfile`. Es la lección general en
+dos partes: una dependencia que entró por performance necesita que **verifiques que está
+enganchada** y que **revalides la medición**, porque el consejo de hace ocho años sigue
+circulando mucho después de dejar de ser cierto — el gem `json` se reescribió entre 2023 y
+2025 y buena parte de la ventaja histórica de Oj se evaporó.
 
 > La pregunta «¿Solid Queue o Sidekiq?» cae seguro y la respuesta completa está en §13 y en
 > docs/07. La versión de 30 segundos: Solid Queue mete el `INSERT` del job **en tu misma
 > transacción**, Sidekiq no; por debajo de ~10k jobs/min eso vale más que la latencia de
-> ~1 ms de Redis. Y el remate que separa una buena respuesta:
-> `enqueue_after_transaction_commit` arregla el rollback pero **no reemplaza al outbox**,
-> porque si el proceso muere entre el COMMIT y el enqueue el job se pierde igual.
+> ~1 ms de Redis. Y acá van los dos remates que separan una buena respuesta de una excelente.
+> Primero: eso del `INSERT` transaccional **es cierto sólo si la cola comparte base con tus
+> datos**, y en este repo no la comparte (`config.solid_queue.connects_to = { database:
+> { writing: :queue } }`), así que el rollback deja el job encolado igual — es una propiedad
+> de la topología, no de la gema. Segundo: `enqueue_after_transaction_commit` arregla el
+> rollback en los dos backends pero **no reemplaza al outbox**, porque si el proceso muere
+> entre el COMMIT y el enqueue el job se pierde igual. Y ojo dónde lo escribís: en Rails 8.1
+> ponerlo en un initializer como `config.active_job.enqueue_after_transaction_commit` es un
+> **no-op silencioso**; va por clase de job (`self.enqueue_after_transaction_commit = true` en
+> `ApplicationJob`).

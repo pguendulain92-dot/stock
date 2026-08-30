@@ -30,12 +30,12 @@ Ruby 3.3.6, Rails 8.1.3.1).
 | `FOR UPDATE NOWAIT` | `app/models/application_record.rb:34` | `lock_or_fail!` |
 | Optimistic locking | `app/models/stock_item.rb:22`, `app/models/product.rb:9` | `locking_column` |
 | Optimistic locking sobre HTTP | `app/controllers/api/v1/products_controller.rb:56` | `lock_version` en el PATCH |
-| UPDATE condicional atómico | `app/models/stock_item.rb:104` | `atomically_decrement` |
+| UPDATE condicional atómico | `app/models/stock_item.rb:115` | `atomically_decrement` |
 | CHECK constraints (última red) | `db/migrate/20260830160600_create_stock_items.rb:77` | 5 constraints |
 | Transacción + traducción de errores | `app/services/application_service.rb:68` | `transactional` |
 | Abortar sin `ActiveRecord::Rollback` | `app/services/application_service.rb:46` | `BusinessRuleViolation` |
 | Efectos después del commit | `app/services/outbox/recorder.rb:47` | `after_all_transactions_commit` |
-| Encolar después del commit (⚠️ no-op en Rails 8.1) | `config/initializers/sidekiq.rb:74` | `enqueue_after_transaction_commit`, ver §7.1 |
+| Encolar después del commit | `app/jobs/application_job.rb` | `self.enqueue_after_transaction_commit = true` — estuvo mal puesto en un initializer, ver §7.1 |
 | Lotes para evitar transacciones largas | `app/services/stock/expire_reservations.rb:37` | `in_batches` |
 | Timeouts de sesión | `config/database.yml` | `lock_timeout`, `statement_timeout` |
 | Tests de concurrencia reales | `spec/integration/concurrency_spec.rb` | 8 ejemplos con threads |
@@ -102,7 +102,7 @@ no aborta: **re-evalúa el `WHERE` contra la versión nueva** (el mecanismo se
 llama *EvalPlanQual*). Si la condición ya no se cumple, la fila no se actualiza.
 
 Eso es exactamente lo que hace correcto a `StockItem.atomically_decrement`
-(`app/models/stock_item.rb:104`): el `WHERE quantity_on_hand - quantity_reserved >= ?`
+(`app/models/stock_item.rb:115`): el `WHERE quantity_on_hand - quantity_reserved >= ?`
 se vuelve a evaluar sobre el dato fresco. Es una garantía de READ COMMITTED, no
 un truco.
 
@@ -393,8 +393,8 @@ nada.
 Y `lock_timeout` (10 s, seteado en `config/database.yml`) es el tercer
 modificador, el global: si esperás más de eso, Postgres aborta la sentencia y
 Rails levanta `ActiveRecord::LockWaitTimeout`, que
-`app/services/application_service.rb:82` traduce a
-`Result.failure(:locked, ...)` y `app/controllers/concerns/api/error_handling.rb:31`
+`app/services/application_service.rb:89` traduce a
+`Result.failure(:locked, ...)` y `app/controllers/concerns/api/error_handling.rb:40`
 convierte en un 409. Sin `lock_timeout`, un lock olvidado tiene todos tus
 threads de Puma colgados hasta el `statement_timeout` (o para siempre).
 
@@ -461,7 +461,7 @@ Los dos que muerden:
    con el stack apuntando a la línea culpable. Es más fácil de depurar y hace
    que el orden de escrituras sea el orden de tus llamadas.
 2. **`update_all` no toca `lock_version`.** Por eso
-   `StockItem.atomically_decrement` (`app/models/stock_item.rb:104`) lo
+   `StockItem.atomically_decrement` (`app/models/stock_item.rb:115`) lo
    incrementa **a mano** dentro del SQL:
 
    ```ruby
@@ -515,7 +515,7 @@ rescue ActiveRecord::StaleObjectError
 
 ### 3.3 UPDATE condicional atómico
 
-`app/models/stock_item.rb:104`. La variante de máximo throughput: **una sola
+`app/models/stock_item.rb:115`. La variante de máximo throughput: **una sola
 sentencia**, con la regla de negocio adentro del `WHERE`.
 
 ```ruby
@@ -575,7 +575,7 @@ método va envuelto en `connection.uncached { ... }` + `clear_query_cache`
 | El usuario puede reintentar | irrelevante | ✅ requisito | ⚠️ |
 | Se usa en este repo para | stock, reservas, transferencias, OCs | edición de catálogo vía API/UI | el contador correlativo (`SequenceCounter`); `atomically_decrement` está implementado y testeado, pero ningún service lo usa hoy |
 
-Regla de bolsillo, tal como está escrita en `app/models/stock_item.rb:99`:
+Regla de bolsillo, tal como está escrita en `app/models/stock_item.rb:110`:
 
 - 1 fila + condición expresable en SQL → **UPDATE condicional**.
 - Varias filas / lógica compleja / hay que leer antes → **`SELECT FOR UPDATE`**.
@@ -601,7 +601,7 @@ add_check_constraint :stock_items, "quantity_reserved <= quantity_on_hand",
 ```
 
 El modelo tiene **las mismas** reglas como validaciones
-(`app/models/stock_item.rb:32`, y `reserved_cannot_exceed_on_hand`). No es
+(`app/models/stock_item.rb:39`, y `reserved_cannot_exceed_on_hand`). No es
 duplicación por descuido: cumplen funciones distintas.
 
 | | Validación de Rails | CHECK constraint |
@@ -615,10 +615,14 @@ duplicación por descuido: cumplen funciones distintas.
 El problema estructural es el mismo TOCTOU de siempre: la validación hace
 `SELECT` (o lee el objeto en memoria), decide, y recién después escribe. Entre
 esos dos momentos hay una ventana. El caso más citado es `validates :uniqueness`,
-que es **imposible** de hacer correcto sin índice único:
+que es **imposible** de hacer correcto sin índice único.
+
+Y acá va una historia que vale por el resto de la sección, porque el rescue
+"obvio" **no alcanza** — y este repo lo tuvo mal. Así estaba escrito
+`StockItem.find_or_provision!`:
 
 ```ruby
-# app/models/stock_item.rb:121 — la forma correcta
+# ❌ La versión que ESTUVO viva en este repo: el rescue era decorativo.
 def self.find_or_provision!(product:, warehouse:)
   find_by(product:, warehouse:) || create!(product:, warehouse:)
 rescue ActiveRecord::RecordNotUnique
@@ -627,13 +631,70 @@ rescue ActiveRecord::RecordNotUnique
 end
 ```
 
+Dos defectos, los dos reales.
+
+**Trampa 1 — un rescue adentro de una transacción no sirve.** Los tres
+llamadores (`Stock::Receive`, `Transfers::Dispatch`, `Purchasing::ReceiveOrder`)
+invocan esto **dentro** de una transacción. En PostgreSQL, cuando una sentencia
+falla, **toda la transacción queda abortada**: cualquier consulta posterior
+muere. Reproducido contra `stock_development`:
+
+```text
+ActiveRecord::StatementInvalid: PG::InFailedSqlTransaction: ERROR:
+current transaction is aborted, commands ignored until end of transaction block
+```
+
+O sea que el `find_by!` del rescate explotaba igual, y encima con un error más
+difícil de leer que el original. Esto es muy distinto de MySQL o de la JVM con
+JDBC, donde un error de sentencia **no** invalida la transacción; es la
+diferencia que más sorprende viniendo de otro motor.
+
+**Trampa 2 — no siempre es `RecordNotUnique`.** El modelo también tiene
+`validates :product_id, uniqueness: { scope: :warehouse_id }`. Si el ganador
+commitea justo antes de que corra **esa** validación, el perdedor recibe
+`RecordInvalid`, no `RecordNotUnique`. La ventana es angosta pero existe, y el
+rescue de una sola clase la deja pasar.
+
+**Cómo quedó** (`app/models/stock_item.rb`, `find_or_provision!`):
+
+```ruby
+def self.find_or_provision!(product:, warehouse:)
+  existing = find_by(product:, warehouse:)
+  return existing if existing
+
+  # requires_new: true -> SAVEPOINT. Sin esto, el rescue de abajo es inútil
+  # cuando ya estamos dentro de una transacción (que es SIEMPRE, en la práctica).
+  transaction(requires_new: true) { create!(product:, warehouse:) }
+rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid
+  # El otro proceso ganó la carrera y su fila ya está commiteada.
+  # El savepoint se revirtió, así que la conexión sigue usable.
+  find_by!(product:, warehouse:)
+end
+```
+
+El `requires_new: true` emite un `SAVEPOINT` (§6.2). Al fallar el `create!` se
+revierte **sólo hasta el savepoint**: la transacción externa sigue viva y el
+`find_by!` del rescue puede correr. Es el savepoint usado al revés de lo
+habitual — no para descartar un pedazo de trabajo, sino para **sobrevivir a un
+error esperado** sin llevarse puesta la transacción de afuera.
+
 Confiás en el índice único (`add_index ..., unique: true`) y **rescatás el
-choque**. El test con 6 threads concurrentes confirma que queda exactamente una
-fila. `find_or_create_by!` sin este rescue es un bug esperando: los dos threads
+choque**. `find_or_create_by!` sin esto es un bug esperando: los dos threads
 pasan el `find`, los dos intentan el `create`, uno explota.
 
+Lo que lo protege hoy: el ejemplo de 6 threads concurrentes de
+`spec/integration/concurrency_spec.rb` (confirma que queda exactamente una fila)
+más dos regresiones en `spec/models/stock_item_spec.rb` — una crea al "ganador"
+**desde otra conexión** y verifica que la llamada sobrevive estando dentro de una
+transacción, la otra fuerza el `RecordNotUnique`.
+
 El mapeo a HTTP está en `app/services/application_service.rb:80`:
-`RecordNotUnique → Result.failure(:duplicate, ...)` → 409.
+`RecordNotUnique → Result.failure(:duplicate, ...)` → 409. Con un detalle que
+también se corrigió: ese `Result` ya **no** adjunta el `e.message` de
+`PG::UniqueViolation`. Ese mensaje trae el nombre del índice, el de la tabla y el
+valor que colisionó, y `ErrorSerializer` renderiza `details` tal cual: se estaba
+filtrando estructura interna en el cuerpo del 409. Hoy el mensaje que sale es
+genérico y el detalle completo va al log (`event: "service.duplicate"`).
 
 **Lo que un CHECK no te da**: no te salva de estados *válidos pero incorrectos*
 (el `7` del lost update). Es la última red, no la primera.
@@ -736,7 +797,7 @@ transferencias con los mismos dos productos en orden cruzado y exige
 `resultado[:errors]` vacío y dos `ok?`. Corrido recién:
 
 ```text
-8 examples, 0 failures      # Finished in 2.1 seconds
+8 examples, 0 failures      # Finished in 2.18 seconds
 ```
 
 **Reglas prácticas para no generar deadlocks:**
@@ -754,7 +815,7 @@ transferencias con los mismos dos productos en orden cruzado y exige
 
 ### 5.4 Reintentar es válido, pero no es la solución
 
-`app/jobs/application_job.rb:52`:
+`app/jobs/application_job.rb:81`:
 
 ```ruby
 retry_on ActiveRecord::Deadlocked, wait: :polynomially_longer, attempts: 5
@@ -1047,23 +1108,33 @@ encolaría antes de que la externa termine. El SETNX del cache, además,
 *debouncea*: 500 eventos en un lote encolan **un** job, no 500.
 
 **`enqueue_after_transaction_commit`**, y acá hay una trampa de versión que este
-repo se comió entera. En Rails 7.2 esto era un interruptor global —
-`config.active_job.enqueue_after_transaction_commit = :always` — y así está
-escrito en `config/initializers/sidekiq.rb:74`. **Rails 8.1 removió esa config
+repo se comió entera. **Este bug estuvo vivo acá; abajo está cómo se veía, cómo
+se detectó y cómo se arregló.**
+
+En Rails 7.2 esto era un interruptor global —
+`config.active_job.enqueue_after_transaction_commit = :always` — y así estaba
+escrito en `config/initializers/sidekiq.rb`. **Rails 8.1 removió esa config
 global** y también los valores `:always` / `:never` / `:default`: hoy es un
 atributo **por clase de job**. El railtie de Active Job incluso lo excluye a
 propósito cuando vuelca `config.active_job` sobre `ActiveJob::Base` ("This config
-can't be applied globally"), así que esa línea no falla, no avisa y **no hace
-nada**:
+can't be applied globally"), así que esa línea no fallaba, no avisaba y **no
+hacía nada**:
 
 ```ruby
+# Antes del arreglo:
 Rails.application.config.active_job.enqueue_after_transaction_commit  # => :always
 ActiveJob::Base.enqueue_after_transaction_commit                      # => false  ⚠️
 ```
 
-Verificado corriéndolo: un `perform_later` adentro de una transacción escribe la
-fila de la cola **al instante** y sobrevive al `ROLLBACK`. La forma correcta hoy
-es el atributo de clase:
+Cómo se detectó: no mirando la config —que contestaba `:always` y te dejaba
+tranquilo— sino preguntándole al **consumidor real** del valor,
+`ActiveJob::Base.enqueue_after_transaction_commit`. Y corriéndolo: un
+`perform_later` adentro de una transacción escribía la fila de la cola **al
+instante** y sobrevivía al `ROLLBACK`.
+
+**El arreglo.** Se borró la línea del initializer (`config/initializers/sidekiq.rb`
+hoy sólo configura Redis y el death handler) y se puso el atributo de clase donde
+corresponde, en `app/jobs/application_job.rb`:
 
 ```ruby
 class ApplicationJob < ActiveJob::Base
@@ -1071,9 +1142,32 @@ class ApplicationJob < ActiveJob::Base
 end
 ```
 
-Lo que salva al repo de que esto sea grave es que el evento de dominio **no
-depende de acá**: el outbox usa `after_all_transactions_commit` y escribe su fila
-dentro de la misma transacción.
+Estado actual, con `bin/rails runner`:
+
+```text
+config.active_job.enqueue_after_transaction_commit  => nil
+ActiveJob::Base.enqueue_after_transaction_commit    => false
+ApplicationJob.enqueue_after_transaction_commit     => true   ✅
+```
+
+Y el comportamiento, medido contra la base de desarrollo con el adapter de Solid
+Queue:
+
+```text
+dentro de la tx:       0 jobs encolados
+después del ROLLBACK:  0 jobs encolados     # antes: 1, y se ejecutaba igual
+después del COMMIT:    1 job encolado
+```
+
+Guardátelo como ejemplo de categoría, porque es el tipo de defecto más caro: no
+explotaba, no logueaba, no había deprecation warning, y la config que vos
+escribiste te devolvía exactamente el valor que le pusiste. Lo único que
+delataba el problema era medir el efecto, no leer la configuración.
+
+Lo que salvó al repo de que esto fuera grave mientras estuvo vivo es que el
+evento de dominio **no depende de acá**: el outbox usa
+`after_all_transactions_commit` y escribe su fila dentro de la misma
+transacción.
 
 ### 7.2 Por qué eso todavía no es un outbox
 
@@ -1445,7 +1539,7 @@ Concurrencia sobre el stock
   reservas concurrentes
     no se puede reservar dos veces la misma unidad
 
-Finished in 2.34 seconds (files took 1.77 seconds to load)
+Finished in 2.18 seconds (files took 1.69 seconds to load)
 8 examples, 0 failures
 ```
 
@@ -1526,8 +1620,14 @@ excepción. El repo usa `next success(...)` y `fail!`.
 **8. `PG::UniqueViolation` en `stock_items` bajo doble POST.**
 Síntoma: 500 en picos, dos requests idénticas simultáneas.
 Causa: `find_or_create_by!` sin rescue — los dos threads pasan el `find`.
-Arreglo: `StockItem.find_or_provision!` (`app/models/stock_item.rb:121`), que
-confía en el índice único y rescata `RecordNotUnique` releyendo la fila ganadora.
+Arreglo (**✅ corregido en este repo**): `StockItem.find_or_provision!`
+(`app/models/stock_item.rb`), que confía en el índice único y rescata el choque
+releyendo la fila ganadora. Ojo con las dos trampas del rescue ingenuo, que acá
+estuvieron vivas y hoy están cerradas (§4): hace falta
+`transaction(requires_new: true)` —un SAVEPOINT— para que el rescue sirva de algo
+estando dentro de una transacción, y hay que rescatar **también**
+`RecordInvalid`, no sólo `RecordNotUnique`. Regresiones en
+`spec/models/stock_item_spec.rb`.
 
 **9. La base "se puso lenta" y `autovacuum` no limpia nada.**
 Síntoma: tablas hinchadas, planes que empeoran, disco creciendo.
@@ -1552,12 +1652,17 @@ resetea solo al final de cada request y de cada job.
 **12. Un job que corre para una transacción que hizo rollback.**
 Síntoma: el worker procesa una orden o un movimiento que en la base no existe
 (`RecordNotFound` intermitente), o manda un mail por algo que se revirtió.
-Causa: `perform_later` adentro de la transacción, con el enqueue inmediato. En
-este repo la línea de `config/initializers/sidekiq.rb:74` **no lo evita**: Rails
-8.1 removió esa config global y `ActiveJob::Base.enqueue_after_transaction_commit`
-sigue en `false` (§7.1, verificado).
-Arreglo: `self.enqueue_after_transaction_commit = true` en `ApplicationJob` (o
-en el job puntual), y outbox para lo que directamente no se puede perder.
+Causa: `perform_later` adentro de la transacción, con el enqueue inmediato.
+Este bug **estuvo vivo acá**: la línea
+`config.active_job.enqueue_after_transaction_commit = :always` de
+`config/initializers/sidekiq.rb` no lo evitaba, porque Rails 8.1 removió esa
+config global y `ActiveJob::Base.enqueue_after_transaction_commit` seguía en
+`false`.
+Arreglo (**✅ ya aplicado**): se borró la línea del initializer y
+`app/jobs/application_job.rb` declara `self.enqueue_after_transaction_commit = true`.
+Verificado: `ApplicationJob.enqueue_after_transaction_commit # => true`, y un
+`perform_later` dentro de una transacción que hace rollback ya no encola nada
+(§7.1). Para lo que directamente no se puede perder, outbox.
 
 ---
 
@@ -1666,9 +1771,13 @@ en el job puntual), y outbox para lo que directamente no se puede perder.
 > `enqueue_after_transaction_commit`, que difiere el encolado hasta el COMMIT
 > para cualquier adapter. Ojo con la versión: en Rails 7.2 era la config global
 > `config.active_job.enqueue_after_transaction_commit`, y en 8.1 la removieron —
-> hoy es un atributo por clase de job. En este repo quedó puesta la forma vieja,
-> que no hace nada; lo dejo anotado porque justamente es el tipo de bug que no
-> avisa.
+> hoy es un atributo por clase de job. Este repo tenía puesta la forma vieja, que
+> no hace absolutamente nada y encima te contesta `:always` si le preguntás a la
+> config; lo arreglé borrando esa línea del initializer y poniendo
+> `self.enqueue_after_transaction_commit = true` en `ApplicationJob`. Lo cuento
+> porque es el tipo de bug que no avisa: no explota, no loguea, no hay
+> deprecation warning, y sólo lo ves si medís el efecto o le preguntás a
+> `ActiveJob::Base.enqueue_after_transaction_commit`.
 >
 > Pero eso **todavía no es un outbox**: entre el COMMIT y el enqueue hay una
 > ventana de microsegundos donde, si el proceso muere o Redis está caído, el job

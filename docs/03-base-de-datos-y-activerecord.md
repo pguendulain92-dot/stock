@@ -64,7 +64,7 @@ Seis queries (1 + N) contra dos (una por tabla: Rails hace `IN (...)`, no un
 JOIN, salvo que uses `preload`/`eager_load` explícitamente). No hay ningún
 `fetch = EAGER` que te salve por defecto: hay que pedir `includes` en cada
 listado. Por eso los modelos de este repo exponen un scope `with_associations`
-(`app/models/product.rb:60`, `app/models/stock_item.rb:47`).
+(`app/models/product.rb:64`, `app/models/stock_item.rb:54`).
 
 La consecuencia más cara de no tener identity map: **dos instancias del mismo
 registro se pisan**. Por eso el dominio bloquea la fila antes de leer y escribir,
@@ -263,7 +263,7 @@ contesta por cada una:
 ```bash
 $ bin/rails db:version
 database: stock_development
-Current version: 20260830161300
+Current version: 20260830220000
 
 database: stock_development_cache
 Current version: 1
@@ -284,7 +284,7 @@ Todas las tareas `db:*` tienen variante por base: `db:migrate:primary`,
 jerarquía de modelos. En este repo lo usan los engines de Rails:
 
 ```ruby
-# config/environments/production.rb:54
+# config/environments/production.rb:67
 config.solid_queue.connects_to = { database: { writing: :queue } }
 ```
 
@@ -665,10 +665,39 @@ Tres cosas que hay que saber y que se preguntan:
 
 Lo mismo para borrar: `remove_index :tabla, column: :x, algorithm: :concurrently`.
 
-(Los índices de este repo se crearon todos dentro de los `create_table`
+Casi todos los índices de este repo se crearon dentro de los `create_table`
 originales — `db/migrate/20260830160600_create_stock_items.rb:65-75` — y eso es
 seguro: **sobre una tabla nueva, que nadie está usando, ninguna de estas reglas
-aplica**. `strong_migrations` lo detecta con `new_table?` y no molesta.)
+aplica**. `strong_migrations` lo detecta con `new_table?` y no molesta.
+
+La excepción es la única migración posterior del repo, y es justamente el caso
+de esta sección: `db/migrate/20260830220000_add_ledger_global_index.rb` agrega un
+índice sobre `stock_movements`, que **ya tiene datos y escrituras**, así que va
+con las dos cosas juntas:
+
+```ruby
+class AddLedgerGlobalIndex < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!
+
+  def change
+    add_index :stock_movements,
+              [ :occurred_at, :id ],
+              order: { occurred_at: :desc, id: :desc },
+              algorithm: :concurrently,
+              if_not_exists: true,
+              name: "index_stock_movements_global_ledger"
+  end
+end
+```
+
+Por qué existe: el ledger **sin filtros** (el del panel y el de
+`GET /api/v1/stock_movements` sin parámetros) ordena por `occurred_at DESC, id
+DESC`, y los índices que había empezaban todos por otra columna
+(`stock_item_id`, `product_id`, `warehouse_id`). Un B-tree sólo sirve si la query
+usa un **prefijo izquierdo** de sus columnas, así que ninguno servía: Seq Scan +
+Sort sobre la tabla que más crece del sistema. El comentario de la migración lo
+explica entero, incluida la advertencia de que en desarrollo, con 109 filas, el
+planner **igual** elige Seq Scan y tiene razón (§12.3).
 
 ### 5.4 `NOT NULL` sin bloquear: el CHECK `NOT VALID`
 
@@ -832,7 +861,7 @@ gem no te iba a avisar.
 
 `db/schema.rb` es un **dump declarativo** del esquema, generado después de cada
 `db:migrate`, y es lo que carga `db:schema:load` (que es como se crea la base de
-test: rápido y sin re-ejecutar 17 migraciones).
+test: rápido y sin re-ejecutar 18 migraciones).
 
 ### 6.1 Qué SÍ representa (más de lo que la gente cree)
 
@@ -843,14 +872,14 @@ Mirando `db/schema.rb` de este repo, el dumper de Rails 8.1 captura:
 | Extensiones | `enable_extension "citext"`, `"pg_trgm"`, `"btree_gin"` (`db/schema.rb:15-18`) |
 | Índices parciales | `where: "(revoked_at IS NULL)"` (`db/schema.rb:34`) |
 | Índices con `opclass` y `using` | `opclass: :gin_trgm_ops, using: :gin` (`db/schema.rb:127`) |
-| Índices con orden | `order: { occurred_at: :desc, id: :desc }` (`db/schema.rb:240`) |
+| Índices con orden | `order: { occurred_at: :desc, id: :desc }` (`db/schema.rb:241`) y su forma abreviada `order: :desc` cuando todas las columnas van igual (`db/schema.rb:238`) |
 | CHECK constraints | los 5 de `stock_items` (`db/schema.rb:213-217`) |
 | Columnas generadas | `t.virtual "quantity_available", ... stored: true` (`db/schema.rb:203`) |
 | Arrays | `t.string "scopes", default: [], array: true` (`db/schema.rb:27`) |
 | Tipos PG (`citext`, `jsonb`, `uuid`) | `t.citext "sku"` (`db/schema.rb:120`) |
 | Defaults por función | `t.uuid "event_id", default: -> { "gen_random_uuid()" }` (`db/schema.rb:77`) |
 | PK no convencional | `create_table "sequence_counters", primary_key: "key", id: :string` (`db/schema.rb:177`) |
-| FK con `on_delete` | `add_foreign_key "stock_movements", "users", on_delete: :nullify` (`db/schema.rb:372`) |
+| FK con `on_delete` | `add_foreign_key "stock_movements", "users", on_delete: :nullify` (`db/schema.rb:373`) |
 | Tipos ENUM nativos | `create_enum` (Rails 7.0+; este repo no los usa a propósito, ver `db/migrate/20260830154959_create_users.rb`) |
 | Exclusion constraints | `t.exclusion_constraint` (Rails 7.1+) |
 
@@ -1153,11 +1182,11 @@ si.save!
 si.reload
 puts "despues del reload: #{si.quantity_available}"'
 
-changed: {"quantity_available"=>[132, 999]}
+changed: {"quantity_available"=>[134, 999]}
 readonly_attributes: []
-UPDATE "stock_items" SET "updated_at" = '...', "lock_version" = 30
-  WHERE "stock_items"."id" = 1 AND "stock_items"."lock_version" = 29
-despues del reload: 132
+UPDATE "stock_items" SET "updated_at" = '...', "lock_version" = 35
+  WHERE "stock_items"."id" = 1 AND "stock_items"."lock_version" = 34
+despues del reload: 134
 ```
 
 Tres cosas:
@@ -1284,7 +1313,7 @@ FKs son explícitas y todas eligen su `on_delete`:
 | `:nullify` | `ON DELETE SET NULL` | pone NULL en el hijo | `stock_movements` → `users`, `stock_reservations` → `users` |
 | (sin opción) | `NO ACTION` | como RESTRICT pero **diferible** al final de la transacción | — |
 
-La decisión de diseño se lee sola en `db/schema.rb:356-381`: **la historia
+La decisión de diseño se lee sola en `db/schema.rb:357-382`: **la historia
 contable nunca se borra en cascada.** Un movimiento de stock sobrevive al borrado
 del usuario que lo hizo (`nullify`), y no podés borrar un producto que tiene
 movimientos (`restrict`). Por eso además existe el soft delete
@@ -1312,7 +1341,7 @@ como prefijo izquierdo.
 
 ## 9. Validaciones vs constraints: la carrera de `validates_uniqueness_of`
 
-`app/models/stock_item.rb:36` tiene:
+`app/models/stock_item.rb:43` tiene:
 
 ```ruby
 validates :product_id, uniqueness: { scope: :warehouse_id }
@@ -1368,13 +1397,19 @@ profundidad, no redundancia:
 | Costo | un SELECT extra por save | ninguno (ya lo pagás) |
 
 El patrón correcto es **confiar en el índice y rescatar el choque**
-(`app/models/stock_item.rb:121-125`):
+(`app/models/stock_item.rb`, `find_or_provision!`):
 
 ```ruby
 def self.find_or_provision!(product:, warehouse:)
-  find_by(product:, warehouse:) || create!(product:, warehouse:)
-rescue ActiveRecord::RecordNotUnique
-  # El otro proceso ganó la carrera: su fila ya está commiteada, la leemos.
+  existing = find_by(product:, warehouse:)
+  return existing if existing
+
+  # requires_new: true -> SAVEPOINT. Sin esto, el rescue de abajo es inútil
+  # cuando ya estamos dentro de una transacción (que es SIEMPRE, en la práctica).
+  transaction(requires_new: true) { create!(product:, warehouse:) }
+rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid
+  # El otro proceso ganó la carrera y su fila ya está commiteada.
+  # El savepoint se revirtió, así que la conexión sigue usable.
   find_by!(product:, warehouse:)
 end
 ```
@@ -1406,22 +1441,68 @@ El rescate sólo funciona si la inserción tiene su propio **SAVEPOINT**
 un `transaction` anidado sin `requires_new:` se fusiona con el de afuera y no
 abre savepoint.
 
-Y acá está el matiz honesto sobre este repo: `find_or_provision!` **sí se llama
-adentro de la transacción** del service (`app/services/stock/receive.rb:32-33`
-lo invoca vía `ItemResolver` dentro de `transactional do`, y lo mismo hacen
-`app/services/stock/transfers/dispatch.rb:62` y
-`app/services/purchasing/receive_order.rb:47`). O sea que el `rescue` de
-`find_or_provision!` sólo cubre el caso sin transacción externa; bajo la carrera
-real, el `find_by!` del rescate se va a comer un `PG::InFailedSqlTransaction`.
-El arreglo es envolver el `create!` en `transaction(requires_new: true)`. En la
-práctica casi nunca se ve, porque la validación de unicidad de
-`app/models/stock_item.rb:36` corta antes con `RecordInvalid` — pero "casi
-nunca" es exactamente la definición de la race condition de esta sección.
-
 La misma lógica aplica a los CHECK: las validaciones de `StockMovement`
 (`app/models/stock_movement.rb:35`) duplican a propósito el CHECK de la
 migración. La validación da el mensaje; el CHECK garantiza que ni un script, ni
 un seed, ni un `psql` metan basura.
+
+### 9.1 Este bug estuvo vivo en este repo: el `rescue` que no rescataba
+
+Vale la pena contarlo entero, porque es la forma más común de que este patrón
+salga mal y porque acá **estaba mal de verdad**.
+
+**Así se veía.** `find_or_provision!` era esto:
+
+```ruby
+# ❌ la versión con el bug
+def self.find_or_provision!(product:, warehouse:)
+  find_by(product:, warehouse:) || create!(product:, warehouse:)
+rescue ActiveRecord::RecordNotUnique
+  find_by!(product:, warehouse:)
+end
+```
+
+Impecable en apariencia e inútil en la práctica, por dos motivos independientes:
+
+1. **El `create!` no tenía savepoint propio.** Los tres llamadores lo invocan
+   **dentro** de una transacción: `app/services/stock/receive.rb:32-33` lo llama
+   vía `ItemResolver` adentro de `transactional do`, y lo mismo hacen
+   `app/services/stock/transfers/dispatch.rb:62` y
+   `app/services/purchasing/receive_order.rb:47`. Cuando el INSERT chocaba
+   contra el índice único, Postgres dejaba la transacción **abortada** y el
+   `find_by!` del rescate se moría con `PG::InFailedSqlTransaction`: el `rescue`
+   cambiaba una excepción por otra peor y menos legible.
+2. **No siempre llega como `RecordNotUnique`.** Si el ganador commitea justo
+   antes de que corra la validación `validates :product_id, uniqueness:`, el
+   perdedor recibe `RecordInvalid` y ese `rescue` ni se activaba.
+
+**Así se detectó.** Leyendo los llamadores, no el método: la pista es que el
+`rescue` está escrito para el caso "no hay transacción externa" y los tres
+callers abren una. Es exactamente el bug que **no** se ve en un test que ejercita
+el método suelto.
+
+**Así se arregló** (`app/models/stock_item.rb`, la versión que se ve arriba): el
+`create!` va envuelto en `transaction(requires_new: true)`, que abre un SAVEPOINT
+y hace que el rollback llegue sólo hasta ahí, dejando viva y usable la
+transacción externa; y el `rescue` atrapa `RecordNotUnique` **y**
+`RecordInvalid`.
+
+**La regresión está cubierta** en `spec/models/stock_item_spec.rb`, en el ejemplo
+*"sobrevive a la carrera DENTRO de una transacción (savepoint)"*. Dos detalles
+del test que son la parte interesante:
+
+* el "ganador" de la carrera se crea desde **otra conexión**
+  (`ApplicationRecord.connection_pool.with_connection` en un thread aparte),
+  porque hace falta que el `UNIQUE` reviente de verdad — con un stub no se
+  reproduce;
+* la aserción de fondo no es el valor devuelto sino la línea siguiente al
+  rescate: un `StockItem.count` **dentro de la misma transacción**, que con el
+  bug moría con `PG::InFailedSqlTransaction`.
+
+Y el detalle que se pregunta y que este bug ilustra: **esto es específico de
+PostgreSQL**. En MySQL o en la JVM con JDBC una sentencia fallida no invalida la
+transacción entera, así que el mismo código "anda" y el hábito viaja sano hasta
+que alguien lo escribe contra Postgres.
 
 ---
 
@@ -1853,7 +1934,7 @@ toda la cadena hacia arriba. Ese es el "touch storm" clásico.
 Todas tienen sufijo por base: `db:migrate:primary`, `db:rollback:queue`, etc.
 
 En producción, `config.active_record.dump_schema_after_migration = false`
-(`config/environments/production.rb:77`): el servidor de producción no tiene por
+(`config/environments/production.rb:93`): el servidor de producción no tiene por
 qué escribir `schema.rb`.
 
 ### 12.2 `dbconsole`
@@ -1888,9 +1969,17 @@ Desde Rails, sobre cualquier relación. Dos trampas antes del ejemplo:
 `explain(:analyze, :verbose)` funciona porque el adapter hace
 `"EXPLAIN (#{options.join(", ").upcase})"`
 (`activerecord-8.1.3.1/.../postgresql/database_statements.rb:96-100`). Con un
-hash, ese `join` interpola el `inspect` del hash. El helper
-`ApplicationRecord.explain_analyze` (`app/models/application_record.rb:44-46`)
-usa la forma con hash y **está roto hoy**; verificado:
+hash, ese `join` interpola el `inspect` del hash.
+
+**Y este bug estuvo vivo acá.** El helper `ApplicationRecord.explain_analyze`
+estaba escrito con la forma que parece natural y no existe:
+
+```ruby
+# ❌ como estaba
+relation.explain(analyze: true, verbose: true)
+```
+
+Así se veía al usarlo:
 
 ```bash
 $ bin/rails runner 'ApplicationRecord.explain_analyze(Product.kept.limit(1)).inspect'
@@ -1899,8 +1988,39 @@ ActiveRecord::StatementInvalid: PG::SyntaxError: ERROR:  syntax error at or near
 LINE 1: EXPLAIN ({:ANALYZE=>TRUE, :VERBOSE=>TRUE}) SELECT "products"...
 ```
 
-Usá `.explain(:analyze, :verbose).inspect` directo sobre la relación hasta que
-se corrija:
+El hash entero se interpolaba como texto dentro del paréntesis del `EXPLAIN`.
+Cómo se detectó: corriéndolo. Es el defecto típico de un helper "de consola" que
+nadie ejerce en la suite — se escribe, se lee bien y nunca se ejecuta.
+
+**Así se arregló** (`app/models/application_record.rb`, método
+`self.explain_analyze`): símbolos posicionales, y `.inspect` adentro del propio
+helper para que devuelva el plan y no el proxy.
+
+```ruby
+def self.explain_analyze(relation = all)
+  relation.explain(:analyze, :verbose).inspect
+end
+```
+
+Verificado hoy:
+
+```bash
+$ bin/rails runner 'puts ApplicationRecord.explain_analyze(Product.kept.limit(1))'
+
+EXPLAIN (ANALYZE, VERBOSE) SELECT "products".* FROM "products"
+ WHERE "products"."discarded_at" IS NULL LIMIT 1
+                                       QUERY PLAN
+------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.08 rows=1 width=168) (actual time=0.012..0.012 rows=1 loops=1)
+   Output: id, active, attributes_data, barcode, category_id, cost_cents, created_at, …
+   ->  Seq Scan on public.products  (cost=0.00..1.15 rows=15 width=168)
+       (actual time=0.011..0.011 rows=1 loops=1)
+         Filter: (products.discarded_at IS NULL)
+ Planning Time: 0.082 ms
+ Execution Time: 0.033 ms
+```
+
+Sobre una relación cualquiera, la forma directa es la misma:
 
 ```bash
 $ bin/rails runner 'puts Product.kept.active.order(:name).limit(5).explain(:analyze, :verbose).inspect'
@@ -1943,6 +2063,32 @@ secuencialmente sale más barato que ir al índice y volver a la tabla. **Un
 plan, hacelo contra un dataset con volumen parecido al de producción y con
 `ANALYZE` corrido.
 
+Este malentendido es tan común que la migración del índice global del ledger
+(`db/migrate/20260830220000_add_ledger_global_index.rb`, §5.3) lo documenta en su
+propio comentario, con la receta para verificar que el índice **sirve** sin tener
+volumen: apagarle el Seq Scan al planner y mirar si lo elige. Verificado:
+
+```bash
+$ psql -d stock_development -c "EXPLAIN SELECT * FROM stock_movements
+                                ORDER BY occurred_at DESC, id DESC LIMIT 50;"
+ Limit  (cost=7.71..7.84 rows=50 width=140)
+   ->  Sort  (cost=7.71..7.98 rows=109 width=140)
+         Sort Key: occurred_at DESC, id DESC
+         ->  Seq Scan on stock_movements  (cost=0.00..4.09 rows=109 width=140)
+
+$ psql -d stock_development -c "SET enable_seqscan = off;
+                                EXPLAIN SELECT * FROM stock_movements
+                                ORDER BY occurred_at DESC, id DESC LIMIT 50;"
+ Limit  (cost=0.14..8.68 rows=50 width=140)
+   ->  Index Scan using index_stock_movements_global_ledger on stock_movements
+       (cost=0.14..18.76 rows=109 width=140)
+```
+
+Con 109 filas el Seq Scan + Sort gana; forzando el índice desaparece el paso de
+`Sort`, que es exactamente lo que el índice compra en producción. `enable_seqscan
+= off` es una herramienta de diagnóstico, no una configuración: nunca la dejes
+puesta.
+
 ### 12.4 Logs de queries en desarrollo
 
 ```ruby
@@ -1953,7 +2099,21 @@ config.active_record.query_log_tags_enabled = true # agrega /*application='Stock
 
 Los query log tags viajan hasta `pg_stat_activity`, así que en producción podés
 ver **qué controller o job** está corriendo una query lenta sin adivinar. Es la
-mejor herramienta que hay para cazar N+1 y queries huérfanas.
+mejor herramienta que hay para cazar N+1 y queries huérfanas *a mano*.
+
+La automática es Bullet, y también tuvo su historia acá: la gema estaba sólo en
+`group :development` del Gemfile, así que en test la constante `Bullet` no
+existía, los guards `if defined?(Bullet)` de `spec/support/bullet.rb` daban
+`false` y los ejemplos marcados `:n_plus_one` **pasaban en verde hubiera o no un
+N+1**. Hoy la gema está en `group :development, :test` (`Gemfile`), la
+configuración vive en un `after_initialize` de `config/environments/test.rb`
+—`Bullet.enable = true` aplica los parches sobre ActiveRecord en el momento de la
+asignación, así que llegar después del boot es llegar tarde— y
+`spec/n_plus_one_guard_spec.rb` testea **la herramienta** con un control
+positivo: un N+1 fabricado que tiene que hacer fallar el ejemplo. El detector de
+eager loading *innecesario* quedó opt-in con `BULLET_UNUSED=1` porque da falsos
+positivos cuando un camino corta antes de usar la precarga; el de N+1 está
+siempre activo y rompe la suite.
 
 ---
 
@@ -1967,7 +2127,7 @@ mejor herramienta que hay para cazar N+1 y queries huérfanas.
 | `PG::ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a transaction block` | `algorithm: :concurrently` sin `disable_ddl_transaction!` | agregar `disable_ddl_transaction!` |
 | Un índice que existe pero el planner nunca usa | Quedó `INVALID` de un `CONCURRENTLY` que falló | `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` y `DROP INDEX CONCURRENTLY` |
 | `PG::UndefinedColumn: column products.barcode does not exist` durante un deploy | Se borró la columna sin `ignored_columns` un deploy antes; los procesos viejos tienen el schema cacheado | §5.6, y mientras tanto, reiniciar los procesos viejos |
-| `PG::InFailedSqlTransaction: current transaction is aborted` después de un `rescue` | Se rescató una `RecordNotUnique` (o cualquier error de Postgres) **dentro** de una transacción: ya está abortada | envolver el INSERT en `transaction(requires_new: true)` para que el rollback llegue sólo hasta el savepoint (§9) |
+| `PG::InFailedSqlTransaction: current transaction is aborted` después de un `rescue` | Se rescató una `RecordNotUnique` (o cualquier error de Postgres) **dentro** de una transacción: ya está abortada | **corregido en este repo**: `StockItem.find_or_provision!` envuelve el `create!` en `transaction(requires_new: true)` para que el rollback llegue sólo hasta el savepoint, y rescata también `RecordInvalid` (§9.1, regresión en `spec/models/stock_item_spec.rb`) |
 | Dos filas para el mismo (producto, depósito) y el stock que "no cierra" | `validates uniqueness` sin índice único: la carrera de §9 | índice `UNIQUE` + `rescue RecordNotUnique` |
 | `PG::UniqueViolation` al marcar un proveedor como preferido | El índice único parcial `index_one_preferred_supplier_per_product` | desmarcar el anterior en la misma transacción (`app/models/product_supplier.rb:21`) |
 | El total de la orden no coincide con las líneas | Alguien usó `update_column`/`update_all` sobre las líneas: no dispara callbacks | recalcular con `recalculate_totals!`; o `reset_counters` si fuera `counter_cache` |

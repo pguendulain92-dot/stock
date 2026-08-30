@@ -83,8 +83,8 @@ lógica cae por gravedad en dos lugares:
 `quantity_on_hand`** —el stock físico— y el único que escribe un asiento en el
 ledger. Lo verifiqué grepeando: la única asignación a esa columna en todo `app/`
 está en `apply_movement.rb:133`. (El modelo además expone primitivas que podrían
-escribirla —`#apply_delta!` en `stock_item.rb:74` y `.atomically_decrement` en
-`:104`—, pero hoy no las llama nadie en `app/`: sólo los specs.) Su `call` tiene
+escribirla —`#apply_delta!` en `stock_item.rb:85` y `.atomically_decrement` en
+`:115`—, pero hoy no las llama nadie en `app/`: sólo los specs.) Su `call` tiene
 seis pasos y nada más:
 
 ```ruby
@@ -156,10 +156,10 @@ código, y está bien puesto:
 
 | Va en el modelo | Ejemplo real | Va en el service |
 |---|---|---|
-| Lecturas derivadas | `#available`, `#below_reorder_point?`, `#valuation` (`stock_item.rb:51-62`) | Operaciones con lock + ledger + evento |
-| Validaciones de forma | `#reserved_cannot_exceed_on_hand` (`:132`) | Reglas que dependen del caso de uso |
-| Scopes reutilizables | `.in_stock`, `.needing_reorder` (`:39-45`) | Consultas con 6 filtros → query object |
-| Primitivas de persistencia | `.atomically_decrement` (`:104`), `.find_or_provision!` (`:121`) | Orquestación de varias primitivas |
+| Lecturas derivadas | `#available`, `#below_reorder_point?`, `#valuation` (`stock_item.rb:58-69`) | Operaciones con lock + ledger + evento |
+| Validaciones de forma | `#reserved_cannot_exceed_on_hand` (`:175`) | Reglas que dependen del caso de uso |
+| Scopes reutilizables | `.in_stock`, `.needing_reorder` (`:47-52`) | Consultas con 6 filtros → query object |
+| Primitivas de persistencia | `.atomically_decrement` (`:115`), `.find_or_provision!` (`:158`) | Orquestación de varias primitivas |
 
 La regla que uso para decidir: **si el método necesita una transacción, es un
 caso de uso**. Si sólo lee o valida forma, es del modelo.
@@ -285,7 +285,7 @@ toques la lógica":
 
 | Tabla | Archivo | Qué evita |
 |---|---|---|
-| `STATUS_FOR` (código de error → HTTP) | `app/controllers/concerns/api/error_handling.rb:38` | Un `case` de 17 ramas en cada controller |
+| `STATUS_FOR` (código de error → HTTP) | `app/controllers/concerns/api/error_handling.rb:47` | Un `case` de 17 ramas en cada controller |
 | `SORTS` (nombre → cláusula ORDER BY) | `app/queries/products/search.rb:25` | Interpolar `params[:sort]` en SQL (inyección) |
 | `TRANSITIONS` (estado → estados válidos) | `app/models/stock_transfer.rb:35`, `purchase_order.rb:27` | `if status == "draft" && ...` repartido |
 | `MOVEMENT_STYLES` / `STATUS_STYLES` | `app/helpers/application_helper.rb:9` y `:20` | Clases de Tailwind duplicadas en las 9 vistas que usan los badges |
@@ -372,7 +372,7 @@ def render_result(result, success_status: :ok, serializer: nil)
   end
 end
 ```
-<sub>`app/controllers/concerns/api/error_handling.rb:58`</sub>
+<sub>`app/controllers/concerns/api/error_handling.rb:67`</sub>
 
 ### 4.3 Los forms también, con otro nombre de método
 
@@ -624,11 +624,15 @@ normal, se lee en la firma, y no requiere XML, anotaciones ni reflection.
    clase mal escrita, te enterás en la **primera llamada en producción**. Mitigación
    real del repo: `config.eager_load = true` en producción
    (`config/environments/production.rb:10`), que al menos hace fallar el **deploy**
-   y no la primera request. Ojo: el CI de este repo corre RuboCop, Brakeman,
-   bundler-audit y RSpec, pero **no** corre `zeitwerk:check`
-   (`.github/workflows/ci.yml`) — y aunque lo corriera, `zeitwerk:check` sólo
-   verifica que cada archivo defina la constante que su nombre promete, no que la
-   referencia exista.
+   y no la primera request. Sobre las otras redes: **el CI corría RuboCop,
+   Brakeman, bundler-audit y RSpec, y no corría `zeitwerk:check`**. Eso se
+   arregló: hoy hay un paso «Check Zeitwerk autoloading»
+   (`bin/rails zeitwerk:check` en `.github/workflows/ci.yml`), que carga la app
+   entera y adelanta al CI la clase de fallas de autoloading que antes aparecían
+   recién en el deploy. Ojo igual con qué cubre: `zeitwerk:check` sólo verifica
+   que cada archivo defina la constante que su nombre promete, **no** que la
+   referencia exista. Un default mal escrito en un keyword arg lo sigue
+   descubriendo la primera llamada.
 2. **No hay scopes.** `event_recorder: Outbox::Recorder.new` construye **una
    instancia nueva por llamada**, porque los defaults se evalúan en cada
    invocación. Acá da igual (el `Recorder` no tiene estado), pero si mañana
@@ -836,6 +840,17 @@ request (`spec/policies/policies_spec.rb`), y `verify_authorized` en un
 `after_action` te avisa si te olvidaste de autorizar una acción
 (`app/controllers/api/v1/base_controller.rb:117`). En Spring, olvidarte la
 anotación no produce ningún error: el endpoint queda abierto y silencioso.
+
+**Ese `after_action` estuvo sólo en la API**, y ahí quedaba un agujero real: un
+controller HTML nuevo sin `authorize` no disparaba ninguna alarma. Ya está
+corregido: el mismo callback vive ahora también en la UI web
+(`after_action :verify_pundit_usage` en
+`app/controllers/application_controller.rb`), con los controllers de `sessions`
+y `passwords` excluidos porque son públicos por definición. Y las acciones que legítimamente no autorizan nada lo declaran
+**explícito** en vez de quedar en gris: `skip_policy_scope` en
+`DashboardController#index` y `skip_policy_scope` + `skip_authorization` en
+`StockItemsController#low_stock`. Declararlo es mejor que saltear el callback:
+queda escrito que la decisión se tomó.
 
 ### 7.5 Serializer
 
@@ -1265,9 +1280,9 @@ product.update!(active: false)
 
 Y acá están los lugares del repo donde **deliberadamente no** se aplicó un patrón:
 
-- **`StockItem#valuation`** (`stock_item.rb:62`) es `product.cost * on_hand`. No
+- **`StockItem#valuation`** (`stock_item.rb:69`) es `product.cost * on_hand`. No
   hay service de valuación de un ítem: es una lectura derivada.
-- **`Product#margin` y `#margin_ratio`** (`product.rb:71`) son aritmética pura
+- **`Product#margin` y `#margin_ratio`** (`product.rb:75`) son aritmética pura
   sobre `Money`. No merecen una clase.
 - **`StockMovement.discrepancies`** (`stock_movement.rb:64`) es
   `def self.discrepancies(...) = StockItems::Reconciliation.call(...)`: un atajo
@@ -1307,7 +1322,7 @@ El `!` es el que más se malinterpreta viniendo de otros lenguajes. **No signifi
 `Array#flatten!` muta *y* devuelve `nil` si no hubo cambios. `Result#value!`
 (`app/lib/result.rb:81`) es el caso puro en este repo: **no muta nada** (el
 `Result` está congelado), y el `!` está sólo porque levanta `Result::Failure` en
-vez de devolverte el error como valor. Y `StockItem.find_or_provision!` (`:121`)
+vez de devolverte el error como valor. Y `StockItem.find_or_provision!` (`:158`)
 sí escribe, pero el `!` está por el `create!` / `find_by!` que pueden explotar, no
 por la escritura.
 
@@ -1327,7 +1342,7 @@ def below_reorder_point? = available <= reorder_point
 def out_of_stock? = available <= 0
 def valuation = product.cost * on_hand
 ```
-<sub>`app/models/stock_item.rb:51`</sub>
+<sub>`app/models/stock_item.rb:58`</sub>
 
 Cuándo **no** usarlo: si el cuerpo no entra cómodo en una línea, o si hay efectos
 laterales. `def call = new(...).call` está bien; un `def call = transactional { ... }`
@@ -1370,7 +1385,7 @@ if item.quantity_on_hand - item.quantity_reserved >= cantidad
 # ✅ tell
 if item.can_fulfil?(cantidad)
 ```
-<sub>`app/models/stock_item.rb:57`</sub>
+<sub>`app/models/stock_item.rb:64`</sub>
 
 Lo mismo con `#terminal?` (`stock_reservation.rb:43`), que encapsula
 `committed? || released? || expired?` y evita que cada llamador arme la condición.
@@ -1435,23 +1450,39 @@ tipos.
 # frozen_string_literal: true
 ```
 
-Es la primera línea de casi todo el código del repo: 165 de los 188 archivos
-`.rb`. Los 23 que no lo tienen son los que generó Rails y nadie retocó — los 13
-de `config/` (`application.rb`, `boot.rb`, `puma.rb`, los `environments/`…), los
-cuatro `db/*schema.rb`, `sessions_controller.rb`, `passwords_controller.rb`, el
-concern `authentication.rb` y los dos mailers, más
-`application_cable/connection.rb`. Las migraciones **sí** lo tienen. Es una
-inconsistencia que vale la pena arreglar, porque el comentario es **por
-archivo**: que lo tenga el 88% no protege al 12% restante.
+Es la primera línea de casi todo el código del repo: **178 de los 194 archivos
+`.rb`**. Los 16 que no lo tienen son los que genera Rails y nadie retoca: 12 de
+`config/` (`application.rb`, `boot.rb`, `puma.rb`, los `environments/`…) y los
+cuatro `db/*schema.rb`. Las migraciones **sí** lo tienen, y en `app/` y `lib/`
+**no queda ninguno sin el comentario**.
+
+**Esa inconsistencia estuvo viva en este repo y se corrigió.** Cuando se verificó
+esta documentación faltaba en 23 de 188 archivos, y seis de esos estaban en
+`app/`: `sessions_controller.rb`, `passwords_controller.rb`, el concern
+`authentication.rb` —que corre en **cada** request de la UI—, los dos mailers y
+`application_cable/connection.rb`. O sea: no era sólo boilerplate de arranque,
+era código de la aplicación. Así se detecta y así se verifica que quedó limpio:
+
+```bash
+for f in $(find app lib -name '*.rb'); do
+  head -1 "$f" | grep -q frozen_string_literal || echo "$f"
+done
+# => sin salida
+```
+
+Importa justamente por lo que decía el conteo: el comentario es **por archivo**,
+así que que lo tuviera el 88% no protegía al 12% restante. Los 16 que quedan son
+archivos de configuración y schemas generados, donde no hay literales calientes
+en un camino de request.
 
 Qué hace: congela los literales de string de ese archivo. Menos objetos, menos GC,
 y **una mutación accidental explota** en vez de corromper algo lejano. En Ruby 3.3
 todavía no es el default, así que el comentario mágico sigue haciendo falta.
 
-Los 19 usos de `.freeze` en `app/` son casi todos constantes de configuración
+Los 20 usos de `.freeze` en `app/` son casi todos constantes de configuración
 (`ADAPTERS`, `TRANSITIONS`, `SORTS`, `STATUS_FOR`, `SUBUNITS`, `UNITS`,
-`ROLE_RANK`, `KINDS`, `MOVEMENT_STYLES`…) y están congeladas por la misma razón
-por la que en Java usarías
+`ROLE_RANK`, `KINDS`, `MOVEMENT_STYLES`, `DEFAULT_PRELOAD`…) y están congeladas
+por la misma razón por la que en Java usarías
 `Map.of(...)` / `List.copyOf(...)`: en un servidor **multi-thread** como Puma, una
 constante mutable es estado compartido sin lock.
 
@@ -1483,7 +1514,7 @@ Corrí el análisis y lo desarmé:
 ```bash
 export PATH="/opt/rbenv/versions/3.3.6/bin:$PATH"
 bundle exec rubocop
-# => 188 files inspected, no offenses detected
+# => 194 files inspected, no offenses detected
 ```
 
 ```text
@@ -1529,7 +1560,45 @@ Comparación honesta con Java:
 | Complejidad / deuda | PMD, SonarQube | **nada activado** | — |
 | Vulnerabilidades en dependencias | OWASP dependency-check | **bundler-audit** | CVEs del `Gemfile.lock` |
 | Cobertura | JaCoCo | **SimpleCov** (line + branch) | — |
-| N+1 | ninguna estándar | **Bullet** (rompe los ejemplos marcados `:n_plus_one`) | — |
+| N+1 | ninguna estándar | **Bullet** (rompe los ejemplos marcados `:n_plus_one`) — ver el asterisco de abajo | — |
+
+**El asterisco de Bullet, que es la lección más cara de esta tabla.** Esa red
+figuraba en la tabla, pero **estuvo colgada y sin atar durante todo el
+proyecto**: la gema estaba sólo en `group :development` del Gemfile, así que en
+test la constante `Bullet` no existía, los guards `if defined?(Bullet)` de
+`spec/support/bullet.rb` daban `false`, y los ejemplos marcados `:n_plus_one`
+pasaban en verde **hubiera o no un N+1**. Un chequeo verde que no verifica nada
+es peor que no tener chequeo, porque te da confianza y te saca las ganas de
+mirar.
+
+Así quedó arreglado:
+
+- La gema pasó a `group :development, :test` (`Gemfile`).
+- La configuración (`Bullet.enable`, `Bullet.raise`) se movió de
+  `spec/support/bullet.rb` a un `config.after_initialize` de
+  `config/environments/test.rb`, porque `Bullet.enable = true` **aplica los
+  parches sobre ActiveRecord en el momento de la asignación**: desde un
+  `before(:suite)` de RSpec llega tarde para algunos ganchos y la detección
+  queda muda.
+- `spec/support/bullet.rb` se quedó sólo con el ciclo
+  `start_request`/`end_request` y con el helper `detectando_n_plus_one`, que
+  envuelve **nada más que la consulta a auditar** (si creás los registros dentro
+  del request de Bullet quedan marcados como "imposibles" y no reporta nada).
+- `spec/n_plus_one_guard_spec.rb` testea **la herramienta**, no el código: un
+  control positivo que arma un N+1 a propósito y exige que Bullet lo levante.
+  Es la regla general — cuando una herramienta de test puede desactivarse en
+  silencio, escribí un test que verifique que está activa.
+- El detector de eager loading **innecesario** (`unused_eager_loading`) quedó
+  opt-in con `BULLET_UNUSED=1`, porque da falsos positivos cuando un camino
+  precarga para el caso feliz y corta antes por una validación. El de N+1 sigue
+  siempre activo: sus hallazgos son bugs reales.
+
+Y apenas la red empezó a atajar aparecieron N+1 de verdad. Uno de ellos explica
+el método privado `serialize` de `Api::V1::PurchaseOrdersController`: el
+serializer recorre las líneas tocando `line.product`, y la precarga se hace con
+`ActiveRecord::Associations::Preloader` **en el momento de serializar** en vez de
+buscar con `includes`, porque los caminos de error (422, 403) cortan antes de
+serializar y ahí el eager loading se pagaría sin usarse.
 
 Si quisieras las métricas, activarías `Metrics` en `.rubocop.yml` con umbrales
 propios, o sumarías `rubocop-rspec` (que está en el `Gemfile` pero **no** está
@@ -1543,7 +1612,7 @@ requerido en `.rubocop.yml`: el reporte muestra 0 cops de RSpec cargados).
 |---|---|---|---|
 | 1 | Una transferencia falló a mitad y quedaron líneas commiteadas | Alguien llamó a un sub-service y **no** cortó con `fail!`. La transacción anidada se **une** a la externa: que el hijo devuelva `Result.failure` no revierte nada | Todo llamado a un sub-service termina en un `fail!` si el hijo devolvió failure, sea con `.tap` (`app/services/stock/issue.rb:39`) o con variable local (`transfers/dispatch.rb:60`) |
 | 2 | Se escribió stock sin pasar por `ApplyMovement` y `SUM(movements) != quantity_on_hand` | Alguien hizo `item.update!(quantity_on_hand: n)` desde un script o la consola | `StockItems::Reconciliation` lo detecta; lo corre `Stock::ReconcileBalancesJob`. Si devuelve una sola fila, hay un bug |
-| 3 | Un `Result.failure` de un service viaja al cliente como 500 | El código de error no está en `STATUS_FOR` y cae en el default | Agregá la fila en `app/controllers/concerns/api/error_handling.rb:38`. El default es 422, así que el síntoma más común es "422 donde debería ser 404 o 409" |
+| 3 | Un `Result.failure` de un service viaja al cliente como 500 | El código de error no está en `STATUS_FOR` y cae en el default | Agregá la fila en `app/controllers/concerns/api/error_handling.rb:47`. El default es 422, así que el síntoma más común es "422 donde debería ser 404 o 409" |
 | 4 | `NameError: uninitialized constant Outbox::NullRecorder` en desarrollo, pero en producción anda | La clase estaba anidada en otro archivo. Zeitwerk carga por demanda; `eager_load` en producción la salvaba | Un archivo por constante (`app/services/outbox/null_recorder.rb:18`). `zeitwerk:check` **no** lo detecta |
 | 5 | Un "auto-registro por herencia" (`self.inherited`) encuentra 0 clases | Mismo mecanismo: sin `eager_load!`, las subclases no existen todavía. Lo medí: 0 sin, 12 con | Registro explícito, como `Publisher::ADAPTERS` |
 | 6 | Enviar dos veces la misma orden devuelve **403** y el usuario no entiende nada | El estado se chequeó dentro de la policy (`manager? && record.draft?`) | Policy = rol (403). Estado = service/controller (422 `invalid_transition`). Ver `app/policies/purchase_order_policy.rb:3-21` |
@@ -1552,7 +1621,7 @@ requerido en `.rubocop.yml`: el reporte muestra 0 cops de RSpec cargados).
 | 9 | Un test da verde y en producción falta un parámetro | Un `double(record: nil)` acepta cualquier firma | Null Object real (`Outbox::NullRecorder`) o `instance_double` / `class_double`, que son verificados |
 | 10 | Un listado de 200 productos tarda segundos | N+1 de **agregación**; `includes` no lo arregla | Precalcular con `StockItems::Availability` y **pasárselo** al serializer (`product_serializer.rb:23`) |
 | 11 | `Money` de USD sumado con EUR y el total no cierra | Alguien operó con `cents` crudo en vez del value object | La aritmética vive en `Money`: `assert_same_currency!` levanta `CurrencyMismatch` (`money.rb:109`) |
-| 12 | `quantity_available` "no se actualiza" en el objeto en memoria | Es una **columna generada** de Postgres: se lee, no se escribe | `reload` después de escribir (`apply_movement.rb:139`) |
+| 12 | `quantity_available` "no se actualiza" en el objeto en memoria | Es una **columna generada** de Postgres: se lee, no se escribe. Y Rails **no** la marca readonly (`StockItem.readonly_attributes` devuelve `[]`): si le asignás un valor, `save!` devuelve `true` sin excepción y el UPDATE omite la columna — falla en silencio | `reload` después de escribir (`apply_movement.rb:139`). El comentario de `stock_item.rb:30-38` lo explica |
 | 13 | Un `"10 unidades"` entró como cantidad `10` y nadie se enteró | `.to_i` parsea el prefijo y descarta el resto | `Integer(...)` con `rescue ArgumentError, TypeError` (`stock_operations_controller.rb:94`) |
 | 14 | Se agregó un keyword a `record(...)` y explotó recién en producción | La "interfaz" no está declarada en ningún lado; nadie compila | Null Object real + un spec compartido de contrato para todos los implementadores |
 | 15 | RuboCop verde y un método de 200 líneas con complejidad 40 | El preset omakase tiene los **10 cops de `Metrics` apagados** | Saberlo. Activá `Metrics` con umbrales propios si lo querés, y no confundas "lint verde" con "diseño correcto" |

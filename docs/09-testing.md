@@ -10,8 +10,17 @@ red-green-refactor sobre una regla de stock de verdad, y qué corre el CI.
 
 Todos los números de este documento salieron de correr la suite en esta máquina
 (Ruby 3.3.6, Rails 8.1.3.1, PostgreSQL 16.13, rspec-rails 8.0.4 sobre rspec-core
-3.13.6): **338 ejemplos, 0 fallas, ~16 s**. Cada ruta que se cita existe; si algo
+3.13.6): **358 ejemplos, 0 fallas, ~17 s**. Cada ruta que se cita existe; si algo
 no está implementado en el repo lo digo explícitamente en vez de inventarlo.
+
+Un aviso sobre los bugs que vas a leer acá. Escribiendo y verificando esta
+documentación aparecieron defectos **reales** en la app: Bullet estaba inerte en
+test, el lint de factories fallaba por traits fantasma,
+`enqueue_after_transaction_commit` estaba puesto donde es un no-op, y había N+1
+de verdad en los serializers. **Todos están arreglados.** No los borré de acá: el
+bug, cómo se detectó y cómo se arregló es exactamente lo que se pregunta en una
+entrevista. Cada uno está contado en pasado, con la ruta del archivo donde vive
+el arreglo y el spec de regresión que lo cubre.
 
 Está escrito para vos, que venís de JUnit 5 + Mockito + AssertJ + Testcontainers.
 Cada sección marca dónde la analogía con Java **se rompe**, porque ahí es donde
@@ -37,11 +46,15 @@ la gente pierde el tiempo.
 | Form object | `spec/forms/stock_transfer_form_spec.rb` | validación del input |
 | Request (HTTP real) | `spec/requests/api/v1/stock_operations_spec.rb` | 401/403/404/422, idempotencia |
 | Smoke de rutas | `spec/requests/api/v1/endpoint_coverage_spec.rb:99` | recorre TODAS las rutas de la API buscando 5xx |
+| Endurecimiento HTTP | `spec/requests/api/v1/hardening_spec.rb` | techo de paginación, 400 en JSON, fuga de info |
 | Rate limiting | `spec/requests/api/v1/rate_limiting_spec.rb` | las dos capas |
+| Vencimiento de sesión | `spec/requests/session_expiry_spec.rb` | `Session.active` en la autenticación |
 | Job | `spec/jobs/outbox_publish_pending_job_spec.rb` | `have_enqueued_job`, poison message |
 | Sistema (browser) | `spec/system/transfer_with_js_spec.rb` | Capybara + Chromium headless |
 | Concurrencia | `spec/integration/concurrency_spec.rb` | threads y conexiones reales |
-| N+1 | `spec/support/bullet.rb:20` | `Bullet.raise = true` |
+| N+1 · configuración | `config/environments/test.rb` | `Bullet.enable` / `Bullet.raise` en un `after_initialize` |
+| N+1 · ciclo por ejemplo | `spec/support/bullet.rb` | `start_request`/`end_request` y el helper `detectando_n_plus_one` |
+| N+1 · meta-test | `spec/n_plus_one_guard_spec.rb` | control positivo: verifica que la herramienta detecte de verdad |
 | Helper de threads | `spec/support/concurrency.rb:25` | `run_concurrently` |
 | Driver del browser | `spec/support/capybara.rb:104` | `rack_test` vs `cuprite` |
 | HTTP externo bloqueado | `spec/support/webmock.rb:25` | `disable_net_connect!(allow_localhost: true)` |
@@ -74,8 +87,8 @@ en el `Gemfile`). No es una cuestión de gusto: son dos filosofías.
    sólo los que toca. En Minitest lo escribís en `setup` y se crea todo siempre,
    o armás métodos memorizados a mano. Con 57 ejemplos de servicio eso se nota.
 2. **Metadata.** `:concurrency`, `:n_plus_one`, `js: true` no son comentarios:
-   son *tags* que disparan hooks globales (desactivar transacciones, prender
-   Bullet, cambiar de driver de browser). Minitest no tiene un equivalente
+   son *tags* que disparan hooks globales (desactivar transacciones, abrir el
+   request de Bullet, cambiar de driver de browser). Minitest no tiene un equivalente
    declarativo tan directo.
 3. **shoulda-matchers.** `it { is_expected.to validate_presence_of(:sku) }`
    funciona en los dos, pero el `subject` implícito de RSpec lo hace una línea.
@@ -199,7 +212,7 @@ Cuándo va cada uno:
 ```ruby
 before { sign_in_as(user) }                       # spec/system/stock_operations_spec.rb:11
 
-before do                                         # spec/rails_helper.rb:75
+before do                                         # spec/rails_helper.rb:63
   Current.reset
   Rails.cache.clear
 end
@@ -296,7 +309,7 @@ pero acá es un hash arbitrario:
 | Tag | Dónde se declara | Qué dispara |
 |---|---|---|
 | `:concurrency` | `spec/integration/concurrency_spec.rb:20` | `spec/support/concurrency.rb:54-64`: incluye `ConcurrencyHelpers`, apaga transactional tests, hace `TRUNCATE` al final |
-| `:n_plus_one` | `spec/queries/products_search_spec.rb:64` | `spec/rails_helper.rb:63-70`: `Bullet.start_request` / `end_request` |
+| `:n_plus_one` | `spec/queries/products_search_spec.rb:64` | `spec/support/bullet.rb:64-72`: incluye `BulletHelpers` y abre/cierra el request de Bullet |
 | `js: true` | `spec/system/transfer_with_js_spec.rb:20` | `spec/support/capybara.rb:108`: cambia el driver a `cuprite` |
 | `type: :request` | inferido por carpeta | `infer_spec_type_from_file_location!` (`rails_helper.rb:48`) |
 | `:focus` / `fit` | ad hoc | `filter_run_when_matching :focus` (`spec_helper.rb:42`) corre sólo eso |
@@ -335,24 +348,25 @@ Lo que la suite tiene de verdad, medido con `rspec --dry-run` por carpeta:
 
 | Carpeta | Ejemplos | % | Tiempo | Qué cubre |
 |---|---:|---:|---:|---|
-| `spec/models` | 92 | 27 % | ~1,2 s | validaciones, scopes, constraints, Value Objects |
-| `spec/services` | 57 | 17 % | ~3,5 s | **reglas de negocio** |
-| `spec/requests` | 52 | 15 % | ~4,8 s | contrato HTTP, auth, idempotencia, rate limit |
-| `spec/policies` | 33 | 10 % | 0,57 s | matriz de autorización |
-| `spec/queries` | 28 | 8 % | ~1,3 s | query objects, N+1, keyset pagination |
-| `spec/lib` | 18 | 5 % | 0,13 s | `Result` (unitario puro) |
-| `spec/jobs` | 18 | 5 % | ~0,7 s | outbox, jobs de mantenimiento |
-| `spec/serializers` | 11 | 3 % | ~0,4 s | contrato del JSON |
-| `spec/system` | 11 | 3 % | ~4,6 s | browser real |
-| `spec/forms` | 10 | 3 % | ~0,5 s | validación de input |
-| `spec/integration` | 8 | 2 % | ~2,0 s | concurrencia con threads |
-| **Total** | **338** | | **16,1 s** | |
+| `spec/models` | 93 | 26 % | ~1,3 s | validaciones, scopes, constraints, Value Objects |
+| `spec/requests` | 66 | 18 % | ~5,7 s | contrato HTTP, auth, idempotencia, rate limit, endurecimiento |
+| `spec/services` | 57 | 16 % | ~3,5 s | **reglas de negocio** |
+| `spec/policies` | 33 | 9 % | 0,50 s | matriz de autorización |
+| `spec/queries` | 29 | 8 % | ~1,5 s | query objects, N+1, keyset pagination |
+| `spec/lib` | 18 | 5 % | 0,14 s | `Result` (unitario puro) |
+| `spec/jobs` | 18 | 5 % | ~0,8 s | outbox, jobs de mantenimiento |
+| `spec/serializers` | 11 | 3 % | ~0,3 s | contrato del JSON |
+| `spec/system` | 11 | 3 % | ~5,4 s | browser real |
+| `spec/forms` | 10 | 3 % | ~0,6 s | validación de input |
+| `spec/integration` | 8 | 2 % | ~2,1 s | concurrencia con threads |
+| raíz de `spec/` | 4 | 1 % | ~0,3 s | `n_plus_one_guard_spec.rb`: el meta-test de Bullet |
+| **Total** | **358** | | **17,3 s** | |
 
 (Los tiempos por carpeta se midieron corriendo cada una por separado, así que
-suman algo más que la corrida completa; los porcentajes redondean a 98 %.)
+suman algo más que la corrida completa; los porcentajes redondean a 99 %.)
 
-Leelo así: **el 3 % de los ejemplos (los 11 de sistema) se lleva casi el 30 % del
-tiempo**. Eso no es un problema — es el precio correcto por cubrir Turbo +
+Leelo así: **el 3 % de los ejemplos (los 11 de sistema) se lleva cerca de un
+tercio del tiempo**. Eso no es un problema — es el precio correcto por cubrir Turbo +
 Stimulus + Chromium. Lo que sí sería un problema es tener 60 system tests
 probando reglas de negocio que un spec de servicio cubre 20 veces más rápido.
 
@@ -433,7 +447,7 @@ tendrías que mover `Result` a `lib/` y requerirlo a mano.
 ### 4.2 De modelo, con shoulda-matchers
 
 `spec/models/product_spec.rb`, `stock_item_spec.rb`, `user_spec.rb`,
-`api_token_spec.rb`, `sequence_counter_spec.rb` — 92 ejemplos.
+`api_token_spec.rb`, `sequence_counter_spec.rb` — 93 ejemplos.
 
 ```ruby
 subject { build(:product) }
@@ -450,7 +464,7 @@ Configurado en `spec/support/shoulda.rb`. **Advertencia real**:
 `validate_uniqueness_of` **hace un INSERT** para probar la unicidad (necesita una
 fila existente contra la cual chocar). Es de los pocos matchers que tocan la base
 y por eso el `subject` tiene que ser guardable. Está anotado en
-`spec/models/product_spec.rb:15-17`.
+`spec/models/product_spec.rb:14-16`.
 
 Lo que estos specs prueban de más y que casi nadie escribe:
 
@@ -469,7 +483,7 @@ no la busca. Acá hay que usar `\A` y `\z`.
 Y la red que las validaciones no atrapan:
 
 ```ruby
-# spec/models/product_spec.rb:105 — el CHECK constraint frena lo que AR no
+# spec/models/product_spec.rb:103 — el CHECK constraint frena lo que AR no
 it "rechaza un costo negativo aunque saltees las validaciones" do
   product = create(:product)
   expect { product.update_column(:cost_cents, -1) }
@@ -571,7 +585,7 @@ Y el `reload` de la última línea no es adorno: `quantity_available` es una
 
 ### 4.4 De query object
 
-`spec/queries/stock_queries_spec.rb` y `products_search_spec.rb` — 28 ejemplos.
+`spec/queries/stock_queries_spec.rb` y `products_search_spec.rb` — 29 ejemplos.
 
 El test que justifica que el query object exista:
 
@@ -631,7 +645,7 @@ igual con JPQL dinámico o con `Sort.by(userInput)` de Spring Data.
 
 ### 4.5 De policy: la matriz rol × acción
 
-`spec/policies/policies_spec.rb` — 33 ejemplos en 0,56 s, **sin tocar la base**
+`spec/policies/policies_spec.rb` — 33 ejemplos en 0,50 s, **sin tocar la base**
 (usa `build_stubbed`).
 
 ```ruby
@@ -729,9 +743,25 @@ En AssertJ sería `assertThat(msg).contains("línea 2", "NO-EXISTE")`.
 
 ### 4.8 De request: la API end-to-end sobre HTTP
 
-52 ejemplos en `spec/requests/` (18 de operaciones de stock, 13 de órdenes de
-compra, 12 de reservas, 8 de rate limiting y 1 de smoke). Ejercitan **router +
-middlewares + auth + controller + service + base + serializer**, sin browser.
+66 ejemplos en `spec/requests/` (18 de operaciones de stock, 13 de órdenes de
+compra, 12 de reservas, 11 de rate limiting, 8 de endurecimiento, 3 de
+vencimiento de sesión y 1 de smoke). Ejercitan **router + middlewares + auth +
+controller + service + base + serializer**, sin browser.
+
+Tres de esos archivos nacieron de bugs encontrados verificando esta
+documentación, y por eso cada ejemplo describe el bug además del comportamiento
+deseado:
+
+- `spec/requests/api/v1/reservations_spec.rb` — la API de reservas no tenía un
+  solo request spec. Cubre TTL acotado, `410 Gone` cuando la reserva venció y
+  liberar dos veces (que es idempotente, devuelve 200).
+- `spec/requests/api/v1/hardening_spec.rb` — el techo de paginación
+  (`MAX_PAGE_SIZE`), los `400` en JSON ante un body malformado (antes salía una
+  página HTML de error), que una clave de idempotencia no se queme con un 404 del
+  cliente, y que un 409 por duplicado no filtre el mensaje crudo de PostgreSQL.
+- `spec/requests/session_expiry_spec.rb` — una sesión vencida ya no autentica.
+  `find_session_by_cookie` buscaba con `Session.find_by` a secas, así que la
+  columna `expires_at` era decorativa. Hoy usa `Session.active.find_by`.
 
 ```ruby
 it "el reintento devuelve la MISMA respuesta y no aplica dos veces" do
@@ -755,10 +785,18 @@ Y el que prueba que las claves de idempotencia están **scopeadas por usuario**
 `Rails.application.routes.routes`, filtra las que empiezan con `/api/v1/`, las
 ejecuta todas con un token de admin y falla si alguna devuelve 5xx. No verifica
 lógica —para eso están los otros specs—, verifica que ninguna ruta reviente.
-Existe por un bug real: `GET /api/v1/reservations` tiraba 500 para cualquier
-request porque faltaba `StockReservationPolicy`, y ningún test ejecutaba esa
-acción. Se actualiza solo: si mañana agregás un endpoint, aparece en la lista sin
-que nadie tenga que acordarse.
+Existe por un bug real, y ya arreglado: `GET /api/v1/reservations` tiraba 500
+para **cualquier** request porque faltaba `StockReservationPolicy`, y ningún test
+ejecutaba esa acción. Hoy la policy existe
+(`app/policies/stock_reservation_policy.rb`), el endpoint responde 200 y hay
+además un spec dedicado (`spec/requests/api/v1/reservations_spec.rb`).
+
+La lección general es más interesante que el bug: `verify_policy_scoped` te
+obliga a **llamar** a `policy_scope`, pero no puede saber que la policy no existe
+hasta que alguien ejecuta el código. Los chequeos estáticos tienen ese límite, y
+un smoke test que recorre las rutas lo cubre por dos pesos. Se actualiza solo: si
+mañana agregás un endpoint, aparece en la lista sin que nadie tenga que
+acordarse.
 
 **Punto de precisión sobre el alcance**: un request spec de Rails levanta el
 `ActionDispatch::Integration::Session`, que llama a la aplicación Rack **completa,
@@ -846,7 +884,7 @@ end
 
 ### 4.10 De sistema: Capybara con Chromium headless
 
-11 ejemplos en `spec/system/`, ~4,6 s. Toda la configuración está en
+11 ejemplos en `spec/system/`, ~5,4 s. Toda la configuración está en
 `spec/support/capybara.rb`, que es el archivo más comentado de la suite porque
 es donde más gente se traba.
 
@@ -861,8 +899,8 @@ end
 
 | Driver | Browser | JS | Velocidad medida acá |
 |---|---|---|---|
-| `:rack_test` | no hay, parsea HTML | ❌ | 8 ejemplos en ~1,5 s |
-| `:cuprite` | Chromium via CDP | ✅ | 3 ejemplos en ~3,2 s (~1,1 s c/u) |
+| `:rack_test` | no hay, parsea HTML | ❌ | 8 ejemplos en ~2,0 s |
+| `:cuprite` | Chromium via CDP | ✅ | 3 ejemplos en ~3,9 s (~1,3 s c/u) |
 | `:selenium` | Chrome via chromedriver | ✅ | no se usa (ver abajo) |
 
 **Por qué cuprite y no selenium**: Selenium habla W3C WebDriver y necesita el
@@ -1007,35 +1045,171 @@ IDENTITY CASCADE` (`spec/support/concurrency.rb:54-64`).
 ```ruby
 # spec/queries/products_search_spec.rb:64
 describe "prevención de N+1", :n_plus_one do
-  it "trae la categoría con includes" do
+  it "trae la categoría con includes (Bullet rompe el test si aparece un N+1)" do
     create_list(:product, 5, :with_category)
 
-    # Con Bullet.raise = true, si esto generara N+1 el test ROMPE.
-    described_class.call.to_a.each { |p| p.category&.name }
+    # `detectando_n_plus_one` abre el request de Bullet DESPUÉS del setup.
+    expect {
+      detectando_n_plus_one { described_class.call.to_a.each { |p| p.category&.name } }
+    }.not_to raise_error
+  end
+
+  it "sin includes el mismo recorrido SÍ dispara la alarma (control)" do
+    create_list(:product, 5, :with_category)
+
+    expect {
+      detectando_n_plus_one { Product.kept.to_a.each { |p| p.category&.name } }
+    }.to raise_error(Bullet::Notification::UnoptimizedQueryError)
   end
 end
 ```
 
-La configuración (`spec/support/bullet.rb`):
+#### El bug: la red de seguridad no atrapaba nada
+
+**Este bug estuvo vivo en este repo, y es la peor clase de falla de testing que
+existe: un chequeo verde que no verifica nada.**
+
+Así se veía. En el `Gemfile`, la gema estaba declarada así:
 
 ```ruby
-Bullet.enable = true
-Bullet.raise = true                        # <- el N+1 rompe el test
-Bullet.unused_eager_loading_enable = true  # detecta el problema INVERSO
+group :development do
+  gem "bullet", "~> 8.0"   # <- SÓLO development
+end
 ```
 
-Dos cosas que valen:
+Consecuencia en cadena: en el entorno de test la constante `Bullet` no existía,
+los guards `if defined?(Bullet)` del archivo de soporte daban `false`, los hooks
+nunca se registraban, y los ejemplos marcados `:n_plus_one` pasaban en verde
+**hubiera o no un N+1**. El archivo `spec/support/bullet.rb` estuvo inerte todo
+el proyecto y nadie se enteró, porque un chequeo que no corre y un chequeo que
+pasa se ven exactamente igual desde afuera.
 
-- **`raise = true`** es la única forma efectiva de que los N+1 no vuelvan. Un log
-  de warnings lo lee nadie.
-- **`unused_eager_loading`** detecta el problema opuesto: hiciste `includes` de
-  algo que después no usaste. Es una query y memoria desperdiciadas.
+Así se detectó: escribiendo un **control positivo**, o sea un ejemplo con un N+1
+puesto a propósito que *tiene* que fallar. Pasó en verde. Ahí se cae la carta.
 
-Y una decisión que hay que defender: **Bullet se activa sólo en los ejemplos
-marcados con `:n_plus_one`** (hooks en `spec/rails_helper.rb:63-70`), no
-globalmente. Razón: en muchos specs unitarios el "N+1" es intencional (probás un
-método que consulta), y activarlo global genera falsos positivos que la gente
-termina silenciando con un `Bullet.enable = false`… y ahí perdés la herramienta.
+Así se arregló, en cuatro partes:
+
+1. **`Gemfile`**: la gema pasó a `group :development, :test`.
+2. **`config/environments/test.rb`** (dentro de un `after_initialize`): ahí vive
+   ahora la configuración. `Bullet.enable = true` aplica los parches sobre
+   ActiveRecord **en el momento de la asignación**, así que tiene que pasar
+   durante el boot; hacerlo en un `before(:suite)` de RSpec llega tarde para
+   algunos ganchos y la detección queda muda.
+
+   ```ruby
+   config.after_initialize do
+     Bullet.enable = true
+     Bullet.bullet_logger = false
+     Bullet.rails_logger  = false
+     Bullet.raise = true                # <- el N+1 rompe el test
+     Bullet.unused_eager_loading_enable = ENV["BULLET_UNUSED"].present?
+   end
+   ```
+3. **`spec/support/bullet.rb`** quedó sólo con el ciclo de vida
+   (`start_request`/`end_request` alrededor de los ejemplos `:n_plus_one`) y con
+   el helper `detectando_n_plus_one`.
+4. **`spec/n_plus_one_guard_spec.rb`**: el spec de regresión, que testea **la
+   herramienta**, no el código.
+
+```ruby
+# spec/n_plus_one_guard_spec.rb
+it "Bullet está cargado en el entorno de test" do
+  expect(defined?(Bullet)).to eq("constant"),
+    "revisá que la gema esté en `group :development, :test` del Gemfile."
+end
+
+it "Bullet está habilitado y configurado para ROMPER la suite" do
+  expect(Bullet.enable?).to be(true)
+  # `Bullet.raise` NO tiene getter (chocaría con Kernel#raise): el setter
+  # instala el notificador UniformNotifier::Raise, así que preguntamos por él.
+  expect(UniformNotifier.active_notifiers).to include(UniformNotifier::Raise)
+end
+
+it "detecta de verdad un N+1 (prueba la TRAMPA, no el código)", :n_plus_one do
+  create_list(:product, 3, :with_category)
+  expect {
+    detectando_n_plus_one { Product.all.to_a.each { |p| p.category&.name } }
+  }.to raise_error(Bullet::Notification::UnoptimizedQueryError, /category/)
+end
+```
+
+**La regla general, que vale para cualquier lenguaje: cuando una herramienta de
+test puede desactivarse en silencio** —un linter, un detector, un mock que no se
+aplica, un `@Tag` que nadie corre— **escribí un test que verifique que está
+activa, y un control positivo que tenga que fallar.** Cuesta cinco líneas y es lo
+único que distingue "no hay bugs" de "no estoy mirando".
+
+#### La segunda trampa: objetos "imposibles"
+
+Con Bullet ya cargado apareció el problema siguiente, y es el que hace que mucha
+gente concluya que "Bullet no detecta nada en los tests". Bullet clasifica los
+objetos en **posibles** e **imposibles**: uno que se cargó de a uno, o que
+acabás de crear, queda marcado como imposible y no se reporta (es una heurística
+para no llenarte de falsos positivos).
+
+En un test eso significa que si hacés `create_list(...)` **adentro** del request
+de Bullet, esos registros quedan mudos aunque el N+1 exista. Por eso el helper
+`detectando_n_plus_one` (`spec/support/bullet.rb`) cierra y reabre el request:
+armás los datos primero, y recién después envolvés **sólo** la consulta que
+querés auditar. El helper además resetea el colector en el `ensure`, porque
+`perform_out_of_channel_notifications` notifica pero **no limpia**: sin ese
+reset, el hook `after` vuelve a levantar la misma excepción y RSpec marca el
+ejemplo como fallado aunque tu `expect { }.to raise_error` la haya capturado.
+
+#### Por qué `unused_eager_loading` quedó OPT-IN
+
+`unused_eager_loading` detecta el problema opuesto: hiciste `includes` de algo
+que después no usaste, o sea una query y memoria desperdiciadas. La idea es buena
+y encontró desperdicio real acá (un `created_by` que ningún serializer mostraba).
+
+Pero como **gate de CI** es contraproducente, y esto es una conclusión del repo,
+no una opinión: cualquier código que precargue para el camino feliz y corte antes
+por una validación lo dispara. `Purchasing::ReceiveOrder` carga
+`includes(lines: :product)` porque necesita recorrer las líneas, pero si la
+cantidad recibida es inválida corta en la primera y la precarga "no se usó". No
+hay nada que arreglar ahí: no podés saber de antemano si vas a fallar. Un chequeo
+que grita en casos correctos entrena a la gente a ignorarlo, y ahí perdés también
+las alertas buenas.
+
+Así que quedó detrás de una variable de entorno, para correrlo a propósito:
+
+```bash
+BULLET_UNUSED=1 bundle exec rspec
+```
+
+El detector de N+1, en cambio, está **siempre activo**: sus hallazgos son bugs
+reales, no ruido.
+
+#### Los N+1 que aparecieron apenas la herramienta funcionó
+
+Con Bullet vivo saltaron N+1 de verdad en los serializers, que recorrían las
+líneas tocando `line.product` sin precarga. El arreglo tiene un matiz que vale
+para una entrevista:
+
+- **Órdenes de compra** (`app/controllers/api/v1/purchase_orders_controller.rb`,
+  método privado `serialize`): la precarga se hace **en el momento de
+  serializar**, con `ActiveRecord::Associations::Preloader`, y no con `includes`
+  al buscar. ¿Por qué? Porque esas acciones tienen caminos de error (estado
+  inválido → 422, sin permiso → 403) que cortan **antes** de serializar: con
+  `includes` pagás el eager loading y no lo usás. `Preloader` es el objeto que
+  `includes` usa por debajo, y se puede llamar a mano — muy poca gente sabe que
+  se puede.
+- **Transferencias** (`app/controllers/api/v1/stock_transfers_controller.rb`):
+  ahí sí alcanza el scope `StockTransfer.with_associations` al buscar, porque el
+  serializer corre en todos los caminos.
+- **Ledger** (`app/queries/stock_movements/ledger.rb`): ahora acepta un parámetro
+  `preload:`, y cada llamador pide **sólo lo que va a usar**. El dashboard pasa
+  `%i[product warehouse]` porque no muestra quién hizo el movimiento; pedir
+  `:user` de más era exactamente el eager loading innecesario del punto anterior.
+
+#### Dónde se activa la detección
+
+**Bullet está habilitado en todo el entorno de test, pero sólo *reporta* dentro
+de los ejemplos marcados con `:n_plus_one`** (los hooks que abren y cierran el
+request están en `spec/support/bullet.rb:64-72`). Razón: en muchos specs
+unitarios el "N+1" es intencional (probás un método que consulta), y reportar en
+todos genera falsos positivos que la gente termina silenciando con un
+`Bullet.enable = false`… y ahí perdés la herramienta.
 
 > **Java.** El N+1 de Hibernate te avisa de otra forma: `LazyInitializationException`
 > cuando la sesión ya cerró, o el `hibernate.generate_statistics` +
@@ -1046,7 +1220,7 @@ termina silenciando con un `Bullet.enable = false`… y ahí perdés la herramie
 
 ### 4.13 De rate limiting
 
-`spec/requests/api/v1/rate_limiting_spec.rb` — 8 ejemplos, dos capas.
+`spec/requests/api/v1/rate_limiting_spec.rb` — 11 ejemplos, dos capas.
 
 ```ruby
 # Capa 2: ActionController#rate_limit (nativo de Rails 8, por token)
@@ -1085,7 +1259,7 @@ causa número uno de flakiness en specs de rate limiting:
    El default de Rails en test es `:null_store`, y con eso `store.increment`
    devuelve `nil`, la comparación nunca supera el límite y **tus tests de rate
    limiting dan verde sin probar nada**. Es un falso verde particularmente cruel.
-3. **`Rails.cache.clear` antes de cada ejemplo** (`spec/rails_helper.rb:77`) más
+3. **`Rails.cache.clear` antes de cada ejemplo** (`spec/rails_helper.rb:65`) más
    el `Rack::Attack.cache.store.clear` del `before` local.
 
 El ejemplo más valioso del archivo es un test de regresión de un bug real:
@@ -1101,6 +1275,44 @@ end
 Sin `name:` en cada `rate_limit`, la clave de cache es la misma para el límite
 global de `BaseController` y el de `ReportsController`: comparten contador, cada
 request lo incrementa dos veces y el límite de 20 corta en 10.
+
+**Y tres regresiones más, de bugs que estuvieron vivos en este repo y hoy están
+arreglados** (todos en `config/initializers/rack_attack.rb`):
+
+```ruby
+it "limita los intentos contra UNA CUENTA aunque cambie la IP" do
+  # 7 intentos desde IPs distintas contra el MISMO email. El límite por IP no
+  # los agarra porque cada IP hace uno solo; el límite por email sí.
+  7.times do |i|
+    post "/session",
+         params: { email_address: "victima@stock.test", password: "intento#{i}" },
+         headers: { "REMOTE_ADDR" => "203.0.113.#{i + 1}" }
+  end
+
+  expect(response).to have_http_status(:too_many_requests)
+  expect(response.headers["RateLimit-Limit"]).to eq("6")
+end
+```
+
+1. **Los throttles `logins/email` y `password-resets/email` estaban muertos.**
+   Leían `req.params.dig("session", "email_address")`, o sea la forma anidada,
+   pero el formulario manda los params **planos**: el discriminador era siempre
+   `nil` y Rack::Attack no contaba nada. Hoy leen
+   `req.params["email_address"]` con fallback al anidado. **Un rate limit roto
+   se ve exactamente igual que uno que nunca se disparó** — por eso el test de
+   regresión ataca desde IPs distintas: si sólo funcionara el límite por IP, el
+   ejemplo no llegaría al 429.
+2. **El casing evadía el límite.** El email se normaliza (`downcase.strip`)
+   antes de usarlo como clave, y hay un ejemplo que rota
+   `Victima@Stock.test` / `VICTIMA@STOCK.TEST` / `victima@stock.test`.
+3. **Se podían probar tokens de API sin costo.** El throttle `api/token` cuenta
+   por token, así que cada token inventado estrenaba su propio balde de
+   1.000/hora. Ahora hay un `blocklist` con `Fail2Ban` por IP sobre los fallos de
+   autenticación, y como Rack::Attack corre **antes** del controller (no conoce
+   el status de la respuesta), es `Api::TokenAuthentication` el que marca el
+   fallo con `record_authentication_failure!` escribiendo en
+   `Rack::Attack.cache`. El ejemplo prueba 12 tokens basura desde la misma IP y
+   espera un **403** (blocklist), no un 401.
 
 ---
 
@@ -1186,7 +1398,7 @@ create:         7,37 ms/objeto        ->  6,4x
 O sea: **cada `create` que podés evitar te ahorra entre 5 y 6 veces su costo**, y
 la diferencia crece con la cantidad de asociaciones. Por eso
 `spec/policies/policies_spec.rb` usa `build_stubbed` para los cinco usuarios de la
-matriz y corre 33 ejemplos en 0,56 s, y por eso `spec/models/product_spec.rb:57`
+matriz y corre 33 ejemplos en 0,50 s, y por eso `spec/models/product_spec.rb:57`
 usa `build_stubbed` para todo lo que es aritmética de dinero.
 
 Trampa de `build_stubbed`: el objeto **finge estar persistido** (`persisted?` es
@@ -1230,25 +1442,11 @@ fixtures.
 
 ### 5.4 El lint de factories, y un bug real que encontré escribiendo esto
 
-```ruby
-# spec/support/factory_bot.rb:10-15 (tal cual está hoy)
-config.before(:suite) do
-  if ENV["LINT_FACTORIES"]
-    DatabaseCleanerStub = nil   # <- línea muerta: database_cleaner no está en el proyecto
-    FactoryBot.lint(traits: true)
-  end
-end
-```
-
-Esa constante `DatabaseCleanerStub` no hace nada y se puede borrar; la dejo a la
-vista porque el resto del documento cita el archivo y no quiero que el código
-pegado difiera del real.
-
 `FactoryBot.lint` construye **todas** las factories y verifica que produzcan
 objetos válidos. Con `traits: true`, además construye cada trait por separado. El
-CI lo corre en un step propio (`.github/workflows/ci.yml:152-155`).
+CI lo corre en un step propio (`.github/workflows/ci.yml:160-163`).
 
-**Corrí ese comando y falla.** Ésta es la salida real:
+**Cuando escribí este documento, ese comando fallaba.** Ésta era la salida:
 
 ```bash
 $ LINT_FACTORIES=1 bundle exec rspec spec/lib
@@ -1263,9 +1461,9 @@ FactoryBot::InvalidFactoryError:
   * stock_reservation+expired   - PG::CheckViolation: viola "stock_reservations_released_at_present"
 ```
 
-Lo interesante es que **esos traits no están escritos en ningún lado**. En
-`spec/factories/stock.rb` la factory `stock_reservation` sólo define
-`:expired_soon` y `:already_expired`. ¿De dónde salen `committed`, `released`,
+Lo interesante era que **esos traits no estaban escritos en ningún lado**. En
+`spec/factories/stock.rb` la factory `stock_reservation` definía sólo
+`:expired_soon` y `:already_expired`. ¿De dónde salían `committed`, `released`,
 `expired`?
 
 De **`FactoryBot.automatically_define_enum_traits`**, que en factory_bot 6.6.0
@@ -1275,17 +1473,17 @@ de compilación de la factory. Lo verifiqué forzando el compile:
 
 ```ruby
 FactoryBot.factories.find(:stock_reservation).tap(&:compile).defined_traits.map(&:name)
-# => ["already_expired", "committed", "expired", "expired_soon", "held", "released"]
+# ANTES => ["already_expired", "committed", "expired", "expired_soon", "held", "released"]
 ```
 
 Y `StockReservation` declara
 `enum :status, STATUSES.index_by(&:itself), validate: true, prefix: :status`
-en `app/models/stock_reservation.rb:22`. El trait auto-generado pone
-`status: "committed"` **y nada más**, así que viola el CHECK
+en `app/models/stock_reservation.rb:22`. El trait auto-generado ponía
+`status: "committed"` **y nada más**, así que violaba el CHECK
 `stock_reservations_committed_at_present`, que exige `committed_at` no nulo. El
-CHECK está bien; el trait fantasma, no.
+CHECK estaba bien; el trait fantasma, no.
 
-Las dos formas de arreglarlo, las dos verificadas corriendo:
+Había dos formas de arreglarlo, las dos verificadas corriendo:
 
 ```ruby
 # Opción A: no lintear traits auto-generados
@@ -1296,11 +1494,62 @@ FactoryBot.lint(traits: true)          # -> OK
 FactoryBot.lint                        # -> OK
 ```
 
-Recomiendo la A: perdés el azúcar de `create(:stock_reservation, :committed)`
-—que igual estaba roto— y conservás el lint de los traits que sí escribiste a
-mano. Un efecto colateral menos obvio de la opción A: hoy `stock_movement` tiene
-el trait `issue` **dos veces** (el escrito a mano y el del enum), y el auto-generado
-podría pisar al tuyo según el orden de compilación.
+**Se aplicó la A**, y así quedó `spec/support/factory_bot.rb`:
+
+```ruby
+FactoryBot.automatically_define_enum_traits = false
+
+RSpec.configure do |config|
+  config.before(:suite) do
+    FactoryBot.lint(traits: true) if ENV["LINT_FACTORIES"]
+  end
+end
+```
+
+(De paso desapareció una línea muerta que había en ese `before(:suite)`: una
+constante `DatabaseCleanerStub = nil` que no hacía nada, porque `database_cleaner`
+nunca estuvo en el proyecto.)
+
+Tres razones para la opción A, y la tercera es la que más se defiende en una
+entrevista:
+
+1. Los traits inventados **ignoran las invariantes del modelo**: setean la
+   columna del enum y nada más, y en un dominio con máquina de estados eso
+   siempre viola algo.
+2. **Colisionan en silencio** con los que sí escribís. `stock_movement` tenía el
+   trait `issue` **dos veces** (el mío y el del enum); `defined_traits` lo
+   listaba duplicado y cuál ganaba dependía del orden de compilación.
+3. Te dan la **ilusión de cobertura** de estados que nunca escribiste ni
+   pensaste.
+
+Los estados que hacían falta hoy están escritos a mano en `spec/factories/stock.rb`,
+con todos los campos que la máquina de estados exige:
+
+```ruby
+trait(:committed) do
+  status { "committed" }
+  committed_at { Time.current }     # <- lo que el trait fantasma no ponía
+end
+
+trait(:released) do
+  status { "released" }
+  released_at { Time.current }
+end
+```
+
+Y hoy el comando pasa:
+
+```bash
+$ LINT_FACTORIES=1 bundle exec rspec spec/lib
+18 examples, 0 failures
+```
+
+```ruby
+FactoryBot.factories.find(:stock_reservation).tap(&:compile).defined_traits.map(&:name).sort
+# HOY => ["already_expired", "committed", "expired_soon", "released"]
+FactoryBot.factories.find(:stock_movement).tap(&:compile).defined_traits.map(&:name).sort
+# HOY => ["adjustment", "issue", "scrap", "transfer_in", "transfer_out"]   # `issue` una sola vez
+```
 
 ---
 
@@ -1408,7 +1657,7 @@ allow(Stock::ReleaseReservation).to receive(:call).and_call_original
 allow(Stock::ReleaseReservation).to receive(:call)
   .with(hash_including(reservation: a)).and_return(Result.failure(:boom, "falló"))
 
-# 3) spec/models/stock_item_spec.rb:85 — simular una carrera perdida
+# 3) spec/models/stock_item_spec.rb:122 — simular una carrera perdida
 allow(described_class).to receive(:find_by).and_return(nil, otro)
 allow(described_class).to receive(:create!).and_raise(ActiveRecord::RecordNotUnique)
 allow(described_class).to receive(:find_by!).and_return(otro)
@@ -1422,6 +1671,56 @@ cubierto **de verdad**, con threads, en `spec/integration/concurrency_spec.rb`
 ("no crea filas duplicadas para el mismo par producto/depósito"). Un mock para el
 camino de código, un test real para el comportamiento: ésa es la combinación
 correcta.
+
+**Y acá el mock solo no alcanzaba: había un bug que ningún stub podía atrapar.**
+`StockItem.find_or_provision!` tenía el `rescue ActiveRecord::RecordNotUnique`
+bien escrito, pero era **inútil**, porque los tres llamadores (`Stock::Receive`,
+`Transfers::Dispatch`, `Purchasing::ReceiveOrder`) lo invocan dentro de una
+transacción. En PostgreSQL una sentencia que falla **aborta la transacción
+entera**: el `find_by!` del rescate moría con `PG::InFailedSqlTransaction`. (Es
+muy distinto de MySQL o de la JVM con JDBC, donde un error de sentencia no
+invalida la transacción; por eso a un javero esto no le suena.) El stub nunca lo
+mostró: `and_raise(RecordNotUnique)` levanta la excepción **sin** ensuciar la
+conexión de verdad.
+
+El arreglo, en `app/models/stock_item.rb`, tiene dos partes:
+
+```ruby
+def self.find_or_provision!(product:, warehouse:)
+  existing = find_by(product:, warehouse:)
+  return existing if existing
+
+  # requires_new: true -> SAVEPOINT. Sin esto el rescue de abajo es inútil
+  # cuando ya estamos dentro de una transacción (que es SIEMPRE, en la práctica).
+  transaction(requires_new: true) { create!(product:, warehouse:) }
+rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid
+  find_by!(product:, warehouse:)
+end
+```
+
+El `SAVEPOINT` hace que al fallar sólo se revierta hasta ahí y la transacción de
+afuera siga viva. Y el rescue atrapa **las dos** excepciones: el modelo también
+tiene `validates :product_id, uniqueness:`, así que si el ganador commitea justo
+antes de esa validación el perdedor recibe `RecordInvalid`, no `RecordNotUnique`.
+Ventana angosta pero real.
+
+El spec de regresión (`spec/models/stock_item_spec.rb:92`, "sobrevive a la
+carrera DENTRO de una transacción (savepoint)") **no puede usar un stub**: crea
+el ganador desde **otra conexión** para que el índice único reviente de verdad, y
+después verifica lo que importa —que la transacción siga usable—:
+
+```ruby
+ApplicationRecord.transaction do
+  resultado = described_class.find_or_provision!(product:, warehouse:)
+
+  # La prueba de fuego: después del rescue, la transacción SIGUE VIVA.
+  # Con el bug, esta línea moría con PG::InFailedSqlTransaction.
+  described_class.count
+end
+```
+
+La moraleja para la sección: **un mock prueba que escribiste el `rescue`; sólo la
+base de verdad prueba que el `rescue` sirve.**
 
 `and_return(nil, otro)` es el equivalente de
 `when(x.find()).thenReturn(null).thenReturn(otro)` de Mockito: valores sucesivos
@@ -1439,8 +1738,8 @@ config.use_transactional_fixtures = true
 ```
 
 Cada ejemplo corre dentro de una transacción que se revierte al terminar. El
-rollback es O(1); truncar tablas es O(filas). Con 338 ejemplos y ~6.700 queries
-reales por corrida (~10.400 eventos `sql.active_record` si contás también
+rollback es O(1); truncar tablas es O(filas). Con 358 ejemplos y ~6.900 queries
+reales por corrida (~10.850 eventos `sql.active_record` si contás también
 `SCHEMA` y `TRANSACTION`), la diferencia es de segundos.
 
 Cómo funciona por dentro: Rails abre una transacción antes del ejemplo y hace
@@ -1515,7 +1814,7 @@ La infraestructura está: `config/database.yml:95` usa
 `parallel_tests` y de `rails test:prepare`. **La gema `parallel_tests` no está
 instalada**, así que hoy la suite corre en un solo proceso.
 
-Con 16 s de reloj no hace falta. El cálculo para decidir cuándo sí: paralelizar
+Con 17 s de reloj no hace falta. El cálculo para decidir cuándo sí: paralelizar
 tiene un costo fijo de N boots de Rails (1,9 s cada uno acá) más N bases que
 crear. Con 4 procesos eso son ~8 s de overhead: sólo conviene cuando la suite
 pasa de ~60 s.
@@ -1741,9 +2040,9 @@ en la primera línea de `spec_helper.rb`, que a su vez está en `.rspec` como
 Corriendo `COVERAGE=1 bundle exec rspec` en esta máquina:
 
 ```text
-Line coverage:   1862 / 2105 (88,45 %)
-Branch coverage:  346 / 547  (63,25 %)
-Finished in 21,4 seconds         # contra 16,1 s sin cobertura: +33 %
+Line coverage:   1908 / 2152 (88,66 %)
+Branch coverage:  355 / 557  (63,73 %)
+Finished in 20,9 seconds         # contra 17,3 s sin cobertura: +21 %
 ```
 
 **Line vs branch**, con un ejemplo del repo:
@@ -1756,8 +2055,8 @@ return Result.failure(:invalid_quantity, "...") unless @quantity.positive?
 Un solo test con `quantity: 10` marca esa **línea** como cubierta. Pero la rama
 "quantity no positiva" nunca se ejecutó. Con `enable_coverage :branch`, SimpleCov
 te muestra que falta. Por eso la diferencia entre 88 % de línea y 63 % de rama es
-información, no ruido: **te está diciendo que hay 201 caminos condicionales sin
-probar** (547 − 346).
+información, no ruido: **te está diciendo que hay 202 caminos condicionales sin
+probar** (557 − 355).
 
 **Por qué el 100 % no es la meta**, y el umbral está en 70/45:
 
@@ -1791,7 +2090,7 @@ Qué sí conviene mirar:
 | Causa | Síntoma | Arreglo |
 |---|---|---|
 | **Orden** | pasa solo, falla en suite (o al revés) | ya corre en `:random` (`spec_helper.rb:52`); reproducí con `--seed N` y aislá con `--bisect` |
-| **Estado global** | falla el ejemplo *siguiente* | `Current.reset` + `Rails.cache.clear` (`rails_helper.rb:75-78`); `around` para restaurar (`Rack::Attack.enabled`) |
+| **Estado global** | falla el ejemplo *siguiente* | `Current.reset` + `Rails.cache.clear` (`rails_helper.rb:63-66`); `around` para restaurar (`Rack::Attack.enabled`) |
 | **Tiempo** | falla a las 23:59, o el 1° de enero | `travel_to` / `freeze_time`; nunca `Time.now` en una aserción |
 | **Aleatoriedad** | falla 1 de cada 50 | `sequence` en vez de Faker para lo único; `Kernel.srand config.seed` ya está |
 | **Concurrencia** | falla con el CI cargado | `CyclicBarrier`, `rescue` por thread, `clear_active_connections!` |
@@ -1824,14 +2123,14 @@ Medido acá, con `PROFILE=1 bundle exec rspec` (que activa
 `config.profile_examples = 10`, `spec_helper.rb:47`):
 
 ```text
-Top 10 más lentos: 6,41 s = 34,8 % del tiempo total
-  1,52 s  spec/system/transfer_with_js_spec.rb:49        (transferencia completa con Chromium)
-  0,96 s  spec/system/transfer_with_js_spec.rb:83
-  0,74 s  spec/requests/api/v1/endpoint_coverage_spec.rb:99  (recorre todas las rutas)
-  0,69 s  spec/system/transfer_with_js_spec.rb:36
-  0,65 s  spec/requests/api/v1/rate_limiting_spec.rb:98  (400 requests a /up)
+Top 10 más lentos: 6,26 s = 34,4 % del tiempo total
+  1,11 s  spec/system/transfer_with_js_spec.rb:49         (transferencia completa con Chromium)
+  1,08 s  spec/system/transfer_with_js_spec.rb:36
+  0,73 s  spec/requests/api/v1/endpoint_coverage_spec.rb:99  (recorre todas las rutas)
+  0,70 s  spec/system/transfer_with_js_spec.rb:83
+  0,64 s  spec/requests/api/v1/rate_limiting_spec.rb:142  (400 requests a /up)
   ...
-Finished in 16,09 seconds (files took 1,85 seconds to load)
+Finished in 18,22 seconds (files took 1,85 seconds to load)
 ```
 
 Los cinco costos, en orden de impacto:
@@ -1840,33 +2139,33 @@ Los cinco costos, en orden de impacto:
    `Gemfile`) ya está optimizado. En CI, `config.eager_load = ENV["CI"].present?`
    (`config/environments/test.rb:16`) lo empeora a propósito, para detectar
    errores de autoload que en desarrollo no aparecen. Es el trade-off correcto.
-2. **Los system tests: ~4,6 s por 11 ejemplos.** Chromium arranca una vez y se
+2. **Los system tests: ~5,4 s por 11 ejemplos.** Chromium arranca una vez y se
    reusa, pero cada `visit` es un round-trip real.
-3. **`create` de FactoryBot.** ~6.700 queries en toda la corrida. Cada `create`
+3. **`create` de FactoryBot.** ~6.900 queries en toda la corrida. Cada `create`
    evitable son ~2,8 ms (§5.2).
 4. **bcrypt.** Ver abajo.
-5. **SimpleCov: +33 %** (16,1 s → 21,4 s). Por eso está detrás de
+5. **SimpleCov: +21 %** (17,3 s → 20,9 s). Por eso está detrás de
    `if ENV["COVERAGE"]` y sólo se activa en CI.
 
 **El costo de bcrypt, con números medidos en esta máquina:**
 
 ```ruby
-BCrypt::Password.create("x", cost: 4)   # 1,2 ms      <- lo que usa el entorno test
-BCrypt::Password.create("x", cost: 12)  # 243 ms      <- lo que usa producción
-# ratio: ~200x
+BCrypt::Password.create("x", cost: 4)   # 1,1 ms      <- lo que usa el entorno test
+BCrypt::Password.create("x", cost: 12)  # 233 ms      <- lo que usa producción
+# ratio: ~210x
 ```
 
 Rails setea `ActiveModel::SecurePassword.min_cost = true` en el entorno de test
 (lo verifiqué: `min_cost` es `true`, y `BCrypt::Engine.cost` global es 12). Eso
 baja el cost a `BCrypt::Engine::MIN_COST`, que es 4.
 
-La suite hace **171 `INSERT INTO users`** (lo conté instrumentando
+La suite hace **182 `INSERT INTO users`** (lo conté instrumentando
 `sql.active_record` en una corrida completa). La cuenta:
 
-- Con cost 4: 171 × 1,2 ms ≈ **0,2 s**.
-- Con cost 12: 171 × 243 ms ≈ **41,5 s**.
+- Con cost 4: 182 × 1,1 ms ≈ **0,2 s**.
+- Con cost 12: 182 × 233 ms ≈ **42,4 s**.
 
-O sea que sin `min_cost`, esta suite pasaría de 16 s a casi 60 s: **más del
+O sea que sin `min_cost`, esta suite pasaría de 17 s a casi 60 s: **más del
 triple, y el 70 % del tiempo sería hashear passwords**. Es la optimización
 más rentable de cualquier suite Rails, y viene gratis. El bug clásico es
 sobreescribirla con `config.active_model.secure_password_min_cost = false` o
@@ -1882,7 +2181,7 @@ Cómo medir, en orden de utilidad:
 
 ```bash
 PROFILE=1 bundle exec rspec              # top 10 de ejemplos y de grupos
-bundle exec rspec --dry-run              # ¿cuántos ejemplos hay? (338)
+bundle exec rspec --dry-run              # ¿cuántos ejemplos hay? (358)
 bundle exec rspec spec/services          # tiempo por capa
 ```
 
@@ -2101,25 +2400,31 @@ step "Tests: RSpec", "bundle exec rspec"
 
 ## Errores que ves en producción
 
-Cada uno con el síntoma exacto y el arreglo.
+Cada uno con el síntoma exacto y el arreglo. Los que dicen **✅ CORREGIDO EN ESTE
+REPO** estuvieron vivos acá y hoy no lo están: queda la explicación porque el
+valor está en reconocer el síntoma, no en el estado del archivo.
 
 **1. El lint de factories del CI falla por traits que nadie escribió.**
+**✅ CORREGIDO EN ESTE REPO.**
 Síntoma: `LINT_FACTORIES=1 bundle exec rspec spec/lib` tira
 `FactoryBot::InvalidFactoryError` mencionando `stock_reservation+committed`,
 `stock_movement+scrap` y otros tres que no están en `spec/factories/`.
 Causa: `FactoryBot.automatically_define_enum_traits` (default `true` en
 factory_bot 6) genera un trait por cada valor de cada `enum` de ActiveRecord, y
 esos traits setean sólo la columna del enum, violando los CHECK constraints
-(`stock_reservations_committed_at_present`). Arreglo verificado:
-`FactoryBot.automatically_define_enum_traits = false` antes del `lint`, o usar
-`FactoryBot.lint` sin `traits: true`.
+(`stock_reservations_committed_at_present`).
+Arreglo aplicado: `FactoryBot.automatically_define_enum_traits = false` en
+`spec/support/factory_bot.rb`, antes del `lint`, más los traits de estado
+escritos a mano con su timestamp en `spec/factories/stock.rb` (§5.4). La
+alternativa era `FactoryBot.lint` sin `traits: true`, que también pasa pero deja
+de verificar los traits propios. Hoy el step del CI está en verde.
 
 **2. Los tests de rate limiting dan verde sin probar nada.**
 Síntoma: hacés 200 requests y nunca llega el 429; el test pasa igual.
 Causa: `config.cache_store = :null_store` (el default de Rails en test) hace que
 `store.increment` devuelva `nil` y la comparación nunca supere el límite.
 Arreglo: `:memory_store` (`config/environments/test.rb:35`) + `Rails.cache.clear`
-en un `before` global (`spec/rails_helper.rb:77`).
+en un `before` global (`spec/rails_helper.rb:65`).
 
 **3. Un test de concurrencia pasa en verde sin ejercitar un solo lock.**
 Síntoma: 8 threads egresando 3 unidades sobre un stock de 10 y todos "tienen
@@ -2163,9 +2468,9 @@ Arreglo: primera línea de `spec/spec_helper.rb`, y `spec_helper` cargado desde
 `.rspec` con `--require spec_helper`.
 
 **8. La suite tarda 3 veces lo que debería y nadie sabe por qué.**
-Síntoma: casi 60 s en vez de 16 s.
-Causa típica: bcrypt con cost de producción en test (medido acá: 243 ms vs 1,2
-ms por hash, ~200×; con 171 usuarios creados son 41 s de puro hash). Suele
+Síntoma: casi 60 s en vez de 17 s.
+Causa típica: bcrypt con cost de producción en test (medido acá: 233 ms vs 1,1
+ms por hash, ~210×; con 182 usuarios creados son 42 s de puro hash). Suele
 aparecer por un initializer que setea `BCrypt::Engine.cost` sin condicionar por
 entorno.
 Arreglo: dejar que Rails maneje `ActiveModel::SecurePassword.min_cost` (es `true`
@@ -2173,11 +2478,30 @@ en test); confirmalo con `bin/rails runner`. Y perfilá con `PROFILE=1` antes de
 adivinar.
 
 **9. Un N+1 se cuela a producción y nadie se entera hasta el timeout.**
+**✅ CORREGIDO EN ESTE REPO.**
 Síntoma: un endpoint que iba a 80 ms empieza a tardar 4 s cuando la tabla crece.
 Causa: en Rails no existe `LazyInitializationException`; la asociación se carga
 donde la toques, en silencio.
-Arreglo: `Bullet.raise = true` y un ejemplo `:n_plus_one` por cada endpoint de
-listado (`spec/support/bullet.rb:20`, `spec/queries/products_search_spec.rb:64`).
+Arreglo: `Bullet.raise = true` (en el `after_initialize` de
+`config/environments/test.rb`) y un ejemplo `:n_plus_one` por cada endpoint de
+listado (`spec/queries/products_search_spec.rb:64`).
+Con la herramienta ya funcionando aparecieron N+1 reales en los serializers de
+órdenes de compra y de transferencias, arreglados con
+`ActiveRecord::Associations::Preloader` al serializar y con el parámetro
+`preload:` de `StockMovements::Ledger` (§4.12).
+
+**9-bis. La herramienta de detección estaba apagada y la suite decía que todo
+estaba bien.** **✅ CORREGIDO EN ESTE REPO.**
+Síntoma: ninguno. Ése es el punto — los ejemplos `:n_plus_one` pasaban en verde
+hubiera o no un N+1.
+Causa: `gem "bullet"` estaba sólo en `group :development`, así que en test la
+constante no existía y los guards `if defined?(Bullet)` daban `false`.
+Arreglo: la gema en `group :development, :test`, la configuración en
+`config/environments/test.rb` (porque `Bullet.enable = true` parchea
+ActiveRecord en el momento de la asignación y tiene que correr durante el boot),
+y un meta-test con control positivo en `spec/n_plus_one_guard_spec.rb`.
+La regla que se lleva: **toda herramienta de test que pueda desactivarse en
+silencio necesita un test que verifique que está activa** (§4.12).
 
 **10. Un `sleep` "arregla" un test flakey y lo empeora.**
 Síntoma: el test pasa localmente, sigue fallando en CI, y la suite ahora tarda 30 s más.
@@ -2193,7 +2517,7 @@ Causa: el archivo no está en `spec/requests/`, así que
 Arreglo: movelo, o declará `RSpec.describe "...", type: :request` explícito.
 
 **12. Un job encolado adentro de una transacción se procesa antes del `COMMIT` —
-o después de un `ROLLBACK`.**
+o después de un `ROLLBACK`.** **✅ CORREGIDO EN ESTE REPO.**
 Síntoma: el worker levanta el job y no encuentra la fila; o corre un job de una
 operación que se revirtió.
 Causa: con Sidekiq, `perform_later` escribe en Redis en el acto, sin esperar la
@@ -2203,10 +2527,22 @@ Arreglo: `self.enqueue_after_transaction_commit = true` **en la clase del job**
 Job **excluye a propósito** esa clave de la configuración global
 (`active_job/railtie.rb`, comentario "This config can't be applied globally"),
 así que `config.active_job.enqueue_after_transaction_commit` en un initializer no
-tiene efecto. En este repo está seteada así en
-`config/initializers/sidekiq.rb:74`, y lo verifiqué: hoy
-`ActiveJob::Base.enqueue_after_transaction_commit` es `false`. Y para lo que no
-se puede perder, esto no alcanza: va el patrón outbox
+tiene efecto.
+
+Este repo tenía exactamente ese bug: la línea
+`config.active_job.enqueue_after_transaction_commit = :always` vivía en
+`config/initializers/sidekiq.rb` y era un no-op —el peor caso posible, porque
+*parecía* configurado—. Se eliminó de ahí y hoy está donde corresponde, en
+`app/jobs/application_job.rb:65`. Verificalo vos mismo:
+
+```bash
+$ bin/rails runner -e test 'puts ActiveJob::Base.enqueue_after_transaction_commit'
+false                       # <- la base de Active Job, sin tocar: es lo esperado
+$ bin/rails runner -e test 'puts ApplicationJob.enqueue_after_transaction_commit'
+true                        # <- la config real, POR CLASE
+```
+
+Y para lo que no se puede perder, esto no alcanza: va el patrón outbox
 (`app/services/outbox/recorder.rb:47`, con
 `ActiveRecord.after_all_transactions_commit`).
 
@@ -2230,10 +2566,10 @@ se puede perder, esto no alcanza: va el patrón outbox
 
 **"¿Cómo se distribuyen tus tests? ¿Pirámide?"**
 
-> Pirámide aplanada, más cerca del "trofeo". En esta suite el 17 % son specs de
-> servicio y ahí está la lógica de negocio; el 15 % son request specs que prueban
+> Pirámide aplanada, más cerca del "trofeo". En esta suite el 16 % son specs de
+> servicio y ahí está la lógica de negocio; el 18 % son request specs que prueban
 > sólo el contrato HTTP, sin repetir casos de negocio; y sólo el 3 % son system
-> tests, que se llevan casi el 30 % del tiempo. Ésa es la proporción que quiero.
+> tests, que se llevan cerca de un tercio del tiempo. Ésa es la proporción que quiero.
 >
 > La razón de que en Rails la pirámide se aplane es que **el contexto se bootea
 > una sola vez y no hay `@DirtiesContext`**: un test contra Postgres real tarda 60
@@ -2298,7 +2634,7 @@ se puede perder, esto no alcanza: va el patrón outbox
 **"¿Qué cobertura buscás?"**
 
 > Ninguna en particular como número. Los umbrales de esta suite están en 70 % de
-> línea y 45 % de rama, y hoy está en 88 % / 63 %. Poner 100 % obliga a escribir
+> línea y 45 % de rama, y hoy está en 88,7 % / 63,7 %. Poner 100 % obliga a escribir
 > tests basura para tapar `attr_reader`s, y esos tests después hay que
 > mantenerlos. Además la cobertura mide qué se **ejecutó**, no qué se **verificó**:
 > un spec que llama al método sin ninguna aserción da 100 % y cero valor.
@@ -2307,7 +2643,7 @@ se puede perder, esto no alcanza: va el patrón outbox
 > separado —para que el promedio no se diluya con vistas y helpers—, los archivos
 > en 0 % (casi siempre es código muerto) y la **cobertura de rama** en los
 > servicios. La brecha entre 88 % de línea y 63 % de rama me está diciendo que hay
-> 201 caminos condicionales sin probar, y ésos son los `unless` de error que
+> 202 caminos condicionales sin probar, y ésos son los `unless` de error que
 > aparecen en producción.
 
 **"¿Cómo hacés rápida una suite Rails?"**
@@ -2316,15 +2652,15 @@ se puede perder, esto no alcanza: va el patrón outbox
 > acá es caro.
 >
 > Los cuatro costos reales, en orden: los system tests (acá el 3 % de los
-> ejemplos se lleva casi el 30 % del tiempo — y está bien, mientras sean pocos
+> ejemplos se lleva cerca de un tercio del tiempo — y está bien, mientras sean pocos
 > y bien elegidos), los `create` de FactoryBot (`build_stubbed` es 5-6× más barato, y en
 > los specs de policy eso significa 33 ejemplos en medio segundo sin tocar la
 > base), bcrypt, y SimpleCov (+33 %, por eso va detrás de una variable de entorno
 > y sólo corre en CI).
 >
 > Lo de bcrypt es el ejemplo que más me gusta porque es aritmética: cost 12 son
-> 243 ms por hash y cost 4 son 1,2 ms. Esta suite crea 171 usuarios, así que sin
-> `min_cost` pasaría de 16 s a casi 60, con el 70 % del tiempo hasheando
+> 233 ms por hash y cost 4 son 1,1 ms. Esta suite crea 182 usuarios, así que sin
+> `min_cost` pasaría de 17 s a casi 60, con el 70 % del tiempo hasheando
 > passwords. Rails lo maneja solo en test; el bug aparece cuando alguien setea
 > `BCrypt::Engine.cost` en un initializer sin condicionar por entorno.
 >

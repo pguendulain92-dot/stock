@@ -8,6 +8,16 @@ números y las salidas de comandos se midieron acá, sobre **Ruby 3.3.6, Rails
 8.1.3.1 y PostgreSQL 16.13**, con la base de seed (15 productos, 4 depósitos, 48
 `stock_items`, 109 movimientos, 4 usuarios).
 
+Un aviso sobre los bugs que vas a leer acá. Escribiendo y verificando esta
+documentación aparecieron defectos **reales** en la app: Bullet estaba inerte en
+test, `Rack::Attack` quedaba montado dos veces, el throttle de login por email
+nunca disparaba, las sesiones vencidas seguían autenticando,
+`enqueue_after_transaction_commit` estaba escrito donde es un no-op. **Todos están
+arreglados hoy**, y ninguno se borró de este documento: el bug, cómo se detectó y
+cómo se arregló es exactamente el material que se pregunta en una entrevista.
+Están contados en pasado, con la ruta del archivo donde vive el arreglo y —cuando
+existe— el spec de regresión que impide que vuelvan.
+
 Está escrito para alguien que viene de **Java/Spring**: casi todas las respuestas
 incluyen la comparación con el equivalente de la JVM y, sobre todo, marcan **dónde
 se rompe la analogía**, que es exactamente donde el entrevistador va a apretar.
@@ -77,7 +87,7 @@ Ruby 3.
 
 Un bloque/lambda captura el binding léxico donde fue creado. Los scopes de
 ActiveRecord son lambdas: `scope :in_stock, -> { where(quantity_available: 1..) }`
-(`app/models/stock_item.rb:40`). Por eso un scope se re-evalúa en cada llamada, y
+(`app/models/stock_item.rb:47`). Por eso un scope se re-evalúa en cada llamada, y
 por eso escribir `scope :recent, -> { where("created_at > ?", 1.day.ago) }` está
 bien pero `where("created_at > ?", 1.day.ago)` fuera del lambda congelaría la fecha
 al bootear.
@@ -196,10 +206,11 @@ controller/acción → corren los `before_action` → la acción → `after_acti
 `render` → el response vuelve subiendo por los middlewares. Lo ves entero con
 `bin/rails middleware`.
 
-**Si repreguntan:** en este repo el orden importa: `Rack::Attack` está insertado
-**después** de `ActionDispatch::RemoteIp` (`config/application.rb:52`), porque antes
-de ese middleware `request.ip` es la IP del balanceador y todos los usuarios
-compartirían un contador.
+**Si repreguntan:** en este repo el orden importa: `Rack::Attack` corre **después**
+de `ActionDispatch::RemoteIp` (`config/application.rb:64`), porque antes de ese
+middleware `request.ip` es la IP del balanceador y todos los usuarios compartirían
+un contador. Y la línea es `config.middleware.move_after`, no `insert_after` — el
+porqué está dos preguntas más abajo.
 
 ### ¿Qué es un middleware Rack y con qué se corresponde en Java?
 
@@ -207,15 +218,36 @@ Un objeto que responde `call(env)` y devuelve `[status, headers, body]`, apilado
 como capas de cebolla. Cada capa puede cortar la cadena. Es exactamente
 `javax.servlet.Filter` / la `FilterChain` de Spring Security.
 
-### En `bin/rails middleware` aparece `Rack::Attack` dos veces. ¿Es un bug?
+### En `bin/rails middleware` aparecía `Rack::Attack` dos veces. ¿Era un bug?
 
-Sí y no: el railtie de la gema hace `app.middleware.use(Rack::Attack)` al final de
-la pila, y nosotros además lo insertamos después de `RemoteIp`. **La segunda
-ejecución es un no-op**: `Rack::Attack#call` arranca con
+**Este bug estuvo vivo en este repo.** El railtie de la gema hace
+`app.middleware.use(Rack::Attack)` y lo monta al final de la pila; nosotros además
+hacíamos `insert_after ActionDispatch::RemoteIp`, así que quedaba montado **dos
+veces**. No se contaban las requests doble —eso lo verifiqué leyendo la gema, no lo
+supuse—: `Rack::Attack#call` arranca con
 `return @app.call(env) if ... env["rack.attack.called"]`
-(rack-attack 6.8.0, `lib/rack/attack.rb:105`), o sea que no se cuentan las requests
-dos veces. Igual conviene sacar el duplicado; lo verifiqué leyendo la gema, no lo
-supuse.
+(rack-attack 6.8.0, `lib/rack/attack.rb:105`), o sea que la segunda ejecución es un
+no-op. Pero pagabas un frame de middleware en cada request y, sobre todo, la pila
+mentía sobre lo que la app realmente hace.
+
+El arreglo es la parte que vale contar, porque el intento obvio **no funciona**:
+
+```ruby
+# config/application.rb:64
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+`delete` + `insert_after` **tampoco sirve**. Las operaciones sobre el stack se
+acumulan y se aplican en orden al bootear: tu `delete` corre antes de que el
+railtie haga su `use`, así que borra algo que todavía no está, y el `use`
+posterior lo vuelve a dejar al final. `move_after` mueve el que ya existe, que es
+exactamente lo que querés. Comprobado:
+
+```bash
+$ bin/rails middleware | grep -n "RemoteIp\|Attack"
+11:use ActionDispatch::RemoteIp
+12:use Rack::Attack
+```
 
 ### ¿Qué es un engine y cuándo montarías uno?
 
@@ -340,13 +372,43 @@ llena la caché de asociaciones. Y `includes` + `where("categories.name = ?")` s
 `references(:categories)` explota; con un hash (`where(categories: {...})`) Rails lo
 infiere.
 
+Falta una quinta herramienta que casi nadie nombra:
+`ActiveRecord::Associations::Preloader`, que es el objeto que `includes` usa por
+debajo y que podés llamar a mano para "ya tengo el objeto y **recién ahora**
+necesito sus asociaciones". Acá se usa a propósito. Cuando Bullet empezó a
+funcionar de verdad (ver más abajo) aparecieron N+1 reales en los serializers de
+órdenes de compra y de transferencias: recorrían las líneas tocando
+`line.product`, una query por línea. El arreglo **no** fue buscar la orden con
+`includes`, porque esas acciones tienen caminos de error —422 por estado inválido,
+403 por permiso— que cortan **antes** de serializar, y ahí la precarga se paga y
+no se usa. Se precarga en el método privado `serialize`, justo cuando hace falta
+(`app/controllers/api/v1/purchase_orders_controller.rb:111-117`). El mismo criterio
+motivó el parámetro `preload:` de `StockMovements::Ledger`: el dashboard pide
+`%i[product warehouse]` y no el usuario, porque no lo muestra
+(`app/controllers/dashboard_controller.rb:22`).
+
 ### ¿Cómo detectás un N+1 antes de que llegue a producción?
 
-Con `bullet` activado **en test** y `Bullet.raise = true`
-(`spec/support/bullet.rb:14-24`), de modo que un N+1 **rompa la suite**; el tag
-`:n_plus_one` es el que abre y cierra el request de Bullet en cada ejemplo
-(`spec/rails_helper.rb:62-70`). En desarrollo, el log de queries
-o `rack-mini-profiler`. En producción, el APM.
+Con `bullet` activado **en test** y `Bullet.raise = true`, de modo que un N+1
+**rompa la suite**. La configuración vive en `config/environments/test.rb`, adentro
+de un `after_initialize`, y **no** en un `before(:suite)` de RSpec:
+`Bullet.enable = true` aplica los parches sobre ActiveRecord **en el momento de la
+asignación**, así que hacerlo después de que Rails terminó de bootear llega tarde
+para algunos ganchos y la detección queda muda. El tag `:n_plus_one` abre y cierra
+el request de Bullet alrededor de cada ejemplo (`spec/support/bullet.rb:64-72`). En
+desarrollo, el log de queries o `rack-mini-profiler`. En producción, el APM.
+
+**Si repreguntan —y esta es la mejor parte de la respuesta—:** el chequeo estuvo
+**inerte durante todo el proyecto**. La gema figuraba sólo en `group :development`
+del Gemfile, así que en test la constante `Bullet` no existía, el guard
+`if defined?(Bullet)` daba `false` y los ejemplos marcados `:n_plus_one` pasaban en
+verde **hubiera o no un N+1**. Un verde que no verifica nada es peor que no tener
+chequeo, porque te saca las ganas de mirar. El arreglo fue mover la gema a
+`group :development, :test` y agregar `spec/n_plus_one_guard_spec.rb`, que testea
+**la herramienta** con un control positivo: un N+1 escrito a propósito que *tiene*
+que levantar `Bullet::Notification::UnoptimizedQueryError`. La regla generalizable
+—y es una buena frase para dejar picando—: **cuando una herramienta de test puede
+desactivarse en silencio, escribí un test que verifique que está activa.**
 
 ### ¿Qué es un scope y cuándo pasar a un query object?
 
@@ -412,11 +474,34 @@ rollback, el job ya se encoló y va a procesar algo que no existe; y el worker p
 levantarlo antes de que Postgres commitee.
 
 **Si repreguntan:** en Rails 7.2+ hay dos herramientas mejores.
-`config.active_job.enqueue_after_transaction_commit = :always`
-(`config/initializers/sidekiq.rb`, al final) lo arregla para cualquier adapter; y
+`enqueue_after_transaction_commit` lo arregla para cualquier adapter, y
 `ActiveRecord.after_all_transactions_commit`
 (`app/services/outbox/recorder.rb:47`) ejecuta al commitear la transacción **más
 externa**, que es lo que necesitás dentro de transacciones anidadas.
+
+Y acá va un bug que **estuvo vivo en este repo** y que es una repregunta
+buenísima. La línea estaba escrita como
+`config.active_job.enqueue_after_transaction_commit = :always` en
+`config/initializers/sidekiq.rb`, y en **Rails 8.1 eso es un no-op silencioso**: el
+railtie de Active Job excluye esa clave a propósito de la configuración global
+("This config can't be applied globally") y además el valor `:always` se removió.
+El resultado era el peor posible — parecía configurado y no lo estaba. Se detecta
+leyendo el **valor efectivo**, no el initializer; con el arreglo puesto se ve así
+(el global sigue en `false` porque esta opción no se puede aplicar globalmente, y
+el que manda es el de la clase base de los jobs):
+
+```console
+$ bin/rails runner 'puts ActiveJob::Base.enqueue_after_transaction_commit.inspect'
+false
+$ bin/rails runner 'puts ApplicationJob.enqueue_after_transaction_commit.inspect'
+true
+```
+
+El arreglo fue borrar esa línea y declararlo **por clase de job**:
+`self.enqueue_after_transaction_commit = true` en `app/jobs/application_job.rb:65`,
+que es el único lugar donde Rails 8.1 la lee. La lección sobrevive al arreglo:
+**una opción de configuración que "no toma" casi siempre es orden de boot o una API
+removida; verificalo leyendo el valor efectivo.**
 
 ### ¿Qué trampas tienen las transacciones en Rails?
 
@@ -430,8 +515,23 @@ Tres, y las tres están documentadas en `app/services/application_service.rb:36-
 3. Con `requires_new: true` sí funciona, porque emite un `SAVEPOINT`.
 
 La solución acá es una excepción propia (`BusinessRuleViolation`) que viaja hasta el
-`rescue` de `transactional` (`app/services/application_service.rb:68-84`): el
+`rescue` de `transactional` (`app/services/application_service.rb:68-91`): el
 rollback está garantizado y afuera seguimos devolviendo un `Result`.
+
+**Si repreguntan por un caso real:** la trampa 2 se cobró una víctima en este repo.
+`StockItem.find_or_provision!` rescataba `RecordNotUnique` para resolver la carrera
+de dos requests creando el mismo par producto/depósito… pero los tres llamadores lo
+invocan **dentro** de una transacción, así que cuando el `create!` fallaba la
+transacción entera ya estaba abortada y el `rescue` no podía hacer nada útil: la
+query siguiente moría con `PG::InFailedSqlTransaction`. Un `rescue` que no puede
+recuperarse es peor que no tenerlo, porque te hace creer que el caso está cubierto.
+El arreglo es envolver el `create!` en `transaction(requires_new: true)` —un
+SAVEPOINT, que **sí** se revierte solo y deja la conexión usable— y rescatar
+**también** `RecordInvalid`, porque si el otro proceso alcanzó a commitear, la
+validación de unicidad de Rails gana la carrera y la excepción cambia de clase
+(`app/models/stock_item.rb:158-168`). La regresión está en
+`spec/models/stock_item_spec.rb`, escrita con otra conexión de verdad — que es la
+única forma honesta de testear esto.
 
 ### ¿Qué es una migración y en qué se diferencia de Flyway/Liquibase?
 
@@ -454,14 +554,14 @@ diferencia: en Rails el chequeo ocurre **en cada `UPDATE`**, no en el flush, por
 no hay sesión de persistencia. Y `update_all` / `update_column` **saltean** el
 optimistic locking; si escribís SQL crudo, tenés que incrementar `lock_version` a
 mano, como hace `StockItem.atomically_decrement`
-(`app/models/stock_item.rb:104-114`).
+(`app/models/stock_item.rb:115-125`).
 
 ### ¿Cómo se ve el optimistic locking sobre HTTP?
 
 El cliente manda el `lock_version` que leyó
 (`app/controllers/api/v1/products_controller.rb:56`); si otro lo modificó, Rails
 levanta `StaleObjectError` y el `rescue_from` del concern lo traduce a **409**
-(`app/controllers/concerns/api/error_handling.rb:27` y `:85-89`). Es el mismo
+(`app/controllers/concerns/api/error_handling.rb:27` y `:94-98`). Es el mismo
 mecanismo que `ETag` + `If-Match`, y evita el *last write wins* silencioso.
 
 ### ¿Qué diferencia hay entre `update_attribute`, `update_column` y `update!`?
@@ -549,7 +649,7 @@ estadística.
 **Si repreguntan:** el orden también vale **entre tablas**: en este repo siempre se
 bloquea primero la reserva y después el `stock_item`
 (`app/services/stock/release_reservation.rb:25-30`). El `retry_on
-ActiveRecord::Deadlocked` de `app/jobs/application_job.rb:52` es el cinturón de
+ActiveRecord::Deadlocked` de `app/jobs/application_job.rb:81` es el cinturón de
 seguridad, no la solución.
 
 ### ¿Cómo dimensionás el pool de conexiones?
@@ -655,8 +755,8 @@ end
 contemplaste un caso: `case/in` levanta `NoMatchingPatternError` en vez de devolver
 `nil` como `case/when`. En los controllers de esta API el traductor está
 centralizado en un helper, `render_result`
-(`app/controllers/concerns/api/error_handling.rb:58-67`), que mapea el `code` del
-error al status HTTP.
+(`app/controllers/concerns/api/error_handling.rb:67-76`), que mapea el `code` del
+error al status HTTP con la tabla `STATUS_FOR`, que es el contrato de la API.
 
 ### ¿Qué es CQRS y qué versión de CQRS tenés acá?
 
@@ -691,7 +791,8 @@ commitea ninguno.
 ### ¿Cuándo NO necesitás outbox?
 
 Cuando el evento se puede perder. "Mandale un mail de bienvenida" no justifica una
-tabla y un relay: alcanza con `enqueue_after_transaction_commit = :always`. La
+tabla y un relay: alcanza con `enqueue_after_transaction_commit` (acá lo activa
+`ApplicationJob` para todos los jobs del proyecto). La
 ventana que queda (el proceso muere entre el COMMIT y el enqueue) es de
 microsegundos; si esa ventana te importa, outbox. Saber dónde está esa línea es la
 respuesta madura.
@@ -718,7 +819,7 @@ tests.
 Con un índice único. El INSERT en estado `processing` es la sección crítica: si dos
 requests con la misma clave llegan a la vez, una gana y la otra recibe
 `RecordNotUnique`, que traducimos a 409
-(`app/controllers/concerns/api/idempotency.rb:159-161`). También hay advisory locks
+(`app/controllers/concerns/api/idempotency.rb:183-185`). También hay advisory locks
 de Postgres (`pg_advisory_xact_lock`) para exclusión mutua sin fila.
 
 ### ¿Cómo versionás una API y por qué por path?
@@ -809,7 +910,7 @@ feliz, 409 cuando choca.
 ### ¿Hay una tercera opción?
 
 Sí: el **UPDATE condicional atómico**, una sola sentencia con la regla de negocio en
-el WHERE (`app/models/stock_item.rb:104-114`). Si devuelve 0 filas, la condición no
+el WHERE (`app/models/stock_item.rb:115-125`). Si devuelve 0 filas, la condición no
 se cumplió. Ventaja: cero round-trips extra, cero riesgo de deadlock. Desventaja: no
 podés hacer lógica compleja en Ruby entre el chequeo y la escritura, y **perdés el
 optimistic locking** salvo que incrementes `lock_version` a mano (por eso el SQL lo
@@ -880,15 +981,25 @@ y perder portabilidad.
 | Latencia | ~1 ms (BRPOP bloqueante) | 100 ms – 1 s (polling) |
 | Throughput | decenas de miles/s | miles/s |
 | Durabilidad | según la config de Redis | ACID, igual que tus datos |
-| Enqueue transaccional | ❌ va a Redis ya mismo | ✅ mismo COMMIT que el negocio |
+| Enqueue transaccional | ❌ va a Redis ya mismo | ✅ **sólo si comparte base** (acá no: la cola vive en `stock_development_queue`) |
 | Infra extra | Redis | ninguna |
 
 **El punto transaccional es el más importante y el menos conocido.** Con Sidekiq, un
 `perform_later` dentro de una transacción encola en Redis inmediatamente; si después
 hay rollback, el job procesa una orden que no existe.
 
-**Si repreguntan:** `enqueue_after_transaction_commit = :always` lo arregla para
-cualquier adapter, y está activo en este repo.
+**Si repreguntan:** ojo con ese ✅ de Solid Queue, que es media verdad y un error
+que casi todo el mundo repite. El INSERT del job va en tu transacción **sólo si la
+cola comparte base**. Rails 8 separa las bases por defecto —y hace bien, para no
+contaminar el `VACUUM` de la base de negocio—, así que acá
+`config.solid_queue.connects_to = { database: { writing: :queue } }` apunta a
+`stock_development_queue`: otra base, otra conexión, **otra transacción**, y volvés
+a tener exactamente el problema de Sidekiq. Este repo lo tuvo, porque además el
+`enqueue_after_transaction_commit` estaba escrito donde es un no-op (ver §3). Lo
+que lo arregla en los dos casos es esa opción, que hoy activa `ApplicationJob` para
+todo el proyecto (`app/jobs/application_job.rb:65`). Se verifica con un script de
+ocho líneas: contás `SolidQueue::Job.count`, hacés `perform_later` dentro de una
+transacción que después hace `raise`, y comparás el delta.
 
 ### ¿Cuáles son las dos reglas de oro de los jobs?
 
@@ -929,7 +1040,7 @@ agregado, mismo worker. Es exactamente el rol de la partition key en Kafka.
 `retry_on` con `wait: :polynomially_longer` para errores transitorios
 (deadlock, lock timeout, conexión) y `discard_on` para errores permanentes:
 reintentar un `RecordNotFound` 25 veces es desperdicio, el registro no va a
-reaparecer (`app/jobs/application_job.rb:52-66`). Si retryás todo, la cola se tapa
+reaparecer (`app/jobs/application_job.rb:81-95`). Si retryás todo, la cola se tapa
 con basura.
 
 **Si repreguntan:** el backoff necesita **jitter**, o 1000 jobs que fallaron juntos
@@ -967,7 +1078,7 @@ el controller y de tocar la base: una request bloqueada cuesta ~0.1 ms. Pero só
 conoce la IP y los headers. **`rate_limit` de Rails 8** corre después de autenticar,
 así que puede limitar por usuario, plan o tenant — cuesta más, pero es el único lugar
 donde tenés esa información
-(`app/controllers/api/v1/base_controller.rb:20-38`).
+(`app/controllers/api/v1/base_controller.rb:20-79`).
 
 ### ¿Cuál es el discriminador correcto y cuál es el error clásico?
 
@@ -975,11 +1086,45 @@ Depende de qué querés proteger. Para login, **dos límites en paralelo**: por 
 (frena credential stuffing) y por email (frena el ataque distribuido de un botnet
 contra una cuenta, donde cada IP hace 2 requests y el límite por IP no lo ve).
 Necesitás los dos: cubren amenazas distintas
-(`config/initializers/rack_attack.rb:160-180`). Para la API, por **token**, no por
+(`config/initializers/rack_attack.rb:160-204`). Para la API, por **token**, no por
 IP: los clientes están detrás de NAT y compartirían el contador.
 
 **Si repreguntan:** el token se hashea antes de usarlo como clave, para no dejar
 secretos en Redis, en logs ni en dashboards.
+
+**Y el error clásico —que acá estuvo vivo—:** el discriminador tiene que coincidir
+con la forma **real** de los params. El throttle `logins/email` leía
+`req.params.dig("session", "email_address")`, pero el formulario usa
+`form_with url:` **sin modelo**, así que los params llegan planos
+(`email_address`) y no anidados bajo `"session"`. El `dig` devolvía `nil`, y un
+discriminador `nil` hace que Rack::Attack **no cuente nada**: el límite por email
+directamente no existía, y con él el ataque distribuido contra una cuenta quedaba
+libre. Lo peor es el modo de falla: no hay error, no hay warning — **un rate limit
+roto se ve exactamente igual que uno que nunca se disparó**. Lo mismo pasaba en
+`password-resets/email`. Hoy leen `req.params["email_address"]` con fallback al
+anidado, y normalizan a minúsculas (si no, el atacante evade el límite cambiando el
+casing). La moraleja es de una línea: **todo throttle necesita un test que lo
+dispare de verdad**; los de regresión están en
+`spec/requests/api/v1/rate_limiting_spec.rb` ("limita los intentos contra UNA
+CUENTA aunque cambie la IP", "normaliza el email: cambiar el casing no evade el
+límite").
+
+Del mismo repaso salieron otros dos agujeros, los dos cerrados:
+
+- **Fuerza bruta de tokens de API sin techo.** Un Bearer inválido devuelve 401 en un
+  `before_action`, y eso **corta la cadena de callbacks**: el `rate_limit` de la
+  capa 2 —que corre después de autenticar— nunca se ejecuta. Y el throttle
+  `api/token` discrimina por el SHA del token, así que **cada token adivinado
+  estrenaba su propio balde de 1000/hora**. La única barrera real era el límite
+  genérico por IP. Ahora hay un `Fail2Ban` por IP sobre los fallos de
+  autenticación de la API (`config/initializers/rack_attack.rb:239-245`): 10 fallos
+  en 5 minutos y esa IP queda bloqueada una hora, pruebe los tokens que pruebe.
+  Como Rack::Attack corre **antes** del controller y no conoce el status de la
+  respuesta, el fallo lo marca `Api::TokenAuthentication` con
+  `record_authentication_failure!`, escribiendo en `Rack::Attack.cache`.
+- **El `rate_limit` del login web contaba sólo por IP**, porque no pasaba `by:`.
+  Ahora cuenta por IP + email (`app/controllers/sessions_controller.rb:18`), que es
+  el mismo par de discriminadores que usa la capa de Rack::Attack.
 
 ### ¿Por qué el store no puede ser un `MemoryStore`?
 
@@ -1015,15 +1160,17 @@ distinto a cada límite.
 ### ¿Qué devolvés cuando bloqueás?
 
 429 con `Retry-After` y las cabeceras `RateLimit-*`
-(`config/initializers/rack_attack.rb:230-254`). Un 429 sin cabeceras es hostil: el
+(`config/initializers/rack_attack.rb:278-302`). Un 429 sin cabeceras es hostil: el
 cliente no sabe cuánto esperar y reintenta en loop, empeorando todo.
 
 Y tené bien la letra chica: el 429 viene de **RFC 6585** y `Retry-After` de **RFC
 9110**, pero las cabeceras `RateLimit-Limit` / `RateLimit-Remaining` /
 `RateLimit-Reset` **todavía no son un RFC**: son el borrador de la IETF
 `draft-ietf-httpapi-ratelimit-headers`, convención de hecho muy implementada. (El
-comentario del initializer las atribuye a la RFC 9331, que en realidad es la de
-ECN/L4S: número equivocado.)
+comentario del initializer las atribuía a la **RFC 9331**, que en realidad es la de
+ECN/L4S y no tiene nada que ver. Ya está corregido, con la aclaración de por qué
+importa: citar un número de RFC equivocado da una falsa autoridad, y es de lo
+primero que un entrevistador con oficio va a chequear.)
 
 **Si repreguntan:** antes de activar un límite nuevo en producción se lo deja en
 `track` (mide sin bloquear) un par de semanas, para ver cuántos clientes legítimos lo
@@ -1046,9 +1193,9 @@ mentiras. Arriba, pocos tests de sistema; abajo, unitarios puros para value obje
 
 ```bash
 $ bundle exec rspec
-338 examples, 0 failures        # 17 s de reloj
+358 examples, 0 failures        # 17,4 s de reloj
 $ cat coverage/.last_run.json
-{ "result": { "line": 88.45, "branch": 63.25 } }    # línea vs rama
+{ "result": { "line": 88.66, "branch": 63.73 } }    # línea vs rama
 ```
 
 ### Factories vs fixtures.
@@ -1085,7 +1232,7 @@ aparte): ese hilo no ve tus datos sin commitear. Está activado globalmente en
 
 Cuatro causas típicas: dependencia del **orden** (estado global no limpiado — por eso
 `Current.reset` y `Rails.cache.clear` antes de cada ejemplo,
-`spec/rails_helper.rb:75-78`), dependencia del **tiempo** (usá `travel_to` /
+`spec/rails_helper.rb:63-66`), dependencia del **tiempo** (usá `travel_to` /
 `freeze_time`, nunca `sleep`), dependencia de la **red** (WebMock) y **carreras** en
 tests de browser (esperá por condición, no por tiempo).
 
@@ -1094,15 +1241,43 @@ tests de browser (esperá por condición, no por tiempo).
 No. La cobertura te dice qué **no** probaste; no te dice si lo que probaste está
 bien. Un 100% de líneas con asserts triviales es peor que un 75% con tests que
 ejercitan las invariantes. Mirá la cobertura de **rama**, que es la que se olvida:
-acá es 63.25% contra 88.45% de línea, y esa brecha son los `if` sin el camino
+acá es 63.73% contra 88.66% de línea, y esa brecha son los `if` sin el camino
 alternativo probado.
+
+**Si repreguntan por un ejemplo concreto:** en este repo `GET /api/v1/reservations`
+devolvía **500 siempre**. Faltaba `app/policies/stock_reservation_policy.rb`, así
+que `policy_scope` moría con `Pundit::NotDefinedError`… y ningún spec tocaba ese
+endpoint, con lo cual la cobertura no se quejaba de nada. El arreglo no fue sólo
+escribir la policy: se agregó `spec/requests/api/v1/endpoint_coverage_spec.rb`, que
+recorre **todas** las rutas de la API y falla si alguna devuelve 5xx. Un smoke test
+de rutas cuesta treinta líneas y encuentra la clase de bug que la cobertura por
+líneas no te va a mostrar nunca.
 
 ### ¿Cómo probás que no hay N+1?
 
-Con Bullet en test y `Bullet.raise = true` (`spec/support/bullet.rb:20`), más el tag
-`:n_plus_one` que abre y cierra el request de Bullet alrededor del ejemplo
-(`spec/rails_helper.rb:62-70`). Es la única forma de que un N+1 no se cuele: que el
-CI falle.
+Con Bullet en test y `Bullet.raise = true` (`config/environments/test.rb`), más el
+tag `:n_plus_one` que abre y cierra el request de Bullet alrededor del ejemplo
+(`spec/support/bullet.rb:64-72`). Es la única forma de que un N+1 no se cuele: que
+el CI falle.
+
+**Si repreguntan:** hay dos trampas que hacen que Bullet "no detecte nada", y las
+dos costaron tiempo acá. **(1)** La gema estaba sólo en `group :development`, así
+que en test ni siquiera existía y los ejemplos marcados pasaban en verde sin
+verificar nada; hoy está en `:development, :test` y `spec/n_plus_one_guard_spec.rb`
+comprueba con un **control positivo** que el detector detecta de verdad. **(2)**
+Bullet clasifica los objetos en posibles e imposibles, y marca como **imposible**
+todo lo que acabás de crear: si hacés el `create_list` **dentro** del request de
+Bullet, la detección se vuelve muda aunque el N+1 exista. Por eso el helper
+`detectando_n_plus_one` arma los datos primero y abre el request recién antes de la
+consulta que querés auditar.
+
+Aparte, el detector de eager loading **innecesario** (`unused_eager_loading`) quedó
+**opt-in** con `BULLET_UNUSED=1`. Como gate de CI es contraproducente: cualquier
+código que precargue para el camino feliz y corte antes por una validación lo
+dispara —`Purchasing::ReceiveOrder` es el caso real— y no hay nada que arreglar
+ahí, porque no podés saber de antemano si vas a fallar. Un chequeo que grita en
+casos correctos entrena a la gente a ignorarlo, y ahí perdés también las alertas
+buenas. El de N+1 sigue **siempre** activo: sus hallazgos son bugs, no ruido.
 
 ### ¿TDD sí o no?
 
@@ -1144,6 +1319,17 @@ bloque `<script>`. Un `link_to` con href controlado por el usuario permite
 (`config/initializers/content_security_policy.rb`) es la segunda línea, y limita el
 daño cuando la primera falla.
 
+Ojo con el detalle que **acá estuvo vivo**: ese archivo venía **entero comentado**
+por el generador de Rails, así que `config.content_security_policy` devolvía `nil`
+mientras el layout emitía tranquilamente `csp_meta_tag`. La etiqueta estaba, la
+política no — seguridad de utilería, que es la peor clase: parece que estás
+protegido. Hoy hay política real (`default_src :self`, `object_src :none`,
+`frame_ancestors :none` contra clickjacking, nonce por respuesta para los inline
+que Rails necesita) y arranca en **report-only**, que es como se despliega una CSP
+sin romper media aplicación: el browser reporta lo que habría bloqueado, mirás los
+reportes un par de semanas, ajustás, y recién ahí la hacés efectiva con
+`CSP_ENFORCE=1`.
+
 ### ¿Por qué la API no tiene protección CSRF y la web sí?
 
 Porque CSRF funciona gracias a que el browser **adjunta la cookie sola**. Un header
@@ -1178,9 +1364,21 @@ a `authorize`. Y el `Scope` por defecto devuelve `scope.none`
 (`app/policies/application_policy.rb:57`): si te olvidás de definir `resolve`, no se
 filtra información de más. **Deny by default** en las dos direcciones.
 
+Esa red estuvo **sólo en la API**, y ese era el agujero: un controller HTML nuevo
+sin `authorize` no disparaba ninguna alarma. Hoy `ApplicationController` también la
+tiene (`app/controllers/application_controller.rb:45`), con los saltos declarados
+**explícitamente**: sesiones y reseteo de contraseña son públicos por definición,
+`DashboardController#index` llama `skip_policy_scope` y
+`StockItemsController#low_stock` llama `skip_policy_scope` + `skip_authorization`.
+Declarar el salto es mejor que no tener el chequeo: queda escrito que fue una
+decisión y no un olvido.
+
 **Si repreguntan:** en dev/test explota; en producción sólo se loguea, para no tumbar
 un endpoint por un olvido, pero la alerta queda. Y ojo: autorizar el `show` no sirve
-de nada si el `index` te lista todo — por eso el `Scope`.
+de nada si el `index` te lista todo — por eso el `Scope`. Un detalle de Rails 7.1+
+que te muerde acá: declarar el `after_action` con `only: %i[index]` cuando alguna
+subclase **no tiene** esa acción levanta `AbstractController::ActionNotFound` y
+rompe todas sus acciones. Por eso es un solo callback que decide adentro.
 
 ### ¿Qué es IDOR y cómo lo prevenís?
 
@@ -1251,7 +1449,7 @@ sin instanciar modelos ni correr callbacks, que es lo que querés en una limpiez
 costo crece con el número de página, y si alguien inserta mientras paginás ves filas
 repetidas. **Keyset** salta directo con el índice, es O(log n) para cualquier página, y como
 el cursor apunta a una fila concreta insertar no desplaza nada
-(`app/queries/stock_movements/ledger.rb:76-83`):
+(`app/queries/stock_movements/ledger.rb:84-91`):
 
 ```sql
 SELECT * FROM stock_movements
@@ -1261,11 +1459,25 @@ ORDER BY occurred_at DESC, id DESC
 LIMIT 20;                                    -- usa index_stock_movements_ledger
 ```
 
-Ojo con el prefijo: el índice es
+Ojo con el prefijo: `index_stock_movements_ledger` es
 `(stock_item_id, occurred_at DESC, id DESC)`, así que sirve para el keyset **sólo si
 la query también filtra por `stock_item_id`**. Sin ese filtro, Postgres no lo puede
-usar para el rango y termina ordenando. Contra del keyset: no podés saltar a la
-página 37 — irrelevante en un ledger.
+usar para el rango y termina en Seq Scan + Sort.
+
+**Y ese agujero estuvo vivo acá.** El comentario del query object hablaba del
+"índice compuesto `(occurred_at DESC, id DESC)`" como si existiera, pero los tres
+índices de `stock_movements` empezaban por otra columna (`stock_item_id`,
+`product_id`, `warehouse_id`), así que el ledger **global** —el que usa el panel y
+`GET /api/v1/stock_movements` sin filtros— ordenaba la tabla entera, y es la tabla
+que más crece del sistema. Lo arregla la migración
+`db/migrate/20260830220000_add_ledger_global_index.rb`, que crea
+`index_stock_movements_global_ledger` sobre `(occurred_at DESC, id DESC)` con
+`algorithm: :concurrently` + `disable_ddl_transaction!`. Con 109 filas el planner
+sigue eligiendo Seq Scan, y tiene razón; para comprobar que el índice **sirve** hay
+que forzarlo con `SET enable_seqscan = off`. Sacar conclusiones de performance
+sobre una base de juguete es la forma más común de equivocarse.
+
+Contra del keyset: no podés saltar a la página 37 — irrelevante en un ledger.
 
 **Si repreguntan:** el cursor se devuelve en Base64 de un JSON para que sea **opaco**:
 si el cliente no puede adivinar qué hay adentro, no se rompe cuando cambiás el
@@ -1410,11 +1622,11 @@ Cada uno con el **síntoma** (lo que reporta el usuario o el monitoreo) y el
 | Dos comprobantes con el mismo número | El **query cache** de Rails cachea un `INSERT ... RETURNING` ejecutado con `select_value` | `connection.uncached { ... }` + `clear_query_cache` (`app/models/sequence_counter.rb:47-48`) |
 | Un rate limit de 20 corta en 10 | Dos `rate_limit` sin `name:` comparten clave y cuentan doble | `name:` distinto por límite (`app/controllers/api/v1/base_controller.rb:59-79`) |
 | El rate limiting "no limita nada" y no hay error | `NullStore`: `increment` devuelve `nil` y la comparación nunca se cumple | Elegir el store explícitamente y avisar si no sirve |
-| Un usuario abusa y bloquea a todos | `Rack::Attack` insertado antes de `RemoteIp`: `request.ip` es la IP del balanceador | `insert_after ActionDispatch::RemoteIp` (`config/application.rb:52`) + `trusted_proxies` |
-| Un job procesa un registro que no existe | `perform_later` dentro de una transacción que después hizo rollback | `enqueue_after_transaction_commit = :always`; para eventos que no se pueden perder, outbox |
+| Un usuario abusa y bloquea a todos | `Rack::Attack` insertado antes de `RemoteIp`: `request.ip` es la IP del balanceador | `move_after ActionDispatch::RemoteIp, Rack::Attack` (`config/application.rb:64`) + `trusted_proxies` |
+| Un job procesa un registro que no existe | `perform_later` dentro de una transacción que después hizo rollback | `self.enqueue_after_transaction_commit = true` en `ApplicationJob` (en un initializer es un **no-op** en Rails 8.1); para eventos que no se pueden perder, outbox |
 | La cola se tapa y los jobs buenos no entran | Poison message reintentado infinito, o `retry_on` para todo | `rescue` por ítem + `mark_failed!`, `discard_on` para errores permanentes, DLQ |
 | El evento salió pero el estado no cambió (o al revés) | Dual write: base y broker sin transacción común | Outbox: el evento se escribe en la misma transacción y un relay lo publica |
-| Un endpoint nuevo queda abierto a todo el mundo | Alguien se olvidó de `authorize` | `verify_authorized` en `after_action` + `Scope#resolve = scope.none` por defecto |
+| Un endpoint nuevo queda abierto a todo el mundo | Alguien se olvidó de `authorize` | `verify_authorized` en `after_action` —en la API **y** en la UI web— + `Scope#resolve = scope.none` por defecto |
 | Un listado devuelve el mismo producto dos veces | Orden por columna no única sin desempate | Desempatar siempre por `id` (`SORTS` en `app/queries/products/search.rb:25-30`) |
 | Página 1 vuela, página 5000 tarda segundos | `OFFSET` grande | Keyset pagination con comparación de tuplas |
 | El endpoint tarda 6 s con 200 productos | N+1 de agregación; `includes` no lo arregla | Una query con `GROUP BY` y pasar el resultado precalculado al serializer |
@@ -1423,8 +1635,41 @@ Cada uno con el **síntoma** (lo que reporta el usuario o el monitoreo) y el
 | El RSS sube y no baja, sin leak de objetos | Fragmentación del allocator de C | `MALLOC_ARENA_MAX=2` o jemalloc; reiniciar workers por RSS |
 | Un campo interno nuevo aparece en la API pública | `render json: modelo` serializa todas las columnas | Serializers POROs explícitos |
 | El valor que guardaste "no se guardó" y no hubo error | Escribiste una columna **generada**: Rails la excluye del UPDATE y no avisa | Nunca asignarla; `reload` después de escribir para leerla |
-| Un job recurrente corre 10 veces por noche | `crontab` replicado en 10 servidores | Scheduler con líder único (`config/recurring.yml` de Solid Queue) |
+| Un job recurrente corre 10 veces por noche | `crontab` replicado en 10 servidores | Scheduler con un solo disparo garantizado por la base: `solid_queue_recurring_executions` tiene un índice único sobre `(task_key, run_at)` — **no** hay elección de líder (`config/recurring.yml`) |
 | El reporte diario salió con 3 horas de diferencia | La zona horaria del scheduler es `Time.zone` de la app | Fijar `config.time_zone` explícitamente y pensar el cron en esa zona |
+
+### Y los que encontramos en ESTE repo, escribiendo la documentación
+
+La tabla de arriba es el catálogo del dominio. Esta es la lista corta de los
+defectos que aparecieron **verificando estos documentos contra el código**, y que
+para una entrevista valen más, porque los podés contar en primera persona: qué se
+veía, cómo se detectó, cómo quedó. **Todos están corregidos.**
+
+| Bug (estuvo vivo acá) | Cómo se veía | Cómo quedó |
+|---|---|---|
+| `bullet` sólo en `group :development` | La constante `Bullet` no existía en test: los ejemplos `:n_plus_one` pasaban en verde **hubiera o no** un N+1 | Gema en `:development, :test`; config en `config/environments/test.rb`; meta-test con control positivo en `spec/n_plus_one_guard_spec.rb` |
+| N+1 en los serializers de órdenes de compra y transferencias | Una query por línea al tocar `line.product` | `ActiveRecord::Associations::Preloader` en el método privado `serialize`, no `includes` al buscar (los caminos de error cortan antes); `preload:` en `StockMovements::Ledger` |
+| `find_or_provision!` rescataba `RecordNotUnique` dentro de una transacción ya abortada | El `rescue` no podía hacer nada: la query siguiente moría con `PG::InFailedSqlTransaction` | `transaction(requires_new: true)` (SAVEPOINT) + rescate de `RecordInvalid`; regresión con otra conexión en `spec/models/stock_item_spec.rb` |
+| `config.active_job.enqueue_after_transaction_commit = :always` en un initializer | No-op silencioso en Rails 8.1: parecía configurado y no lo estaba | `self.enqueue_after_transaction_commit = true` en `app/jobs/application_job.rb:65` |
+| Throttle `logins/email` leyendo el param anidado | El discriminador daba `nil` y el límite **no existía**; sin error ni warning | Lee `req.params["email_address"]` con fallback al anidado y normaliza; tests en `spec/requests/api/v1/rate_limiting_spec.rb` |
+| Fuerza bruta de tokens de API sin techo | El 401 corta los callbacks, así que la capa 2 nunca corría, y cada token probado estrenaba su balde de 1000/hora | `Fail2Ban` por IP sobre los fallos de auth + `record_authentication_failure!` en `Api::TokenAuthentication` |
+| `rate_limit` del login sin `by:` | Contaba sólo por IP | Cuenta por IP + email (`app/controllers/sessions_controller.rb:18`) |
+| `find_session_by_cookie` con `Session.find_by` pelado | Una sesión **vencida** seguía autenticando, en la web y en el WebSocket | `Session.active.find_by` en `Authentication` y en `ApplicationCable::Connection`; `spec/requests/session_expiry_spec.rb` |
+| `paginate` sin techo | `?limit=1000000` era un DoS de una línea: un millón de objetos AR instanciados | `MAX_PAGE_SIZE = 100` y `page_limit` con `clamp` (`app/controllers/api/v1/base_controller.rb:142-154`) |
+| Sin `rescue_from` para `BadRequest` / `ParseError` | Un JSON malformado devolvía una página HTML de error desde una API JSON | 400 en JSON (`app/controllers/concerns/api/error_handling.rb:37-38`) |
+| `Result` de `:duplicate` con el `e.message` de `PG::UniqueViolation` | El 409 le filtraba al cliente el nombre del índice, la tabla y el valor que colisionó | Mensaje genérico afuera, detalle completo al log (`app/services/application_service.rb`) |
+| `Api::Idempotency` dejaba la fila en `processing` si la acción levantaba | La clave quedaba **quemada 24 h**: todo reintento recibía 409 | `rescue/else`. El `ensure` **no** alcanza: corre mientras la excepción sube, o sea **antes** de que el `rescue_from` renderice, y ahí `response.status` todavía es 200 |
+| Faltaba `StockReservationPolicy` | `GET /api/v1/reservations` devolvía **500 siempre** y ningún spec lo tocaba | Policy creada + `spec/requests/api/v1/endpoint_coverage_spec.rb`, que recorre todas las rutas y falla ante cualquier 5xx |
+| `Rack::Attack` montado dos veces | Un frame de middleware de más por request; la pila mentía | `config.middleware.move_after` (`delete` + `insert_after` **no** funciona) |
+| CSP entera comentada, con `csp_meta_tag` en el layout | La etiqueta estaba, la política no | Política real en report-only, se endurece con `CSP_ENFORCE=1` |
+| Sin índice para el ledger **global** | Seq Scan + Sort sobre la tabla que más crece | `index_stock_movements_global_ledger` `(occurred_at DESC, id DESC)`, creado `CONCURRENTLY` |
+| Policies que mezclaban permiso con estado | Devolvían **403** donde correspondía **422**: "no tenés permiso" por una orden ya recibida | `PurchaseOrderPolicy` y `StockTransferPolicy` responden sólo por rol; el estado lo valida el modelo/service y sale como `invalid_transition` → 422 |
+
+Si te preguntan "contame un bug que hayas encontrado vos", cualquiera de estos
+sirve, y los tres mejores son los de **falla silenciosa**: el detector de N+1 que
+no detectaba, el rate limit que no limitaba y la opción de configuración que no
+configuraba. Los tres se ven exactamente igual que el sistema sano — y por eso los
+tres terminaron con un test que verifica que la herramienta **está activa**.
 
 ---
 
@@ -1488,7 +1733,10 @@ Cada uno con el **síntoma** (lo que reporta el usuario o el monitoreo) y el
 **"¿Qué hacés en los primeros 30 días en un sistema legacy que no conocés?"**
 
 > Primero, hacer que el sistema me hable: `pg_stat_statements`, logs estructurados,
-> APM y `bullet` en test si no está. No toco nada hasta poder medir.
+> APM y `bullet` en test si no está. Y ojo con el "si no está": hay que verificar
+> que las herramientas **funcionen**, no que estén en el `Gemfile` — acá me pasó
+> exactamente eso con Bullet, que estaba declarado y no corría en test. No toco
+> nada hasta poder medir de verdad.
 >
 > Segundo, buscar las invariantes que **no** están en la base: un `validates_uniqueness_of`
 > sin índice único, un saldo sin CHECK, una escritura de dinero en Float. Ese es el

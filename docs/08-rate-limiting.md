@@ -12,6 +12,16 @@ los números que ves salieron de correr la app en `localhost:3001` con Redis
 7.0.15 y de leer el código de `actionpack-8.1.3.1` y `rack-attack-6.8.0`
 instalados en esta máquina. Cuando digo "corta en la request 21", lo corrí.
 
+> **Sobre los bugs que vas a leer acá.** Escribiendo este documento aparecieron
+> cuatro defectos reales del repo: el throttle `logins/email` estaba muerto
+> (§4.4), la enumeración de tokens de API no tenía freno (§8.3), `Rack::Attack`
+> quedaba montado dos veces en el stack (§2.2) y el comentario del responder
+> citaba una RFC equivocada (§9). **Los cuatro ya están corregidos**, con test de
+> regresión donde correspondía. No los saqué del documento: el bug, cómo se
+> detectó y cómo se arregló vale mucho más que el código limpio solo — es
+> exactamente lo que te van a preguntar. Cuando leas un bug acá, está en pasado y
+> termina con cómo quedó.
+
 Venís de Java: el mapa mental es Bucket4j + Resilience4j + el
 `RequestRateLimiter` de Spring Cloud Gateway. Te marco dónde la analogía se
 rompe, que es donde se cometen los errores.
@@ -111,18 +121,20 @@ un endpoint *barato*. En `/api/v1/reports/valuation` (una agregación sobre todo
 el inventario) la diferencia es de otro orden.
 
 El `Server-Timing` que devuelve el 429 de Rack::Attack lo confirma desde
-adentro:
+adentro (remedido con el repo en su estado actual):
 
 ```text
-server-timing: cache_read.active_support;dur=0.30, cache_increment.active_support;dur=0.43,
-               throttle.rack_attack;dur=0.14, rack.attack;dur=0.00
-x-runtime: 0.001452
+server-timing: cache_read.active_support;dur=0.93, cache_increment.active_support;dur=0.64,
+               throttle.rack_attack;dur=0.21, rack.attack;dur=0.00
+x-runtime: 0.002924
 ```
 
-1,45 ms de tiempo Rails total, de los cuales 0,73 ms son las dos idas a Redis:
-el `cache_read` es el chequeo de ban del `Fail2Ban` de la blocklist y el
-`cache_increment` es el contador del throttle. El resto del stack (routing,
-controller, ActiveRecord, vistas) ni se ejecutó.
+2,9 ms de tiempo Rails total, de los cuales 1,57 ms son las idas a Redis: los
+`cache_read` son los chequeos de ban de los **dos** `Fail2Ban` de la blocklist
+—el de escáneres y el de fuerza bruta de tokens (§8.3)— y el `cache_increment` es
+el contador del throttle. El resto del stack (routing, controller, ActiveRecord,
+vistas) ni se ejecutó. Fijate el precio de haber tapado el agujero de §8.3: un
+`cache_read` más por request en el borde. Barato, pero no gratis.
 
 ### 2.1 Por qué este repo necesita las DOS capas
 
@@ -169,9 +181,9 @@ duplicar la autenticación en el middleware. Esa resolución son dos `SELECT`
 `UPDATE` de `ApiToken#touch_usage!` (`app/models/api_token.rb:77-81`). Y a la
 inversa: la capa 2 nunca ve
 un request con un token inválido, porque `authenticate_api_token!` ya devolvió
-401 y cortó la cadena (esto tiene una consecuencia fea; ver §8.3).
+401 y cortó la cadena (eso tuvo una consecuencia fea, ya tapada; ver §8.3).
 
-### 2.2 El stack real, y una sorpresa
+### 2.2 El stack real, y una sorpresa que ya está corregida
 
 ```bash
 $ bin/rails middleware
@@ -186,18 +198,19 @@ use Rack::Runtime
 use Rack::MethodOverride
 use ActionDispatch::RequestId
 use ActionDispatch::RemoteIp
-use Rack::Attack                      ← el nuestro (config/application.rb:52)
+use Rack::Attack                      ← el nuestro, UNA sola vez (config/application.rb:64)
 use Propshaft::QuietAssets
 use Rails::Rack::Logger
 ...
+use Rack::ETag
 use Rack::TempfileReaper
-use Rack::Attack                      ← ¿¿otra vez??
-use Bullet::Rack
-run Stock::Application.routes
+run Stock::Application.routes         ← y acá abajo ya no hay un segundo Rack::Attack
 ```
 
-`Rack::Attack` aparece **dos veces**. No es un bug del repo: la gema trae un
-railtie que se agrega solo al final del stack.
+Hoy hay **un** `Rack::Attack`, justo después de `RemoteIp`. **Antes había dos**, y
+vale la pena entender el mecanismo porque se repite con otras gemas.
+
+`rack-attack` trae un railtie que lo monta solo, al final del stack:
 
 ```ruby
 # rack-attack-6.8.0/lib/rack/attack/railtie.rb
@@ -206,8 +219,14 @@ initializer "rack-attack.middleware" do |app|
 end
 ```
 
-Y `config/application.rb:52` inserta una segunda instancia en la posición
-correcta. ¿Por qué no cuenta doble? Por esta guarda:
+y `config/application.rb` hacía **además** un `insert_after` para ponerlo en la
+posición correcta. Resultado: dos instancias.
+
+```text
+antes:  ... RequestId, RemoteIp, Attack, Logger, ... TempfileReaper, Attack   ← ¿¿otra vez??
+```
+
+¿Por qué no contaba doble? Por esta guarda:
 
 ```ruby
 # rack-attack-6.8.0/lib/rack/attack.rb:104-107
@@ -218,18 +237,18 @@ def call(env)
   ...
 ```
 
-La primera instancia (la de después de `RemoteIp`) marca el `env` y la segunda es
-un passthrough. Funciona, pero es una capa de cebolla fantasma, y es exactamente
-el tipo de cosa que te hace perder tres horas el día que cambie el comportamiento
-entre versiones.
+La primera instancia (la de después de `RemoteIp`) marcaba el `env` y la segunda
+era un passthrough. Funcionaba, pero era un frame de Rack inútil en cada request
+y una capa de cebolla fantasma: exactamente el tipo de cosa que te hace perder
+tres horas el día que cambie el comportamiento entre versiones.
 
-**Cómo se saca la duplicada, y por qué la solución obvia falla.** La clave está en
-cómo Rails aplica las operaciones sobre el stack:
-`Rails::Configuration::MiddlewareStackProxy` guarda **dos** listas —
-`@operations` y `@delete_operations`— y `merge_into` corre **primero todas las
-operaciones y después todas las de borrado** (`railties-8.1.3.1/lib/rails/configuration.rb:88-94`).
-`delete`, `move_before` y `move_after` van en la segunda lista; `use`,
-`insert_before` e `insert_after` en la primera.
+**Por qué la solución obvia falla.** La clave está en cómo Rails aplica las
+operaciones sobre el stack: `Rails::Configuration::MiddlewareStackProxy` guarda
+**dos** listas —`@operations` y `@delete_operations`— y `merge_into` corre
+**primero todas las operaciones y después todas las de borrado**
+(`railties-8.1.3.1/lib/rails/configuration.rb:88-94`). `delete`, `move_before` y
+`move_after` van en la segunda lista; `use`, `insert_before` e `insert_after` en
+la primera.
 
 O sea que un `config.middleware.delete Rack::Attack` **no** corre antes que el
 railtie: corre *al final de todo*, y como `MiddlewareStack#delete` usa `reject!`
@@ -237,24 +256,24 @@ railtie: corre *al final de todo*, y como `MiddlewareStack#delete` usa `reject!`
 **las dos**. Simulado con el stack real:
 
 ```text
-hoy (insert_after):     RequestId, RemoteIp, Attack, Logger, TempfileReaper, Attack
+antes (insert_after):   RequestId, RemoteIp, Attack, Logger, TempfileReaper, Attack
 insert_after + delete:  RequestId, RemoteIp, Logger, TempfileReaper       ← ¡ninguna!
-sólo move_after:        RequestId, RemoteIp, Attack, Logger, TempfileReaper
+sólo move_after (hoy):  RequestId, RemoteIp, Attack, Logger, TempfileReaper
 ```
 
-La receta que funciona es la tercera: **borrá el `insert_after` de
-`application.rb:52` y dejá sólo `move_after`**, que mueve la instancia que puso
-el railtie en vez de agregar otra.
+**Cómo quedó.** Se borró el `insert_after` y quedó sólo `move_after`, que mueve la
+instancia que ya puso el railtie en vez de agregar otra:
 
 ```ruby
-# config/application.rb — reemplazo del insert_after
+# config/application.rb:64
 config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
 ```
 
 Funciona porque `move_after` está en `@delete_operations` (corre después del
 `use` del railtie) y `MiddlewareStack#move_after` saca **una** sola instancia
 (`delete_at` sobre el primer índice) y la reinserta en la posición pedida. Queda
-un único `Rack::Attack`, justo después de `RemoteIp`. Y siempre: **verificalo con
+un único `Rack::Attack`, justo después de `RemoteIp` — que es lo que imprime el
+`bin/rails middleware` de arriba. Y siempre: **verificalo con
 `bin/rails middleware`**, que es la única fuente de verdad del stack armado.
 
 > **Analogía Java y dónde se rompe.** El stack Rack es la `FilterChain` de
@@ -652,13 +671,13 @@ el balanceador, el límite por IP deja de existir.
   reparte entre sus tokens. Si limitás por token, el cliente evade la cuota
   emitiendo 50 tokens.
 - **Por endpoint**: los límites por costo. `api/writes` en
-  `config/initializers/rack_attack.rb:208` hace justamente eso (120/min para
+  `config/initializers/rack_attack.rb:250-255` hace justamente eso (120/min para
   todo lo que no sea `GET`/`HEAD`, contra 1000/hora para el total).
 
 En capa 1 no tenés el `id` del token, así que el repo usa el **hash** del token:
 
 ```ruby
-# config/initializers/rack_attack.rb:193-203
+# config/initializers/rack_attack.rb:211-221
 throttle("api/token", limit: 1_000, period: 1.hour) do |req|
   next unless req.path.start_with?("/api/")
 
@@ -697,7 +716,7 @@ end
 ```
 
 O sea: el `.downcase.strip` que hace el bloque de `logins/email`
-(`config/initializers/rack_attack.rb:178`) es **redundante** — pero dejarlo
+(`config/initializers/rack_attack.rb:193`) es **redundante** — pero dejarlo
 explícito está bien, porque el normalizador es global y alguien lo puede
 desactivar.
 
@@ -712,7 +731,7 @@ distintas** y ningún límite solo cubre las dos:
 | **Credential stuffing** | 1 IP, 10.000 cuentas, 1 clave c/u | ✓ sí | ✗ no (1 intento por email) |
 | **Ataque distribuido a 1 cuenta** | 5.000 IPs, 1 cuenta, 2 claves c/u | ✗ no (2 por IP) | ✓ sí |
 
-El repo declara los dos (`config/initializers/rack_attack.rb:170-180`):
+El repo declara los dos (`config/initializers/rack_attack.rb:170-204`):
 
 ```ruby
 throttle("logins/ip", limit: 5, period: 20.seconds) do |req|
@@ -721,18 +740,28 @@ end
 
 throttle("logins/email", limit: 6, period: 15.minutes) do |req|
   if req.path == "/session" && req.post?
+    email = req.params["email_address"] || req.params.dig("session", "email_address")
+    email&.to_s&.downcase&.strip&.presence
+  end
+end
+```
+
+**Y el segundo estuvo MUERTO.** Éste fue el bug más interesante del repo, y es
+del tipo que no falla nunca: falla en silencio, para siempre. Así estaba escrito:
+
+```ruby
+# ANTES — el discriminador daba nil en todos los requests reales
+throttle("logins/email", limit: 6, period: 15.minutes) do |req|
+  if req.path == "/session" && req.post?
     req.params.dig("session", "email_address")&.to_s&.downcase&.strip&.presence
   end
 end
 ```
 
-**Y el segundo no funciona.** Este es el bug real más interesante del repo, y es
-del tipo que no falla nunca: falla en silencio, para siempre.
-
 El formulario de login (`app/views/sessions/new.html.erb:7`) es
 `form_with url: session_path` — **sin modelo**, o sea **sin scope**. Los campos
 se serializan planos: `email_address=...&password=...`. No hay ningún
-`params["session"]`. El `dig("session", "email_address")` devuelve `nil`
+`params["session"]`. El `dig("session", "email_address")` devolvía `nil`
 siempre, y un discriminador `nil` hace que `Rack::Attack::Throttle#matched_by?`
 retorne `false` sin contar nada:
 
@@ -742,37 +771,78 @@ discriminator = discriminator_for(request)
 return false unless discriminator
 ```
 
-Comprobado con `curl`, mirando qué claves aparecen en Redis:
+**Cómo se detectó:** con `curl`, mirando qué claves aparecían en Redis.
 
 ```bash
-# Con params ANIDADOS (lo que el throttle espera):
+# Con params ANIDADOS (lo que el throttle esperaba):
 $ curl -X POST localhost:3001/session --data-urlencode "session[email_address]=Ana@Empresa.com " -d "session[password]=x"
 $ redis-cli --scan --pattern '*'
-rack-attack:rack::attack:1986792:logins/email:ana@empresa.com   ← existe
+rack-attack:rack::attack:1986792:logins/email:ana@empresa.com   ← existía
 rack-attack:rack::attack:5960376:req/ip:127.0.0.1
 rack-attack:rack::attack:89405649:logins/ip:127.0.0.1
 
 # Con params PLANOS (lo que manda el formulario real):
 $ curl -X POST localhost:3001/session -d "email_address=Ana@Empresa.com&password=x"
 $ redis-cli --scan --pattern '*'
-rack-attack:rack::attack:5960376:req/ip:127.0.0.1               ← el de email NO aparece
+rack-attack:rack::attack:5960376:req/ip:127.0.0.1               ← el de email NO aparecía
 rack-attack:rack::attack:89405649:logins/ip:127.0.0.1
 ```
 
-(De paso se ve la normalización funcionando: `"Ana@Empresa.com "` → clave
-`ana@empresa.com`.)
+**Cómo quedó.** El bloque lee `req.params["email_address"]` y deja el anidado
+como *fallback*, para que siga andando si mañana el form pasa a
+`form_with model:`. Corrido de nuevo contra la app, con los params planos del
+formulario real:
 
-El arreglo es de una línea —`req.params["email_address"]`— pero la lección es
-más grande: **un discriminador `nil` desactiva el throttle sin un solo warning**.
-Lo mismo pasa con `password-resets/email`
-(`config/initializers/rack_attack.rb:184-186`), que lee
+```bash
+$ curl -X POST localhost:3001/session -d "email_address=Ana@Empresa.com&password=x"
+$ redis-cli --scan --pattern '*'
+rack-attack:rack::attack:1986811:logins/email:ana@empresa.com   ← ahora SÍ aparece
+rack-attack:rack::attack:5960434:req/ip:127.0.0.1
+rack-attack:rack::attack:89406513:logins/ip:127.0.0.1
+```
+
+(De paso se ve la normalización funcionando: `"Ana@Empresa.com"` → clave
+`ana@empresa.com`. La forma anidada genera exactamente la misma clave; lo probé
+con las dos.)
+
+Lo mismo pasaba con `password-resets/email`
+(`config/initializers/rack_attack.rb:199-204`), que leía
 `params.dig("password", "email_address")` mientras
 `app/views/passwords/new.html.erb:8-10` también usa `form_with url:` sin modelo y
-manda `email_address` plano.
+manda `email_address` plano. Quedó arreglado igual, con el mismo fallback.
 
-Cómo se detecta: **nunca declares un throttle nuevo sin verificar que la clave
-aparece en el store.** Un `redis-cli --scan` después de un request de prueba es
-el smoke test entero.
+Y quedaron **dos tests de regresión**
+(`spec/requests/api/v1/rate_limiting_spec.rb:82-104`), que es la parte que de
+verdad importa: sin ellos el bug vuelve en el próximo refactor del formulario.
+
+```ruby
+it "limita los intentos contra UNA CUENTA aunque cambie la IP" do
+  # 7 intentos desde IPs distintas contra el mismo email. El límite por IP
+  # (5) no los agarra porque cada IP hace uno solo; el límite por email sí.
+  7.times do |i|
+    post "/session",
+         params: { email_address: "victima@stock.test", password: "intento#{i}" },
+         headers: { "REMOTE_ADDR" => "203.0.113.#{i + 1}" }
+  end
+
+  expect(response).to have_http_status(:too_many_requests)
+  expect(response.headers["RateLimit-Limit"]).to eq("6")
+end
+```
+
+Fijate el diseño del test: **usa IPs distintas a propósito**. Si los siete
+intentos salieran de la misma IP, el que cortaría sería `logins/ip` y el test
+daría verde con el throttle de email todavía muerto (§7.2: `throttled?` hace
+short-circuit y el primero que matchea gana). Un test de regresión de un throttle
+tiene que aislar el throttle que quiere probar. El segundo test cubre la
+normalización: siete intentos alternando `Victima@Stock.test`,
+`VICTIMA@STOCK.TEST` y `victima@stock.test` caen todos en la misma clave.
+
+El arreglo era de una línea, pero la lección es más grande: **un discriminador
+`nil` desactiva el throttle sin un solo warning**. De ahí la regla operativa:
+**nunca declares un throttle nuevo sin verificar que la clave aparece en el
+store.** Un `redis-cli --scan` después de un request de prueba es el smoke test
+entero.
 
 ---
 
@@ -895,7 +965,7 @@ un store casero, sí.
 ### 5.3 Por qué Solid Cache (Postgres) no va acá
 
 Este repo usa Solid Cache como `Rails.cache` en desarrollo y producción
-(`config/environments/development.rb:32`, `config/environments/production.rb:50`),
+(`config/environments/development.rb:32`, `config/environments/production.rb:63`),
 y está bien para cachear reportes. Para contadores de rate limiting **no**:
 
 - Es **una escritura por request** contra tu base principal (o su base de
@@ -929,8 +999,8 @@ SessionsController.cache_store                => SolidCache::Store
 O sea: la capa 1 queda con contadores **por proceso** (§5.1) y la capa 2 queda
 contando sobre **Postgres**, que es justamente lo que este apartado desaconseja.
 Peor todavía: `SessionsController` y `PasswordsController` declaran su
-`rate_limit` **sin `store:`** (`app/controllers/sessions_controller.rb:5`,
-`app/controllers/passwords_controller.rb:4`), así que usan
+`rate_limit` **sin `store:`** (`app/controllers/sessions_controller.rb:18-20`,
+`app/controllers/passwords_controller.rb:6`), así que usan
 `config.action_controller.cache_store` — Solid Cache — pase lo que pase con
 `REDIS_URL`. El límite de login de la UI cuenta contra tu base de datos.
 
@@ -975,7 +1045,7 @@ Redis se cae. ¿Qué hacés?
 Este repo elige **fail open**, y en dos lugares distintos:
 
 ```ruby
-# config/initializers/rack_attack.rb:79-83 — explícito
+# config/initializers/rack_attack.rb:79-82 — explícito
 error_handler: ->(method:, returning:, exception:) {
   Rails.logger.error("[RackAttack] Redis caído (#{method}): #{exception.class}")
 },
@@ -1141,7 +1211,7 @@ Regla dura: **cada CIDR que agregás es un agujero potencial.** Si confiás en
 ### 6.3 El bug del orden del middleware
 
 El instinto es `insert_before 0`: cortar lo antes posible. Es la trampa que
-documenta `config/application.rb:33-52`, y es un bug real y sutil.
+documenta `config/application.rb:31-63`, y es un bug real y sutil.
 
 `Rack::Attack::Request` hereda de `Rack::Request`, que **no tiene `remote_ip`**:
 tiene `ip`, que es la IP del **peer TCP**. Detrás de un balanceador, el peer TCP
@@ -1149,11 +1219,12 @@ es el balanceador. Resultado: **todos tus usuarios comparten un contador** y el
 primero que haga 300 requests deja afuera al planeta. En tus dashboards se ve
 como "el sitio anda mal para todos" y el rate limiter ni figura como sospechoso.
 
-Por eso el repo inserta **después** de `RemoteIp`:
+Por eso el repo monta el middleware **después** de `RemoteIp` — con
+`move_after`, no `insert_after`, por lo de §2.2:
 
 ```ruby
-# config/application.rb:52
-config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
+# config/application.rb:64
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
 ```
 
 y expone la IP resuelta con un monkey patch mínimo:
@@ -1208,7 +1279,8 @@ En el repo (`config/initializers/rack_attack.rb`):
 
 ```ruby
 safelists  = ["permitir health checks", "permitir assets", "permitir red interna"]
-blocklists = ["bloquear escaneo de vulnerabilidades"]
+blocklists = ["bloquear escaneo de vulnerabilidades",
+              "bloquear fuerza bruta de tokens de API"]   # ← agregada al tapar §8.3
 throttles  = ["req/ip", "logins/ip", "logins/email", "password-resets/email",
               "api/token", "api/writes"]
 tracks     = ["api/heavy-reports"]
@@ -1218,7 +1290,7 @@ El safelist de health checks (`:99-101`) no es una optimización, es una
 **precondición de disponibilidad**: si limitás `/up`, el balanceador ve fallar el
 health check, saca la instancia de rotación, la carga se concentra en las que
 quedan, y el rate limiter te tira el servicio abajo solo. Hay un test que lo
-fija (`spec/requests/api/v1/rate_limiting_spec.rb:98-101`: 400 GET a `/up`,
+fija (`spec/requests/api/v1/rate_limiting_spec.rb:142-145`: 400 GET a `/up`,
 todos 200).
 
 ### 7.2 Detalle fino: `throttled?` hace short-circuit
@@ -1271,10 +1343,13 @@ end
   baneado a partir de ahí. Es "rate limiting con castigo largo": ideal para
   scraping, donde la request individual es legítima y lo sospechoso es el patrón.
 
-El repo usa `Fail2Ban` contra escáneres (`config/initializers/rack_attack.rb:126-133`):
-3 sondas de `/wp-admin`, `/.env`, `/.git` o `..` en 10 minutos ⇒ 1 hora de ban
-total. Verificado por test: `GET /.env` ⇒ 403
-(`spec/requests/api/v1/rate_limiting_spec.rb:93-96`).
+El repo usa `Fail2Ban` en **dos** lugares. Contra escáneres
+(`config/initializers/rack_attack.rb:126-133`): 3 sondas de `/wp-admin`, `/.env`,
+`/.git` o `..` en 10 minutos ⇒ 1 hora de ban total. Verificado por test:
+`GET /.env` ⇒ 403 (`spec/requests/api/v1/rate_limiting_spec.rb:137-140`). Y contra
+la fuerza bruta de tokens de la API (`config/initializers/rack_attack.rb:239-245`),
+que es el arreglo de §8.3 — ahí está explicado, con el filo que le quedó
+justamente por este `true` de `fail!`.
 
 Ojo con dos cosas:
 
@@ -1295,7 +1370,7 @@ Rack. Los datos del match están en `env["rack.attack.match_data"]`, que arma
 { discriminator:, count:, period:, limit:, epoch_time: }
 ```
 
-El del repo (`config/initializers/rack_attack.rb:230-254`) calcula el
+El del repo (`config/initializers/rack_attack.rb:278-302`) calcula el
 `Retry-After` a partir de la alineación de la ventana fija:
 
 ```ruby
@@ -1320,7 +1395,7 @@ ratelimit-reset: 17
 ```
 
 Fijate que el body es **JSON**, no una página de error HTML. Es deliberado y
-tiene test (`spec/requests/api/v1/rate_limiting_spec.rb:86-91`): el cliente de
+tiene test (`spec/requests/api/v1/rate_limiting_spec.rb:130-135`): el cliente de
 una API tiene que poder parsear el error con el mismo código con el que parsea
 todo lo demás. Un 429 que devuelve HTML rompe el parser del cliente y le tapa la
 causa real.
@@ -1343,7 +1418,7 @@ end
 
 Los nombres reales son `throttle.rack_attack`, `blocklist.rack_attack`,
 `track.rack_attack`, `safelist.rack_attack`. El repo se suscribe con un regex y
-filtra por tipo (`config/initializers/rack_attack.rb:268-284`):
+filtra por tipo (`config/initializers/rack_attack.rb:316-332`):
 
 ```ruby
 ActiveSupport::Notifications.subscribe(/rack_attack/) do |name, _start, _finish, _id, payload|
@@ -1509,7 +1584,7 @@ no hay forma de deducirlo. Regla: **si en una jerarquía de controllers hay más
 un `rate_limit`, `name:` es obligatorio.** El propio docstring de Rails lo dice
 (`rate_limiting.rb:37-38`), pero como advertencia, no como validación.
 
-### 8.3 Orden respecto de la autenticación (y un agujero)
+### 8.3 Orden respecto de la autenticación (y el agujero que dejaba)
 
 En `BaseController`, `include Api::TokenAuthentication` (línea 15) registra
 `before_action :authenticate_api_token!` **antes** de que la línea 75 registre el
@@ -1519,7 +1594,7 @@ En `BaseController`, `include Api::TokenAuthentication` (línea 15) registra
 
 La contra, verificada: **un request con token inválido nunca llega al rate
 limiter**. `authenticate_api_token!` hace `render` y corta la cadena. Tres
-requests con tokens falsos:
+requests con tokens falsos, cuando esto todavía no estaba tapado:
 
 ```bash
 $ curl -H "Authorization: Bearer stk_token_falso_numero_1" localhost:3001/api/v1/reports/reconciliation
@@ -1534,45 +1609,124 @@ rack-attack:rack::attack:29801884:api/heavy-reports:127.0.0.1 => 3
 ```
 
 Y peor: mirá los tres `api/token` distintos. El throttle de capa 1 discrimina por
-**hash del token**, así que **cada token adivinado estrena su propio balde de
-1000/hora**. La única barrera real contra la enumeración de tokens es
+**hash del token**, así que **cada token adivinado estrenaba su propio balde de
+1000/hora**. La única barrera real contra la enumeración de tokens era
 `req/ip: 300/5min` — 3.600 intentos por hora por IP, y sin agregación IPv6 (§4.1)
 eso es efectivamente infinito.
 
-El arreglo: un throttle específico para **requests que fallan la
-autenticación**, discriminado por IP (o `/64`), tipo `Allow2Ban` con un ban
-largo. Es el mismo razonamiento que el límite de login por IP, aplicado a la API.
-
-### 8.4 `SessionsController`: leé el código, no el comentario
+**Cómo quedó.** El problema de fondo es que `Rack::Attack` corre *antes* del
+controller: no tiene el status de la respuesta, así que no puede saber si el
+token era válido. La solución son dos piezas que se hablan por el cache de
+`Rack::Attack`. El controller **marca** el fallo, que es el único que sabe que lo
+hubo:
 
 ```ruby
-# app/controllers/sessions_controller.rb:3-6
+# app/controllers/concerns/api/token_authentication.rb:74-82
+def record_authentication_failure!
+  key = "api-auth-failed:#{request.remote_ip}"
+  Rack::Attack.cache.write(key, 1, 5.minutes)
+rescue StandardError => e
+  # Si el store está caído, NO rompemos el request: el 401 se devuelve igual.
+  Rails.logger.warn("[Auth] no se pudo registrar el fallo de autenticación: #{e.message}")
+end
+```
+
+y el middleware la **lee en el request siguiente**:
+
+```ruby
+# config/initializers/rack_attack.rb:239-245
+blocklist("bloquear fuerza bruta de tokens de API") do |req|
+  Rack::Attack::Fail2Ban.filter("api-auth-fail-#{req.remote_ip}",
+                                maxretry: 10, findtime: 5.minutes, bantime: 1.hour) do
+    Rack::Attack.cache.read("api-auth-failed:#{req.remote_ip}").present?
+  end
+end
+```
+
+El `rescue StandardError` no es decorativo: **la instrumentación puede fallar
+abierta, la autenticación no**. Si Redis se cae, el 401 se devuelve igual y sólo
+se pierde el conteo.
+
+Corrido contra la app, 12 requests con tokens inventados desde la misma IP:
+
+```text
+ 1 -> 401     4 -> 403     7 -> 403    10 -> 403
+ 2 -> 403     5 -> 403     8 -> 403    11 -> 403
+ 3 -> 403     6 -> 403     9 -> 403    12 -> 403
+```
+
+```bash
+$ redis-cli --scan --pattern '*'
+rack-attack:rack::attack:api-auth-failed:127.0.0.1                    ← la marca del controller
+rack-attack:rack::attack:5960434:fail2ban:count:api-auth-fail-127...  ← el contador de Fail2Ban
+rack-attack:rack::attack:fail2ban:ban:api-auth-fail-127.0.0.1         ← el ban de 1 hora
+```
+
+Test de regresión: `spec/requests/api/v1/rate_limiting_spec.rb:106-118` ("bloquea
+la fuerza bruta de tokens de API por IP"), que exige **403** —o sea blocklist— y
+no 401. Fijate que la aserción es sobre el *código distinto*: si sólo pidiera "no
+200", el test pasaría con el agujero abierto.
+
+**El filo que le quedó, y hay que saberlo.** Mirá la corrida de arriba: el 403
+aparece en el request **2**, no en el 11. Son dos cosas sumadas, las dos de §7.3:
+
+1. `Fail2Ban#fail!` devuelve `true`, así que **el request que dispara el filtro
+   también se bloquea**. No es "cuenta y a la décima banea": bloquea desde el
+   primer match, y `maxretry` sólo decide cuándo se convierte en ban de una hora.
+2. La marca `api-auth-failed:<ip>` vive 5 minutos y **nadie la consume**. Mientras
+   esté puesta, *cualquier* request de esa IP matchea — incluso uno con un token
+   perfectamente válido. Lo comprobé: un 401 y después un request con un token
+   bueno desde la misma IP devuelve 403.
+
+O sea que la semántica real es "un fallo de autenticación deja a esa IP afuera de
+la API por lo que le quede a la marca (≤ 5 min); a los 10 matches, una hora". Para
+una API de integración es agresivo, y con una IP de CGNAT castiga a terceros
+(§7.3, segundo bullet). Si querés la semántica que sugiere el comentario —"pasan
+hasta el décimo, después banea"— la primitiva correcta es **`Allow2Ban`**, que
+devuelve `false` hasta llegar a `maxretry`, y conviene además borrar la marca
+cuando la autenticación sale bien. Es un ajuste de política, no de arquitectura:
+el agujero de enumeración ya está cerrado.
+
+### 8.4 `SessionsController`: un comentario no es un test
+
+Este código decía una cosa y hacía otra:
+
+```ruby
+# ANTES — app/controllers/sessions_controller.rb
 # Rate limit NATIVO de Rails sobre el login: la segunda capa, después de
 # Rack::Attack. Acá contamos por IP + email juntos, que es más preciso.
 rate_limit to: 10, within: 3.minutes, only: :create,
            with: -> { redirect_to new_session_path, alert: "Demasiados intentos..." }
 ```
 
-El comentario dice "por IP + email juntos". **El código no pasa `by:`**, y el
-default es `-> { request.remote_ip }` (`rate_limiting.rb:66`). O sea: cuenta
-**sólo por IP**. Igual que `PasswordsController`
-(`app/controllers/passwords_controller.rb:4`).
+El comentario decía "por IP + email juntos". **El código no pasaba `by:`**, y el
+default es `-> { request.remote_ip }` (`rate_limiting.rb:66`): contaba **sólo por
+IP**. No era catastrófico —la capa 1 ya limita por IP y el 10/3min agregaba un
+techo— pero es el recordatorio de que **un comentario no es un test**: nadie se
+entera de que miente, porque el límite "funciona" igual y el síntoma no existe.
 
-No es catastrófico —la capa 1 ya limita por IP y el 10/3min agrega un techo— pero
-es un recordatorio de que **un comentario no es un test**. Si querés lo que el
-comentario promete:
+**Cómo quedó** (`app/controllers/sessions_controller.rb:18-20`): se agregó el
+`by:` que el comentario prometía.
 
 ```ruby
-rate_limit to: 10, within: 3.minutes, only: :create, name: "login-ip-email",
+rate_limit to: 10, within: 3.minutes, only: :create,
            by: -> { "#{request.remote_ip}:#{params[:email_address].to_s.downcase.strip}" },
-           with: -> { redirect_to new_session_path, alert: "Demasiados intentos." }
+           with: -> { redirect_to new_session_path, alert: "Demasiados intentos. Probá de nuevo en unos minutos." }
 ```
 
-Pero ojo: eso es **más permisivo**, no más estricto. Una IP puede probar 10
-claves *por cada email*. Como defensa contra credential stuffing es peor que
-contar sólo por IP. Si querés las dos cosas, necesitás **dos** `rate_limit` con
-`name:` distinto — que es justamente lo que hace la capa 1 con `logins/ip` y
-`logins/email`.
+**Y hay que entender por qué eso, solo, sería un downgrade.** Contar por IP+email
+es **más permisivo** que contar sólo por IP: una IP puede probar 10 claves *por
+cada email*, así que como defensa contra credential stuffing es peor. Lo que lo
+vuelve correcto acá es que los límites **gruesos** los pone la capa 1, que sí
+tiene los dos por separado: `logins/ip` (5 cada 20 s) y `logins/email` (6 cada
+15 min — ahora que funciona, §4.4). La capa 2 agrega el corte **fino**, IP+email,
+que evita que dos personas de la misma oficina se bloqueen entre sí. Es defensa
+en capas: si mirás esa declaración aislada, la conclusión es la contraria.
+
+`PasswordsController` (`app/controllers/passwords_controller.rb:6`) sigue
+contando sólo por IP, sin `by:`. Ahí el límite fino lo pone la capa 1 con
+`password-resets/email` (3 por hora), que también estaba muerto por el mismo
+motivo que `logins/email` y hoy anda.
 
 ---
 
@@ -1588,13 +1742,16 @@ enseguida, y vos gastás recursos rechazando lo mismo cien veces por segundo.
 | `RateLimit-Remaining` | cuánto queda | `RateLimit-Remaining: 0` |
 | `RateLimit-Reset` | segundos hasta que se resetee la cuota | `RateLimit-Reset: 17` |
 
-**Precisión sobre el número de RFC.** El comentario del repo
-(`config/initializers/rack_attack.rb:228`) cita "RFC 9331". Ese número
-corresponde a otra cosa (ECN/L4S). Las cabeceras `RateLimit-*` vienen del trabajo
-del grupo **httpapi** de la IETF (`draft-ietf-httpapi-ratelimit-headers`).
-Verificá el número antes de citarlo en documentación pública o en una entrevista:
-lo importante es el **contenido semántico** de los tres campos, y que existen
-tres convenciones en circulación:
+**Precisión sobre el número de RFC.** El comentario del repo citaba "RFC 9331"
+para las cabeceras `RateLimit-*`. Ese número corresponde a otra cosa (ECN/L4S).
+**Ya está corregido** (`config/initializers/rack_attack.rb:268-276`): las
+`RateLimit-*` todavía no son una RFC publicada, vienen del trabajo del grupo
+**httpapi** de la IETF (`draft-ietf-httpapi-ratelimit-headers`); el que sí está
+en una RFC es `Retry-After` (RFC 9110). Es un error barato de cometer y caro de
+pagar: un número de RFC da una autoridad falsa y el que sabe lo detecta al
+instante. Verificá el número antes de citarlo en documentación pública o en una
+entrevista: lo importante es el **contenido semántico** de los tres campos, y que
+existen tres convenciones en circulación:
 
 1. `RateLimit-Limit` / `-Remaining` / `-Reset` — lo que usa este repo.
 2. `X-RateLimit-*` — el de facto (GitHub, Twitter). El `X-` está deprecado desde
@@ -1607,7 +1764,7 @@ Elegí una y documentala. Devolver las tres es peor que devolver una.
 **Devolvé las cabeceras en las respuestas exitosas también**, no sólo en el 429.
 Un cliente bien hecho baja su ritmo cuando ve `RateLimit-Remaining: 3`; si sólo
 se entera al recibir el 429, ya se pegó contra la pared. Este repo sólo las
-manda en el 429 (`config/initializers/rack_attack.rb:237-245`), que es lo mínimo
+manda en el 429 (`config/initializers/rack_attack.rb:285-293`), que es lo mínimo
 aceptable pero no lo ideal.
 
 ### 9.1 Qué hace un cliente bien hecho
@@ -1685,7 +1842,7 @@ No los inventes. El procedimiento es:
 **1. Medí primero con `track`.** Ésa es la razón de ser de la primitiva:
 
 ```ruby
-# config/initializers/rack_attack.rb:219-221
+# config/initializers/rack_attack.rb:261-263
 track("api/heavy-reports", limit: 20, period: 1.minute) do |req|
   req.remote_ip if req.path.start_with?("/api/v1/reports/")
 end
@@ -1752,7 +1909,7 @@ end
 ```
 
 (En este repo `User` **no** tiene columna `plan` —el schema tiene `role`, con
-check constraint de `admin/manager/operator/viewer`, `db/schema.rb:330-341`—, así
+check constraint de `admin/manager/operator/viewer`, `db/schema.rb:331-342`—, así
 que lo de arriba es el diseño, no código que corra hoy.)
 
 La opción (c) es la más barata en runtime, pero sólo sirve si el plan se puede
@@ -1830,8 +1987,8 @@ it "corta EXACTAMENTE al superar el límite de reportes (20/min)" do
 end
 ```
 
-Y el test de regresión del bug de §8.2, que es el que más valor tiene de toda la
-suite porque el bug es invisible:
+Y los tests de regresión, que son los que más valor tienen de toda la suite
+porque los bugs que fijan son invisibles. Éste es el de §8.2:
 
 ```ruby
 # spec/requests/api/v1/rate_limiting_spec.rb:49-53
@@ -1846,7 +2003,7 @@ Resultado real de la suite:
 
 ```bash
 $ bundle exec rspec spec/requests/api/v1/rate_limiting_spec.rb
-Randomized with seed 35078
+Randomized with seed 23102
 
 API v1 · Rate limiting
   capa 2: ActionController#rate_limit (por token, por controller)
@@ -1855,14 +2012,22 @@ API v1 · Rate limiting
     los distintos rate_limit NO comparten contador (name: distinto)
     devuelve Retry-After y un cuerpo accionable
   capa 1: Rack::Attack (borde, antes de Rails)
+    normaliza el email: cambiar el casing no evade el límite
+    limita los intentos contra UNA CUENTA aunque cambie la IP
     limita los intentos de login por IP
+    bloquea rutas de escaneo de vulnerabilidades
     el cuerpo del 429 es JSON parseable, no una página de error
     NUNCA limita el health check (si lo limitás, el balanceador te saca de rotación)
-    bloquea rutas de escaneo de vulnerabilidades
+    bloquea la fuerza bruta de tokens de API por IP
 
-Finished in 1.72 seconds (files took 1.82 seconds to load)
-8 examples, 0 failures
+Finished in 2 seconds (files took 1.8 seconds to load)
+11 examples, 0 failures
 ```
+
+De los 11, **cuatro son tests de regresión de bugs que este repo tuvo de
+verdad**: el de `name:` distinto (§8.2), los dos del throttle por email (§4.4) y
+el de fuerza bruta de tokens (§8.3). Es la parte de la suite que más vale, porque
+los cuatro bugs eran invisibles: ninguno tenía síntoma.
 
 (El orden de los ejemplos cambia entre corridas porque la suite está en modo
 aleatorio. Que los ejemplos pasen **en cualquier orden** es justamente lo que
@@ -1896,6 +2061,10 @@ más efectivo que existe para rate limiting.**
 
 ## Errores que ves en producción
 
+Las filas que este repo tuvo **de verdad** están marcadas con **CORREGIDO** y la
+referencia al arreglo. Las dejo en la lista igual: el síntoma, la causa y la
+forma de detectarlo valen lo mismo estén arregladas o no.
+
 **1. MemoryStore en producción.** Síntoma: el límite de 100 no corta hasta ~380
 requests, y no siempre en el mismo número. Causa: cada worker de Puma tiene su
 contador. En este repo la causa concreta sería **`REDIS_URL` sin exportar**: el
@@ -1907,10 +2076,13 @@ en un proxy— y no `MemoryStore`.
 **2. `Rack::Attack` insertado antes de `ActionDispatch::RemoteIp`.** Síntoma: a
 partir de cierto volumen, *todos* los usuarios reciben 429 al mismo tiempo,
 aleatoriamente. Causa: `Rack::Request#ip` es el peer TCP = el balanceador; todo
-el tráfico comparte un contador. Arreglo: `insert_after ActionDispatch::RemoteIp`
-(`config/application.rb:52`) y el helper `remote_ip`
+el tráfico comparte un contador. Arreglo: montarlo después de `RemoteIp`
+(`config/application.rb:64`) y el helper `remote_ip`
 (`config/initializers/rack_attack.rb:45-51`). Detección: `bin/rails middleware` y
 mirar el orden; o `redis-cli --scan` y ver una sola IP en todas las claves.
+**CORREGIDO** una variante de esto: se usaba `insert_after`, que dejaba
+`Rack::Attack` montado **dos veces** (el railtie de la gema ya lo monta al final).
+Hoy es `move_after`, y `bin/rails middleware` muestra una sola instancia (§2.2).
 
 **3. `X-Forwarded-For` confiable de más.** Dos variantes distintas, y se
 confunden. (a) Alguien llega **directo a Puma** y manda el header a mano: el rate
@@ -1935,9 +2107,11 @@ claves que `rate_limit` declarados, hay colisión.
 throttle simplemente no existe. Causa: el bloque lee un parámetro con la forma
 equivocada (`params.dig("session", "email_address")` contra un formulario que
 manda `email_address` plano — §4.4). Arreglo: verificar la forma real de los
-params. Detección: **la clave del throttle no aparece en Redis**. Este bug está
-vivo en `config/initializers/rack_attack.rb:174-186` para `logins/email` y
-`password-resets/email`.
+params. Detección: **la clave del throttle no aparece en Redis**. **CORREGIDO**:
+estuvo vivo en `logins/email` y `password-resets/email`; hoy los dos bloques leen
+`req.params["email_address"]` con el anidado como fallback
+(`config/initializers/rack_attack.rb:188-204`) y hay dos tests de regresión
+(`spec/requests/api/v1/rate_limiting_spec.rb:82-104`).
 
 **6. `NullStore` bajo `rate_limit`.** Síntoma: ninguno, el límite no limita.
 Causa: `increment` devuelve `nil` y `nil && nil > to` es falsy
@@ -1948,13 +2122,13 @@ sirve, como hace `app/controllers/api/v1/base_controller.rb:46-57`.
 rotación durante un pico y el incidente se convierte en una caída total. Causa:
 `/up` cae bajo el throttle general. Arreglo: `safelist`
 (`config/initializers/rack_attack.rb:99-101`) **y un test que lo fije**
-(`spec/requests/api/v1/rate_limiting_spec.rb:98-101`).
+(`spec/requests/api/v1/rate_limiting_spec.rb:142-145`).
 
 **8. 429 que devuelve HTML.** Síntoma: el cliente de la API loguea un error de
 parseo de JSON y el equipo pierde horas buscando el bug equivocado. Arreglo:
 `throttled_responder` que devuelve el mismo formato de error que el resto de la
-API (`config/initializers/rack_attack.rb:230-254`), con test
-(`spec/requests/api/v1/rate_limiting_spec.rb:86-91`).
+API (`config/initializers/rack_attack.rb:278-302`), con test
+(`spec/requests/api/v1/rate_limiting_spec.rb:130-135`).
 
 **9. 429 sin `Retry-After`.** Síntoma: el cliente reintenta en loop y multiplica
 la carga justo cuando estás saturado. Arreglo: `Retry-After` calculado sobre lo
@@ -1979,7 +2153,14 @@ discriminador por credencial donde exista.
 de 401 desde una IP. Causa: la capa 2 nunca corre (el 401 corta antes) y el
 throttle de capa 1 discrimina por hash del token, así que cada token adivinado
 estrena su balde (§8.3). Arreglo: un throttle de fallos de autenticación
-discriminado por IP.
+discriminado por IP. **CORREGIDO**:
+`Api::TokenAuthentication#record_authentication_failure!`
+(`app/controllers/concerns/api/token_authentication.rb:74-82`) marca el fallo en
+el cache de `Rack::Attack` y la blocklist `bloquear fuerza bruta de tokens de API`
+(`config/initializers/rack_attack.rb:239-245`) lo convierte en un ban por IP.
+Test: `spec/requests/api/v1/rate_limiting_spec.rb:106-118`. Ojo con el filo que
+quedó (§8.3): la marca vive 5 minutos y mientras esté puesta bloquea también los
+requests con token válido de esa IP.
 
 **14. Suscriptor de `ActiveSupport::Notifications` que hace I/O.** Síntoma: la
 latencia p99 sube justo cuando hay un ataque. Causa: el bus es síncrono y en el
@@ -2047,10 +2228,13 @@ un segundo sin violarlo?"**
 > límite por IP no lo ve porque cada IP hace dos requests. Necesitás los dos.
 > Y una advertencia práctica: el discriminador por email tiene que **normalizarse**
 > (downcase + strip), o el atacante evade el límite cambiando el casing. En este
-> repo el throttle por email está declarado pero **no funciona**, porque lee
+> repo el throttle por email estuvo declarado y **muerto**: leía
 > `params.dig("session", "email_address")` y el formulario manda `email_address`
-> plano: el discriminador es `nil` y `Rack::Attack` saltea el throttle sin
-> avisar. Lo detecté mirando qué claves aparecían en Redis después de un POST.
+> plano, así que el discriminador era `nil` y `Rack::Attack` salteaba el throttle
+> sin avisar. Lo detecté mirando qué claves aparecían en Redis después de un POST,
+> lo arreglé leyendo el param plano (con el anidado de fallback) y lo fijé con dos
+> tests de regresión que atacan **desde IPs distintas**, para que el que corte sea
+> el límite por email y no el de IP.
 > **Trade-off:** contar por email te expone a que un atacante bloquee una cuenta
 > ajena a propósito (DoS de cuenta). Por eso el límite por email es más laxo y
 > con ventana más larga (6 cada 15 min acá), y por eso nunca bloqueás la cuenta:

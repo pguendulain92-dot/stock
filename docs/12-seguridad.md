@@ -9,6 +9,16 @@ que aterriza en Rails mete el bug.
 Todos los números, salidas de comandos y hallazgos de Brakeman de este documento
 salieron de correr las herramientas contra este repo, no de la memoria.
 
+**Una aclaración sobre cómo leer los bugs de este documento.** La auditoría que
+lo originó encontró defectos REALES en el código, y esos defectos **ya están
+arreglados**. No los saqué del texto: el valor didáctico no está en la línea
+final sino en la secuencia completa —así se veía el bug, así se detectó, así se
+arregló y qué test lo cuida ahora—. Donde leas "este bug **estuvo** vivo en este
+repo" es literal: estuvo, y abajo está el arreglo con la ruta del archivo y el
+spec de regresión que lo fija. Lo que sigue marcado como pendiente (§5.4, §6.5,
+§9 con `config.hosts`) es pendiente de verdad, verificado contra el código de
+hoy.
+
 Documentos hermanos que este da por leídos: `docs/06-concurrencia-transacciones-y-locking.md`
 (locking), `docs/08-rate-limiting.md` (las dos capas de rate limiting),
 `docs/10-errores-comunes.md` (query cache, Zeitwerk) y
@@ -41,8 +51,12 @@ distintos y algunos vienen prendidos y otros no:
 `@PreAuthorize("hasRole('ADMIN')")` que el framework aplica solo. No lo hay.
 En Rails, si te olvidás de llamar a `authorize`, la acción se ejecuta y nadie
 te avisa. Por eso este repo pone una red de seguridad explícita
-(`after_action :verify_pundit_usage`, `app/controllers/api/v1/base_controller.rb:117`)
-que en dev/test **explota** si te olvidaste. Volvemos a eso en §7.
+(`after_action :verify_pundit_usage`) que en dev/test **explota** si te
+olvidaste, y hoy está en las **dos** puntas: en la API
+(`app/controllers/api/v1/base_controller.rb:117`) y en la UI web
+(`app/controllers/application_controller.rb:45`). Durante un tiempo estuvo sólo
+en la API — un controller HTML nuevo sin `authorize` no disparaba nada.
+Volvemos a eso en §7.3.
 
 **El error #2:** creer que porque ActiveRecord "genera el SQL", no hay
 inyección posible. AR bindea los parámetros de `where(hash)`, pero deja pasar
@@ -312,56 +326,83 @@ salen de helpers de rutas (`product_path(product.sku)`,
 
 ### 2.4 Content Security Policy y el nonce
 
-**Estado real de este repo: CSP está DESACTIVADA.**
+**Este bug estuvo vivo en este repo: la CSP estaba DESACTIVADA.**
 
-`config/initializers/content_security_policy.rb` está entero comentado (es el
-archivo que genera `rails new`, sin tocar). Lo confirmé en runtime:
-
-```ruby
-Rails.application.config.content_security_policy   # => nil
-```
-
-Y sin embargo `app/views/layouts/application.html.erb:7` tiene
-`<%= csp_meta_tag %>`. Ese helper emite el `<meta name="csp-nonce">` que Turbo
-usa para inyectar scripts; con la política en `nil` no rompe nada, pero
-**tampoco protege nada**. Es exactamente el estado en el que están el 80% de
-las apps Rails en producción: el helper puesto, la política vacía.
-
-El arreglo, y por qué el nonce importa:
+`config/initializers/content_security_policy.rb` estaba entero comentado (el
+archivo que genera `rails new`, sin tocar), así que en runtime daba:
 
 ```ruby
-# config/initializers/content_security_policy.rb
-Rails.application.configure do
-  config.content_security_policy do |policy|
-    policy.default_src :self
-    policy.font_src    :self, :data
-    policy.img_src     :self, :data
-    policy.object_src  :none
-    policy.script_src  :self
-    policy.style_src   :self
-    policy.base_uri    :self
-    policy.frame_ancestors :none
-    policy.report_uri "/csp-violation-report-endpoint"
-  end
-
-  # Un nonce nuevo por respuesta. `SecureRandom.base64(16)` es lo correcto;
-  # NO uses request.session.id (el ejemplo comentado que genera Rails):
-  # es estable durante toda la sesión, así que un atacante que lo lea una vez
-  # puede firmar scripts para siempre. El nonce tiene que ser IMPREDECIBLE
-  # y de un solo uso.
-  config.content_security_policy_nonce_generator = ->(_request) { SecureRandom.base64(16) }
-  config.content_security_policy_nonce_directives = %w[script-src style-src]
-
-  # Sin esta línea, `javascript_tag` / `javascript_include_tag` / `stylesheet_link_tag`
-  # NO ponen el nonce solos: el default de `content_security_policy_nonce_auto`
-  # es `false` (railties `configuration.rb:76`), y el initializer que genera
-  # Rails lo deja comentado.
-  config.content_security_policy_nonce_auto = true
-end
+Rails.application.config.content_security_policy   # => nil     ← ANTES
 ```
 
-Con eso, cualquier `<script>` inyectado por XSS **no se ejecuta** porque no lleva
-el nonce. CSP es la defensa en profundidad: no evita el XSS, evita que sirva de algo.
+Y sin embargo `app/views/layouts/application.html.erb:7` tenía —y sigue
+teniendo— `<%= csp_meta_tag %>`. Ese helper emite el `<meta name="csp-nonce">`
+que Turbo usa para inyectar scripts; con la política en `nil` no rompía nada,
+pero **tampoco protegía nada**. Es exactamente el estado en el que están el 80%
+de las apps Rails en producción: el helper puesto, la política vacía. Seguridad
+de utilería: parece que está protegido.
+
+**Cómo quedó.** El initializer tiene hoy una política real. Verificado en
+runtime (`Rails.application.config.content_security_policy.directives`):
+
+```ruby
+{"default-src"    => ["'self'"],
+ "font-src"       => ["'self'", "data:"],
+ "img-src"        => ["'self'", "data:", "https:"],
+ "object-src"     => ["'none'"],
+ "script-src"     => ["'self'"],
+ "style-src"      => ["'self'", "'unsafe-inline'"],   # Tailwind inyecta estilos inline
+ "connect-src"    => ["'self'"],
+ "base-uri"       => ["'self'"],
+ "form-action"    => ["'self'"],
+ "frame-ancestors"=> ["'none'"]}
+```
+
+Con eso, cualquier `<script>` inyectado por XSS **no se ejecuta** porque su
+origen no está permitido. CSP es la defensa en profundidad: no evita el XSS,
+evita que sirva de algo.
+
+Y el despliegue es el correcto: **arranca en report-only**. La última línea del
+initializer es
+
+```ruby
+config.content_security_policy_report_only = !ENV["CSP_ENFORCE"].present? || Rails.env.local?
+```
+
+o sea que el browser reporta pero no bloquea hasta que pongas `CSP_ENFORCE=1`, y
+en dev/test nunca bloquea. Confirmado en runtime con `RAILS_ENV=production`:
+`config.content_security_policy_report_only # => true`. Activar CSP a ciegas
+rompe el sitio, garantizado; arrancá en report-only, mirá los reportes una
+semana y recién ahí lo hacés bloqueante.
+
+⚠️ **Dos cosas del nonce que quedan como deuda consciente, y conviene saber
+leerlas.**
+
+1. El generador que quedó escrito es
+   `->(request) { request.session.id.to_s }` — el ejemplo que sugiere Rails.
+   Funciona, pero **un nonce debería ser impredecible y de un solo uso**, y el
+   id de sesión es estable durante toda la sesión: quien lo lea una vez puede
+   firmar scripts para siempre. Lo correcto es
+   `->(_request) { SecureRandom.base64(16) }`. Es el próximo cambio de este
+   archivo y es de una línea.
+2. `content_security_policy_nonce_directives` lista **sólo `script-src`**, no
+   `style-src`, y eso es deliberado: por spec, si una directiva tiene un nonce,
+   el browser **ignora `'unsafe-inline'`** en esa misma directiva. Como
+   `style-src` necesita `'unsafe-inline'` para Tailwind, ponerle el nonce
+   rompería todos los estilos inline. No es un olvido: es la interacción real
+   entre nonce y `unsafe-inline`, y se pregunta.
+
+También sigue en `false` el auto-nonce:
+
+```ruby
+Rails.application.config.content_security_policy_nonce_auto   # => false
+```
+
+Sin esa opción, `javascript_tag` / `javascript_include_tag` / `stylesheet_link_tag`
+**no** ponen el nonce solos (el default de Rails es `false` y el initializer
+generado lo deja comentado). Acá no molesta porque la app no tiene scripts
+inline propios; el día que agregues uno, se cae en silencio cuando pongas
+`CSP_ENFORCE=1`.
 
 Una precisión sobre quién pone el nonce, porque acá se pierde mucha gente:
 `javascript_importmap_tags` lo pasa **siempre** de forma explícita
@@ -370,10 +411,6 @@ Una precisión sobre quién pone el nonce, porque acá se pierde mucha gente:
 nada más. `javascript_tag` y compañía dependen de
 `content_security_policy_nonce_auto`, que viene en `false`. Si activás CSP y te
 olvidás de esa línea, tus scripts inline se caen y los del importmap no.
-
-Arrancá siempre con `config.content_security_policy_report_only = true`,
-mirá el reporte una semana y recién ahí lo hacés bloqueante. Activar CSP a
-ciegas rompe el sitio, garantizado.
 
 **Comparación:** en Spring esto es `HttpSecurity.headers().contentSecurityPolicy(...)`.
 Mismo header, mismo problema de adopción.
@@ -411,7 +448,7 @@ De ahí sale la regla:
 Este repo aplica exactamente eso:
 
 - **UI web** (`ApplicationController` → `ActionController::Base`): CSRF activo,
-  cookie firmada (`app/controllers/concerns/authentication.rb:44`).
+  cookie firmada (`app/controllers/concerns/authentication.rb:53`).
 - **API** (`app/controllers/api/v1/base_controller.rb` → `ActionController::API`):
   no hay CSRF **porque no se carga el módulo**. `ActionController::API` no
   incluye `RequestForgeryProtection`, ni cookies, ni flash, ni vistas. No es que
@@ -438,7 +475,7 @@ fetch(url, {
 
 ### 3.3 SameSite: la segunda capa
 
-`app/controllers/concerns/authentication.rb:44`:
+`app/controllers/concerns/authentication.rb:53`:
 
 ```ruby
 cookies.signed.permanent[:session_id] = {
@@ -492,7 +529,7 @@ def warehouse_params = params.require(:warehouse).permit(:code, :name, :address,
 
 `params.require(:product)` levanta `ActionController::ParameterMissing` si falta
 la clave raíz — que la API traduce a 400 en
-`app/controllers/concerns/api/error_handling.rb:97`. Y `permit` devuelve un
+`app/controllers/concerns/api/error_handling.rb:117`. Y `permit` devuelve un
 `ActionController::Parameters` con `permitted? == true`; sin eso,
 `Model.new(params)` levanta `ForbiddenAttributesError`.
 
@@ -544,7 +581,7 @@ enterarte.
 ### 5.1 bcrypt y su cost
 
 `app/models/user.rb` usa `has_secure_password`. Guarda un hash bcrypt en
-`users.password_digest` (`db/schema.rb:336`, `string NOT NULL`).
+`users.password_digest` (`db/schema.rb:337`, `string NOT NULL`).
 
 Medido en este repo:
 
@@ -629,7 +666,7 @@ máquina); lo que importa es el orden de magnitud, y ése es estable: dos órden
 de magnitud de diferencia en el camino ingenuo, 1% en el correcto. 330× es
 medible **desde internet**, con jitter de red y todo. 1% no.
 
-Por eso `app/controllers/sessions_controller.rb:17` usa:
+Por eso `app/controllers/sessions_controller.rb:31` usa:
 
 ```ruby
 if user = User.authenticate_by(params.permit(:email_address, :password))
@@ -672,9 +709,9 @@ Dos consecuencias que hay que decir en voz alta:
    idéntico ("Email o contraseña incorrectos", nunca "ese email no existe"), y
    el rate limiting tiene que estar (§5.3).
 2. **`/passwords#create` sí filtra por otro canal.**
-   `app/controllers/passwords_controller.rb:10` hace
+   `app/controllers/passwords_controller.rb:12` hace
    `User.find_by(email_address: params[:email_address])` y sólo manda mail si
-   existe (`deliver_later` en la línea 11). La *respuesta*
+   existe (`deliver_later` en la línea 13). La *respuesta*
    es idéntica en los dos casos ("instrucciones enviadas si existe una cuenta"),
    que es lo correcto. Pero el timing no está igualado: la rama que existe hace
    un `deliver_later` (encolar un job). En una app con cola en Postgres, eso son
@@ -694,7 +731,8 @@ end
 
 throttle("logins/email", limit: 6, period: 15.minutes) do |req|
   if req.path == "/session" && req.post?
-    req.params.dig("session", "email_address")&.to_s&.downcase&.strip&.presence
+    email = req.params["email_address"] || req.params.dig("session", "email_address")
+    email&.to_s&.downcase&.strip&.presence
   end
 end
 ```
@@ -706,14 +744,49 @@ end
 Hacen falta **los dos**. Y fijate el `.downcase.strip`: sin normalizar, el
 atacante evade el contador cambiando el casing (`Ana@x.com` vs `ana@x.com`).
 
-**Capa de controller**, `app/controllers/sessions_controller.rb:5`:
+⚠️ **Este throttle estuvo MUERTO en este repo, y es el mejor ejemplo de fallo
+silencioso de todo el documento.** La versión original leía sólo la forma
+anidada:
+
+```ruby
+# ❌ COMO ESTABA: nunca disparó una sola vez
+req.params.dig("session", "email_address")&.to_s&.downcase&.strip&.presence
+```
+
+El formulario de login usa `form_with url:` **sin modelo**, así que los params
+llegan **planos** (`email_address`), no anidados bajo `"session"`. El `dig`
+devolvía `nil`; y un discriminador `nil` hace que Rack::Attack **no cuente
+nada** y deje pasar la request. Sin error, sin warning, sin nada en el log: un
+rate limit roto se ve **exactamente igual** que uno que nunca se disparó. El
+límite por cuenta —la única defensa contra el botnet distribuido— no existía.
+
+El arreglo está arriba: se lee la forma plana con fallback a la anidada, así
+que sigue funcionando si mañana el form pasa a `form_with model:`. Mismo
+tratamiento recibió `password-resets/email`, que tenía el mismo defecto. Y la
+moraleja quedó fijada en tests: `spec/requests/api/v1/rate_limiting_spec.rb`
+tiene dos ejemplos de regresión que disparan el límite de verdad —"limita los
+intentos contra UNA CUENTA aunque cambie la IP" y "normaliza el email: cambiar
+el casing no evade el límite"—. **Todo throttle necesita un test que lo dispare;
+si no, no sabés si está vivo.**
+
+**Capa de controller**, `app/controllers/sessions_controller.rb:18`:
 
 ```ruby
 rate_limit to: 10, within: 3.minutes, only: :create,
+           by: -> { "#{request.remote_ip}:#{params[:email_address].to_s.downcase.strip}" },
            with: -> { redirect_to new_session_path, alert: "Demasiados intentos..." }
 ```
 
-Sobre el `rate_limit` nativo de Rails 8 hay dos trampas graves que este repo
+⚠️ **Otro bug que estuvo vivo, y es el mismo género: el comentario mentía.**
+Este `rate_limit` decía en su comentario "contamos por IP + email" mientras
+**no pasaba `by:`**. El default de ActionController es
+`-> { request.remote_ip }`, o sea que contaba sólo por IP y nadie se enteraba
+porque el límite "funcionaba" igual. Hoy el `by:` está y el discriminador es
+IP+email: dos personas de la misma oficina no se bloquean entre sí, y un
+atacante que rota IPs contra una cuenta queda limitado por el lado del email.
+Los límites gruesos (sólo IP, sólo email) los cubre Rack::Attack en el borde.
+
+Sobre el `rate_limit` nativo de Rails 8 hay tres trampas graves que este repo
 documenta en `app/controllers/api/v1/base_controller.rb` y en `docs/08`:
 
 1. **Un rate limiter sobre un `NullStore` no limita nada y no avisa.**
@@ -726,8 +799,57 @@ documenta en `app/controllers/api/v1/base_controller.rb` y en `docs/08`:
    `actionpack-8.1.3.1/lib/action_controller/metal/rate_limiting.rb:75`), así
    que cada request lo incrementa dos veces y el límite efectivo queda a la
    mitad: uno de 20 corta en la request 11.
+3. **Si no pasás `by:`, cuenta por IP**, digan lo que digan los comentarios.
+   Es el bug del párrafo anterior. `by:` no es opcional cuando el
+   discriminador que querés no es la IP.
 
-Lo que **falta** acá y hay que saber pedirlo: **bloqueo de cuenta**
+### 5.3.1 Fuerza bruta de tokens de API: el agujero del 401
+
+Este es el más sutil de los agujeros de rate limiting que tuvo el repo, y es el
+que más se repite en APIs ajenas.
+
+Un Bearer token inválido devuelve 401 desde un `before_action`, y eso **corta la
+cadena de callbacks**: el `rate_limit` de la capa 2 —que corre después de
+autenticar— nunca llega a ejecutarse. Y el throttle de borde `api/token`
+discrimina por el **SHA del token**, así que cada token adivinado estrena su
+propio balde de 1.000/hora. Resultado: la única barrera real contra la fuerza
+bruta de tokens era el límite genérico por IP de 300 cada 5 minutos.
+
+El arreglo tiene dos mitades, porque Rack::Attack corre **antes** del controller
+y no puede conocer el status de la respuesta:
+
+```ruby
+# config/initializers/rack_attack.rb — la mitad que bloquea
+blocklist("bloquear fuerza bruta de tokens de API") do |req|
+  Rack::Attack::Fail2Ban.filter("api-auth-fail-#{req.remote_ip}",
+                                maxretry: 10, findtime: 5.minutes, bantime: 1.hour) do
+    Rack::Attack.cache.read("api-auth-failed:#{req.remote_ip}").present?
+  end
+end
+```
+
+```ruby
+# app/controllers/concerns/api/token_authentication.rb — la mitad que marca
+def record_authentication_failure!
+  Rack::Attack.cache.write("api-auth-failed:#{request.remote_ip}", 1, 5.minutes)
+rescue StandardError => e
+  # Si el store está caído NO rompemos el request: fallar abierto en la
+  # instrumentación, nunca en la autenticación.
+  Rails.logger.warn("[Auth] no se pudo registrar el fallo de autenticación: #{e.message}")
+end
+```
+
+Diez fallos de autenticación en cinco minutos y esa IP queda bloqueada una hora
+**para todo**, sin importar cuántos tokens distintos pruebe. Test de regresión:
+"bloquea la fuerza bruta de tokens de API por IP", en
+`spec/requests/api/v1/rate_limiting_spec.rb`.
+
+El patrón general vale para cualquier app: **el borde no ve el resultado, el
+controller sí**. Cuando el evento que querés contar es "fallo de autenticación"
+y el contador vive en el middleware, necesitás que el controller escriba la
+marca y el middleware la lea en el request siguiente.
+
+Lo que **sigue faltando** acá y hay que saber pedirlo: **bloqueo de cuenta**
 (N fallos → cuenta bloqueada M minutos, con desbloqueo por mail) y
 **notificación de login desde IP nueva**. El rate limit frena el volumen; no
 frena a un atacante paciente con 3 intentos por hora.
@@ -766,7 +888,7 @@ explícitamente; produce `Verano2024!` → `Verano2024!!`), y reglas de composic
 
 ### 5.5 Tokens de reset con expiración
 
-`app/controllers/passwords_controller.rb:31` usa
+`app/controllers/passwords_controller.rb:33` usa
 `User.find_by_password_reset_token!(params[:token])`. Ese método **no está
 escrito en el modelo**: lo genera `has_secure_password` cuando el modelo
 responde a `generates_token_for` (o sea, siempre en un ActiveRecord).
@@ -796,7 +918,7 @@ Tres propiedades, todas gratis:
    verifiqué en consola: 182 caracteres, base64 de un JSON firmado.
    `find_by_password_reset_token!` levanta
    `ActiveSupport::MessageVerifier::InvalidSignature` si está adulterado —
-   que el controller rescata en `passwords_controller.rb:32`.
+   que el controller rescata en `passwords_controller.rb:34`.
 
 **Comparación:** en Spring esto lo hacés con una tabla `password_reset_tokens`
 (token UUID, user_id, expires_at, used_at) y un job que la limpia. Rails lo
@@ -805,7 +927,7 @@ truco que un JWT, pero con el secreto de la app y sin exponer un formato
 estándar que invite a parsearlo del lado del cliente.
 
 Lo que este repo **sí** hace bien y mucha gente olvida
-(`app/controllers/passwords_controller.rb:21`):
+(`app/controllers/passwords_controller.rb:23`):
 
 ```ruby
 if @user.update(params.permit(:password, :password_confirmation))
@@ -839,7 +961,7 @@ ENCRIPTADA -> rXjez2qFUb6FzqLZT2cpTDTtzM7Jrg==--FRxADbO/ecuRF924--BamgkyVSZ/llXT
 **La regla:** firmada si el contenido no es secreto (un id), encriptada si lo es.
 
 Este repo usa **firmada** para el session id
-(`app/controllers/concerns/authentication.rb:44`), y está bien: el valor es el
+(`app/controllers/concerns/authentication.rb:53`), y está bien: el valor es el
 `id` de la fila en `sessions`, un bigint. Que el usuario vea "soy la sesión 42"
 no le sirve de nada, porque no puede fabricar la firma para la 43.
 
@@ -889,25 +1011,44 @@ cookies.signed.permanent[:session_id] = {
 |---|---|---|
 | `httponly: true` | ✅ | JS no la lee; un XSS no roba la sesión |
 | `same_site: :lax` | ✅ | mitiga CSRF a nivel browser |
-| `secure: true` | ❌ **falta** | la cookie viaja por HTTP plano si alguien fuerza `http://` |
-| expiración | ⚠️ `permanent` = **20 años** | ver abajo |
+| `secure: true` | ✅ (vía `force_ssl`) | **estuvo faltando**; ver abajo |
+| expiración | ⚠️ `permanent` = **20 años** | ver §6.4 |
 
-`secure` no está seteado explícitamente. Rails lo pone solo **si tenés
-`config.force_ssl = true`** (el middleware `ActionDispatch::SSL` reescribe las
-cookies con `secure`). Y en este repo `force_ssl` **está comentado**
-(`config/environments/production.rb:31`, confirmado en runtime:
-`config.force_ssl # => false`). O sea: hoy, en producción, la cookie de sesión
-saldría sin `secure`.
+`secure` no está seteado explícitamente en el hash de la cookie, y no hace
+falta: Rails lo pone solo **si tenés `config.force_ssl = true`** (el middleware
+`ActionDispatch::SSL` reescribe todas las cookies con `secure`).
 
-Arreglo (los dos, no uno):
+**Este bug estuvo vivo:** `force_ssl` estaba **comentado** en
+`config/environments/production.rb`, así que en runtime
+`config.force_ssl # => false` y la cookie de sesión salía a producción sin
+`secure` — sólo con `httponly` y `same_site: :lax`. Basta una request por
+`http://` (un link viejo, un typo, un atacante que fuerza el downgrade) para que
+alguien en la misma red la capture. Era, además, el único hallazgo de confianza
+**alta** de `brakeman -A` (§11.2).
+
+**Cómo quedó** (`config/environments/production.rb:35` y `:45`) — los dos, no
+uno:
 
 ```ruby
-# config/environments/production.rb
 config.assume_ssl = true   # el proxy termina TLS y habla HTTP con Puma
 config.force_ssl  = true   # redirect 301 a https + HSTS + cookies secure
 ```
 
-### 6.4 Expiración: el bug real de este repo
+Verificado en runtime con `RAILS_ENV=production`:
+
+```text
+config.force_ssl   # => true
+config.assume_ssl  # => true
+config.ssl_options # => {:hsts=>{:subdomains=>true}}
+```
+
+y en el stack de middlewares de producción (`bin/rails middleware`) ahora
+aparecen arriba de todo `ActionDispatch::AssumeSSL` y `ActionDispatch::SSL`,
+que antes no estaban montados. `assume_ssl` no es decorativo: sin él, con un
+proxy delante, `force_ssl` entra en **loop de redirección infinita** — es el
+error más común al activarlo.
+
+### 6.4 Expiración: el bug real que tuvo este repo
 
 `app/models/session.rb` define todo lo necesario:
 
@@ -918,41 +1059,60 @@ scope :active, -> { where(expires_at: Time.current..) }
 def expired? = expires_at.present? && expires_at <= Time.current
 ```
 
-Pero `app/controllers/concerns/authentication.rb:28` hace:
+Pero `app/controllers/concerns/authentication.rb` hacía esto:
 
 ```ruby
+# ❌ COMO ESTABA
 def find_session_by_cookie
   Session.find_by(id: cookies.signed[:session_id]) if cookies.signed[:session_id]
 end
 ```
 
-**`find_by`, no `active.find_by`.** El `expires_at` nunca se chequea al retomar
-la sesión. Lo verifiqué creando una sesión vencida hace 10 días:
+**`find_by`, no `active.find_by`.** El `expires_at` nunca se chequeaba al
+retomar la sesión, así que **una sesión vencida seguía autenticando para
+siempre**. Tener el vencimiento en la base y después no filtrarlo es peor que no
+tenerlo: da la falsa sensación de que las sesiones expiran.
+
+La diferencia sigue siendo fácil de reproducir en consola con una sesión vencida
+hace 10 días (verificado hoy contra `stock_development`):
 
 ```text
-session id=6 expires_at=2026-08-20 expired?=true
-Session.find_by(id:)         -> true    ← lo que hace find_session_by_cookie
-Session.active.find_by(id:)  -> false   ← el scope que existe pero no se usa
+session id=8 expires_at=2026-08-20 expired?=true
+Session.find_by(id:)         -> true    ← lo que hacía find_session_by_cookie
+Session.active.find_by(id:)  -> false   ← el scope que existía pero no se usaba
 ```
 
-Y como la cookie es `permanent` (20 años), el vencimiento tampoco lo aplica el
-browser. La única cosa que hoy termina una sesión vieja es el job nocturno
+Y como la cookie es `permanent` (20 años), el vencimiento tampoco lo aplicaba el
+browser. Lo único que terminaba una sesión vieja era el job nocturno
 `Cleanup::ExpiredRecordsJob` (`app/jobs/cleanup/expired_records_job.rb:31`),
-que borra `Session.where(expires_at: ...Time.current)` — o sea, la sesión sigue
+que borra `Session.where(expires_at: ...Time.current)` — o sea, la sesión seguía
 viva hasta las 4 AM del día siguiente al vencimiento.
 
-El arreglo es de una línea:
+**Cómo quedó.** El arreglo fue de una línea, en
+`app/controllers/concerns/authentication.rb:38`:
 
 ```ruby
 def find_session_by_cookie
-  return unless (id = cookies.signed[:session_id])
-  Session.active.find_by(id: id)
+  return nil if cookies.signed[:session_id].blank?
+
+  Session.active.find_by(id: cookies.signed[:session_id])
 end
 ```
 
-Y ya que estás, **rolling expiration** (renovar mientras se usa) y
-**absolute timeout** (matar a los N días pase lo que pase) son dos políticas
-distintas; las apps serias implementan las dos.
+Y el mismo criterio en `app/channels/application_cable/connection.rb:15`, que
+heredaba idéntico problema para los WebSockets: una sesión vencida podía abrir
+un canal de Action Cable aunque ya no pudiera abrir una página.
+
+Spec de regresión: `spec/requests/session_expiry_spec.rb`, con los tres casos
+que importan —sesión viva autentica, sesión **vencida** redirige al login, y la
+sesión nace con `DEFAULT_TTL`—. Ese es el test que hay que escribir: no "el
+scope existe", sino "un request con la cookie de una sesión vencida termina en
+el login".
+
+Lo que **sigue pendiente** y conviene saber pedir: **rolling expiration**
+(renovar mientras se usa) y **absolute timeout** (matar a los N días pase lo que
+pase) son dos políticas distintas; las apps serias implementan las dos. Acá hay
+TTL absoluto de 30 días y nada de renovación.
 
 ### 6.5 Fijación de sesión
 
@@ -981,7 +1141,7 @@ end
 `reset_session` descarta todo el contenido de la sesión previa. Sin eso,
 cualquier cosa que un anónimo haya puesto en `session[...]` sobrevive al login.
 Concretamente acá: `session[:return_to_after_authenticating]`
-(`authentication.rb:33`) sobrevive el login. Como se guarda `request.url` — una
+(`authentication.rb:42`) sobrevive el login. Como se guarda `request.url` — una
 URL **de esta app**, generada por el propio server — no es un open redirect
 (§13.1). Pero el hábito correcto es `reset_session` al cambiar de identidad,
 siempre: al loguear, al desloguear, y al cambiar de usuario.
@@ -994,7 +1154,7 @@ buena respuesta de entrevista.
 Como la sesión es **una fila en `sessions`**, revocarla es un `DELETE`:
 
 ```ruby
-Current.session.destroy              # logout (authentication.rb:49)
+Current.session.destroy              # logout (authentication.rb:58)
 user.sessions.destroy_all            # "cerrar sesión en todos los dispositivos"
                                      # y también en el reset de password
 ```
@@ -1097,12 +1257,51 @@ Dos cosas finas acá:
 Cuando una acción legítimamente no necesita autorizar, se declara explícito:
 `skip_authorization` / `skip_policy_scope`
 (`app/controllers/api/v1/reports_controller.rb`,
-`app/controllers/stock_items_controller.rb:14`). Eso es distinto de olvidarse:
+`app/controllers/stock_items_controller.rb:18-19`). Eso es distinto de olvidarse:
 queda escrito y se ve en el diff.
 
-⚠️ **Faltante real:** `ApplicationController` (la UI web) **no tiene**
-`verify_authorized`. Sólo lo tiene el `BaseController` de la API. Un controller
-HTML nuevo sin `authorize` no dispara ninguna alarma.
+⚠️ **Faltante que estuvo vivo:** `ApplicationController` (la UI web) **no tenía**
+la red de seguridad. Sólo la tenía el `BaseController` de la API, así que un
+controller HTML nuevo sin `authorize` no disparaba ninguna alarma — y la UI web
+es justamente donde más rápido se agregan pantallas.
+
+**Cómo quedó** (`app/controllers/application_controller.rb:45`):
+
+```ruby
+after_action :verify_pundit_usage, unless: :devise_or_engine_request?
+
+def verify_pundit_usage
+  action_name == "index" ? verify_policy_scoped : verify_authorized
+rescue Pundit::AuthorizationNotPerformedError, Pundit::PolicyScopingNotPerformedError => e
+  raise e if Rails.env.local?
+  Rails.logger.error(event: "security.authorization_missing",
+                     controller: controller_name, action: action_name, error: e.class.name)
+end
+
+# Sesiones y reseteo de contraseña son PÚBLICOS por definición: no hay recurso
+# que autorizar. Se excluyen explícitamente, que es mejor que un
+# `skip_after_action` disperso en cada uno.
+def devise_or_engine_request?
+  controller_name.in?(%w[sessions passwords]) || self.class.module_parent_name.present?
+end
+```
+
+Es la misma política que en la API: dev/test explota, producción loguea
+`security.authorization_missing`. Y activarlo obligó a declarar las exenciones
+que estaban implícitas, que es exactamente el beneficio:
+
+- `DashboardController#index` llama `skip_policy_scope` — arma un resumen de
+  varias tablas, no hay una colección de un recurso que scopear.
+- `StockItemsController#low_stock` llama `skip_policy_scope` **y**
+  `skip_authorization` (`stock_items_controller.rb:18-19`). Las dos, porque la
+  red exige `policy_scope` sólo cuando la acción se llama `index`; para
+  cualquier otro nombre exige `authorize`. Es un `index` con otro nombre y el
+  filtrado lo hace el query object.
+- `StockMovementsController#index` llama `skip_policy_scope` por el mismo motivo.
+
+Fijate el patrón: la red no elimina las excepciones, **las vuelve explícitas y
+revisables en un diff**. Un `skip_policy_scope` en un PR es una pregunta que
+alguien puede hacer; un `authorize` faltante no se ve.
 
 ### 7.4 IDOR y `policy_scope`
 
@@ -1141,10 +1340,10 @@ En este repo hay ejemplos de las dos formas:
 # app/controllers/stock_items_controller.rb:7  → colección filtrada
 scope = policy_scope(StockItem).with_associations
 
-# app/controllers/stock_items_controller.rb:52 → objeto SIN scope
+# app/controllers/stock_items_controller.rb:57 → objeto SIN scope
 def set_stock_item = @stock_item = StockItem.with_associations.find(params[:id])
 # ...y después, en cada acción:
-authorize @stock_item, :adjust?     # línea 42
+authorize @stock_item, :adjust?     # línea 47
 ```
 
 Hoy eso es correcto **porque `StockItemPolicy::Scope#resolve` devuelve
@@ -1200,6 +1399,67 @@ nadie puede arreglarlo").
 Hay tests de matriz rol×acción en `spec/policies/policies_spec.rb`, que es la
 forma correcta de documentar una política de acceso: falla apenas alguien afloja
 un permiso sin querer.
+
+### 7.6 Dos cosas que la auditoría encontró en las policies
+
+**a) `verify_policy_scoped` no puede saber que la policy no existe.**
+
+`app/policies/stock_reservation_policy.rb` **faltaba**. Resultado:
+`policy_scope(StockReservation)` en el `index` levantaba
+`Pundit::NotDefinedError` y **`GET /api/v1/reservations` devolvía 500 para
+cualquier request, siempre**. No 403, no 404: un 500 permanente en un endpoint
+publicado.
+
+Es el límite exacto de la red de seguridad de §7.3: `verify_policy_scoped` te
+obliga a **llamar** a `policy_scope`, pero no puede verificar que exista una
+policy hasta que alguien ejecuta esa acción. Un `after_action` sólo corre en
+acciones que corren.
+
+Lo que lo encontró no fue el análisis estático ni la red de Pundit: fue un test
+que ejecutó el endpoint. Y para que no vuelva a pasar hay dos redes nuevas:
+`spec/requests/api/v1/reservations_spec.rb` (el endpoint concreto) y
+`spec/requests/api/v1/endpoint_coverage_spec.rb`, que **recorre todas las rutas
+de la API y falla si alguna devuelve 5xx**. La lección es tan simple como
+incómoda: **un endpoint sin ningún request spec es un endpoint del que no sabés
+nada.**
+
+**b) Las policies mezclaban permiso con estado, y eso se le nota al cliente.**
+
+Es tentador escribir `def submit? = manager? && record.draft?`. Pundit lo
+permite y se ve en muchos proyectos. Pero junta dos preguntas distintas que
+tienen respuestas HTTP distintas:
+
+| Pregunta | Respuesta correcta |
+|---|---|
+| ¿este usuario tiene **derecho** a hacer esto? | **403** Forbidden |
+| ¿el recurso está en un **estado** que lo permita? | **422** Unprocessable |
+
+Con el estado adentro de la policy, mandar dos veces la misma orden de compra
+devolvía **403**. Y un 403 le dice al cliente "nunca vas a poder", cuando la
+realidad es "ya está enviada". El cliente no puede distinguir un problema de
+permisos de uno de flujo y termina mostrándole al usuario el mensaje equivocado
+—o peor, escondiéndole el botón para siempre—.
+
+Hoy `PurchaseOrderPolicy` y `StockTransferPolicy` responden **sólo por el rol**:
+
+```ruby
+class PurchaseOrderPolicy < ApplicationPolicy
+  def create?  = operator?
+  def submit?  = manager?
+  def receive? = operator?
+  def cancel?  = manager?
+  def destroy? = manager?
+end
+```
+
+y el estado lo valida el modelo/service, que devuelve 422 con el código
+`invalid_transition`. La máquina de estados vive en `PurchaseOrder::TRANSITIONS`,
+que es su lugar natural.
+
+No es sólo prolijidad de contrato: **un 403 y un 422 se auditan distinto**. Si
+mezclás los dos, tu alerta de "picos de 403" —que es la que te avisa que alguien
+está sondeando permisos— se llena de ruido de gente reintentando operaciones ya
+hechas, y deja de servir.
 
 ---
 
@@ -1315,15 +1575,38 @@ se está tratando el email como dato personal, que es lo correcto bajo GDPR/PII.
 
 Este repo lo mitiga bien en dos lugares:
 
-- `app/controllers/concerns/api/error_handling.rb:113` — el error 500 loguea el
+- `app/controllers/concerns/api/error_handling.rb:142` — el error 500 loguea el
   detalle y al cliente le manda **sólo un `request_id`**. Nunca `e.message`.
   Los mensajes de Postgres filtran nombres de tabla, columna y a veces datos.
-- `config/environments/production.rb:80` — `attributes_for_inspect = [:id]`.
+- `config/environments/production.rb:96` — `attributes_for_inspect = [:id]`.
   Sin eso, un `user.inspect` en un log o en un error report dumpea **todas** las
   columnas: `password_digest`, `email_address`, todo.
 - `config/initializers/rack_attack.rb` — el throttle de la API hashea el token
   antes de usarlo como clave del cache (`Digest::SHA256.hexdigest`), porque las
   claves de Redis se ven en dashboards, en `MONITOR` y en logs.
+
+⚠️ **Y acá hubo una fuga real, que es el ejemplo perfecto de por qué el 500 no
+es el único camino de escape.** `ApplicationService` rescata
+`ActiveRecord::RecordNotUnique` y devuelve un `Result.failure(:duplicate, ...)`
+— pero le adjuntaba `e.message` como detalle. `ErrorSerializer` renderiza
+`details` tal cual, así que el cliente recibía en el **409** el texto crudo de
+Postgres: nombre del índice, nombre de la tabla y **el valor que colisionó**.
+La regla "mensaje genérico para afuera, detalle completo en el log" estaba
+escrita tres párrafos más arriba en ese mismo archivo, y el código la violaba.
+
+Así quedó (`app/services/application_service.rb`):
+
+```ruby
+rescue ActiveRecord::RecordNotUnique => e
+  Rails.logger.warn(event: "service.duplicate", error: e.message)   # al log, todo
+  Result.failure(:duplicate, "Ya existe un registro con esos datos.")
+```
+
+Test de regresión en `spec/requests/api/v1/hardening_spec.rb`: un POST duplicado
+no puede devolver un body que contenga `PG::`, `index_…` ni `DETAIL`. **Fijate
+la forma del test**: no verifica el mensaje que sí queremos, verifica que **no
+aparezca** ninguno de los tres marcadores de una fuga. Para info-leaks, el
+assert negativo es el que atrapa la regresión.
 
 ---
 
@@ -1346,41 +1629,68 @@ Rails 8 pone cinco por defecto. Lo confirmé en runtime
 | `X-Content-Type-Options: nosniff` | que el browser adivine el MIME y ejecute un "txt" como JS | ✅ default |
 | `X-XSS-Protection: 0` | **apaga** el filtro XSS legacy de IE/Chrome, que era explotable | ✅ default (0 es lo correcto hoy) |
 | `Referrer-Policy: strict-origin-when-cross-origin` | fugar la URL completa (con tokens en el path) al salir del sitio | ✅ default |
-| `Strict-Transport-Security` | downgrade a HTTP / SSL stripping | ❌ **falta** (depende de `force_ssl`) |
-| `Content-Security-Policy` | XSS, inyección de recursos | ❌ **falta** (§2.4) |
+| `Strict-Transport-Security` | downgrade a HTTP / SSL stripping | ✅ (era ❌) vía `force_ssl` |
+| `Content-Security-Policy` | XSS, inyección de recursos | ✅ report-only (era ❌) — §2.4 |
 
-Las dos que faltan son la misma causa: `config.force_ssl` comentado en
-`config/environments/production.rb:31`.
+**Las dos últimas faltaban, y ya no.** La de HSTS tenía una sola causa:
+`config.force_ssl` estaba comentado en `config/environments/production.rb`.
+Hoy está en `true` (línea 45) junto con `assume_ssl` (línea 35), y el stack de
+producción monta `ActionDispatch::AssumeSSL` + `ActionDispatch::SSL`
+(verificado con `RAILS_ENV=production bin/rails middleware`). La de CSP se
+resolvió escribiendo la política (§2.4).
 
 `force_ssl = true` inserta `ActionDispatch::SSL`, que hace **tres** cosas —
 y esto se pregunta:
 
 1. Redirige 301 todo `http://` a `https://`.
-2. Manda `Strict-Transport-Security`. En runtime, `config.ssl_options` acá vale
+2. Manda `Strict-Transport-Security`. En runtime, `config.ssl_options` vale
    `{hsts: {subdomains: true}}` — pero **eso no lo configura este repo**: la
-   línea `config.ssl_options` de `production.rb:34` está comentada, y el valor
-   sale del default que pone `load_defaults` desde 5.0
-   (`railties-8.1.3.1/lib/rails/application/configuration.rb:124`). No se aplica
-   igual, porque el middleware no está montado.
-3. Marca **todas** las cookies como `secure`.
+   línea `config.ssl_options` de `production.rb:47` sigue comentada (es la que
+   excluiría `/up` del redirect), y el valor sale del default que pone
+   `load_defaults` desde 5.0
+   (`railties-8.1.3.1/lib/rails/application/configuration.rb:124`). La
+   diferencia con antes es que **ahora sí se aplica**, porque el middleware está
+   montado; antes el valor estaba pero no lo leía nadie.
+3. Marca **todas** las cookies como `secure` (§6.3).
 
 Y `config.assume_ssl = true` es su complemento en arquitecturas con proxy: le
 dice a Rails "el TLS lo terminó el balanceador, tratá esta request como segura
 aunque te llegue por HTTP". Sin eso, con un proxy delante, `force_ssl` entra en
-**loop de redirección infinita** — es el error más común al activarlo.
+**loop de redirección infinita** — es el error más común al activarlo, y es la
+razón por la que los dos se activaron juntos.
 
 ⚠️ **Cuidado con HSTS:** es una decisión **irreversible por `max-age`**. Si
 mandás `max-age=31536000` y después necesitás servir por HTTP, los browsers que
 ya lo cachearon **no te van a dejar** durante un año. Arrancá con
-`max-age=300`, verificá, y recién ahí subilo.
+`max-age=300`, verificá, y recién ahí subilo. Acá el default de Rails es un año
+con `subdomains: true`, así que es exactamente el caso a mirar antes del primer
+deploy real.
 
-`config.hosts` (línea 83, comentado) es la otra defensa que falta: protección
-contra **DNS rebinding** y **Host header injection**. Sin allow-list de hosts, un
-atacante manda `Host: evil.com`, y cualquier URL absoluta que genere la app
-(un link en un mail de reset de contraseña, por ejemplo) apunta a su dominio.
-En este repo `config.action_mailer.default_url_options = { host: "example.com" }`
-(línea 61) está hardcodeado, así que el mail no es vulnerable — pero
-`config.hosts` sigue siendo lo correcto.
+⚠️ **Lo que SÍ sigue faltando: `config.hosts`.** Está comentado en
+`config/environments/production.rb:99`, y lo verifiqué en runtime:
+`RAILS_ENV=production` da `config.hosts # => []`, o sea sin allow-list. Es la
+protección contra **DNS rebinding** y **Host header injection**: sin ella un
+atacante manda `Host: evil.com` y cualquier URL absoluta que genere la app
+apunta a su dominio.
+
+El mail de reseteo, que es el vector clásico, **no** es vulnerable, pero por otro
+motivo que antes: `config.action_mailer.default_url_options` ya no está
+hardcodeado en `"example.com"` sino que sale del entorno
+(`{ host: ENV.fetch("APP_HOST", "localhost") }`, línea 77), así que el host de
+los links no depende del header `Host` de ninguna request. Eso arregló el bug
+real —los usuarios recibían links a `example.com`— pero **no** reemplaza a
+`config.hosts`: cualquier `*_url` generado dentro de un request sigue tomando el
+`Host` entrante. Lo pendiente, con la excepción para el health check que el
+propio archivo deja comentada dos líneas más abajo:
+
+```ruby
+config.hosts = [ ENV.fetch("APP_HOST", "localhost"), /.*\.#{Regexp.escape(...)}/ ]
+config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
+```
+
+La exclusión de `/up` no es un detalle: el health check del balanceador llega
+con el `Host` de la IP interna y, sin excluirlo, `HostAuthorization` lo rechaza
+con 403 y el balanceador saca la instancia de rotación.
 
 ---
 
@@ -1478,7 +1788,7 @@ $ bundle exec brakeman -q --no-pager
 Application Path: /home/user/stock
 Rails Version: 8.1.3.1
 Brakeman Version: 8.0.6
-Duration: 1.246347296 seconds
+Duration: 1.380426051 seconds
 Checks Run: BasicAuth, ..., YAMLParsing   (79 checks)
 
 Controllers: 20   Models: 22   Templates: 34   Errors: 0
@@ -1492,17 +1802,33 @@ son **79** (los conté de la propia salida; con `-A` suben a 86). No hay
 `config/brakeman.ignore` (lo verifiqué: el archivo no existe), así que no es
 que estén silenciadas — genuinamente no hay hallazgos.
 
-### 11.2 Con TODOS los checks opcionales (`-A`)
+### 11.2 Con TODOS los checks opcionales (`-A`): los 3 hallazgos que había, y por qué hoy son 0
 
-Acá aparece lo interesante. `-A` agrega checks de baja confianza y de
-configuración que Brakeman no corre por defecto porque generan ruido:
+`-A` agrega checks de baja confianza y de configuración que Brakeman no corre
+por defecto porque generan ruido. **Acá es donde apareció lo interesante**, y
+conviene leer la historia completa porque el desenlace es el argumento entero a
+favor y en contra del análisis estático.
+
+Así daba la corrida cuando se auditó el repo:
 
 ```bash
-$ bundle exec brakeman -q -A --no-pager
+$ bundle exec brakeman -q -A --no-pager      # ← ANTES
 Security Warnings: 3
 
 Missing Encryption: 1
 Unscoped Find: 2
+```
+
+Y así da hoy, con los tres arreglados:
+
+```bash
+$ bundle exec brakeman -q -A --no-pager      # ← HOY
+Checks Run: BasicAuth, ..., YAMLParsing   (86 checks)
+
+Controllers: 20   Models: 22   Templates: 34   Errors: 0
+Security Warnings: 0
+
+No warnings found
 ```
 
 **Hallazgo 1 — Missing Encryption (confianza: High)**
@@ -1513,32 +1839,40 @@ Message: The application does not force use of HTTPS: `config.force_ssl` is not 
 File:    config/environments/production.rb  Line: 1
 ```
 
-**Verdadero positivo.** Es exactamente lo que vimos en §6.3 y §9: `force_ssl`
-comentado en la línea 31 significa sin HSTS, sin redirect a HTTPS y **sin flag
-`secure` en las cookies**. Es el hallazgo más importante de los tres y es un
-one-liner.
+**Verdadero positivo**, y el más importante de los tres. Es lo que vimos en §6.3
+y §9: `force_ssl` comentado significaba sin HSTS, sin redirect a HTTPS y **sin
+flag `secure` en las cookies**. El arreglo fue de dos líneas —`assume_ssl` y
+`force_ssl` en `config/environments/production.rb:35` y `:45`— y con eso el
+check deja de reportar.
 
 **Hallazgos 2 y 3 — Unscoped Find (confianza: Weak)**
 
 ```text
 Check: UnscopedFind
 Code:  Session.find_by(:id => cookies.signed[:session_id])
-File:  app/channels/application_cable/connection.rb:11
-File:  app/controllers/concerns/authentication.rb:29
+File:  app/channels/application_cable/connection.rb
+File:  app/controllers/concerns/authentication.rb
 ```
 
-Brakeman marca "buscás por id sin scopear por usuario" — su heurística de IDOR.
-Acá es un **falso positivo en cuanto al IDOR**: el id sale de una cookie
-**firmada** con `secret_key_base`, no de `params`. Un atacante no puede
-sustituirlo sin la clave.
+Brakeman marcaba "buscás por id sin scopear por usuario" — su heurística de
+IDOR. Como IDOR era un **falso positivo**: el id sale de una cookie **firmada**
+con `secret_key_base`, no de `params`. Un atacante no puede sustituirlo sin la
+clave.
 
-**Pero el dedo está apoyado en el lugar correcto por otro motivo.** Como vimos
-en §6.4, es `find_by` y no `active.find_by`, así que **una sesión vencida sigue
-autenticando**. Brakeman lo marcó por la razón equivocada y encontró un bug real
-igual. Eso es exactamente cómo se usa un analizador estático: no como oráculo,
-sino como generador de preguntas.
+**Pero el dedo estaba apoyado en el lugar correcto por otro motivo.** Como vimos
+en §6.4, era `find_by` y no `active.find_by`, así que **una sesión vencida seguía
+autenticando** — en la UI web y también en los WebSockets. Brakeman lo marcó por
+la razón equivocada y encontró un bug real igual. Eso es exactamente cómo se usa
+un analizador estático: **no como oráculo, sino como generador de preguntas.**
 
-Y `application_cable/connection.rb:11` hereda el mismo problema para WebSockets.
+Y acá viene la parte que hay que decir en voz alta, porque es contraintuitiva:
+el hallazgo desapareció, pero **no porque Brakeman verifique que la sesión
+expira**. Desapareció porque `Session.active.find_by(...)` ya no matchea la
+heurística sintáctica "constante de modelo + `find_by(:id => …)`". Si el arreglo
+hubiera sido cosmético —envolver el mismo `find_by` en un método— el warning
+también se habría ido. **Un warning que se apaga no es un bug que se arregla**;
+lo que garantiza el arreglo es `spec/requests/session_expiry_spec.rb`, no el
+scanner.
 
 ### 11.3 Qué detecta Brakeman y qué NO
 
@@ -1552,18 +1886,30 @@ Y `application_cable/connection.rb:11` hereda el mismo problema para WebSockets.
 | Config faltante: sesión (`SessionSettings`), CSRF (`ForgerySetting`) por defecto; `force_ssl` **sólo con `-A`** | lógica de negocio (descuentos negativos, stock que se duplica) |
 | Deserialización insegura (YAML, Marshal) | todo lo que dependa de datos en runtime |
 
-**Cero warnings de Brakeman ≠ app segura.** Tres ejemplos concretos en este
-mismo repo, y ninguno salió del análisis estático:
+**Cero warnings de Brakeman ≠ app segura, y este repo es la prueba.** Hoy la
+corrida da 0 hasta con `-A`, y aun así la auditoría encontró estos bugs reales,
+que ya están arreglados y ninguno salió del análisis estático:
 
 - el bug de expiración de sesión (§6.4) — Brakeman lo tocó de casualidad, con un
   `UnscopedFind` que apuntaba a otra cosa;
 - la CSP ausente (§2.4) — no hay check para eso;
-- el techo de paginación que no existe (§12.3) — `Pagy::DEFAULT[:max_limit]` es
-  una opción inventada, así que `?limit=1000000` llega crudo al `LIMIT`.
+- el techo de paginación inexistente (§12.3) — `Pagy::DEFAULT[:max_limit]` es
+  una opción que la gema no lee, así que `?limit=1000000` llegaba crudo al
+  `LIMIT`;
+- el throttle `logins/email` muerto (§5.3) — leía un parámetro anidado que el
+  formulario nunca manda, así que el contador jamás se incrementó;
+- el `rate_limit` del login sin `by:` (§5.3), que contaba por IP mientras el
+  comentario decía "IP + email";
+- la fuerza bruta de tokens de API sin freno (§5.3.1), porque el 401 corta la
+  cadena de callbacks antes del rate limiter;
+- la UI web sin `verify_authorized` (§7.3).
 
-Los tres son bugs de **configuración semántica**: la línea está escrita, se lee
-bien, y no hace nada. Un analizador de AST no tiene forma de saber que
-`max_limit` no es una clave que la gema lea.
+Casi todos son bugs de **configuración semántica o de contrato**: la línea está
+escrita, se lee bien, y no hace nada. Un analizador de AST no tiene forma de
+saber que `max_limit` no es una clave que la gema lea, ni que el form manda los
+params planos y no anidados. **Lo que los encuentra es leer el código con la
+pregunta "¿esto se dispara alguna vez?" y después escribir el test que lo
+dispara.**
 
 **Comparación con Java:** SpotBugs analiza bytecode y es agnóstico del framework;
 Brakeman analiza el AST de Ruby **con conocimiento de Rails**, así que entiende
@@ -1630,7 +1976,7 @@ RE2/J. En este punto puntual Rails 8 está mejor parado.
 Nada en Rails limita el tamaño del body por sí solo. El límite tiene que estar
 **afuera**: `client_max_body_size` en nginx, o la variable de entorno
 `MAX_REQUEST_BODY` en Thruster (que este repo usa: `gem "thruster"`,
-`Gemfile:235`, versión 0.1.26). Ojo con el default de Thruster: es **`0`, o sea
+`Gemfile:260`, versión 0.1.26). Ojo con el default de Thruster: es **`0`, o sea
 sin límite** (`thruster-0.1.26/README.md:85`). No alcanza con tener Thruster
 adelante; hay que setear la variable.
 
@@ -1655,12 +2001,23 @@ de `params` para que `?a[]=` no llegue como `[nil]` a un `where` y termine en un
 
 Y la validación de largo en los modelos es la última línea:
 `app/models/product.rb:51` (`name`, máx 200), `app/models/user.rb`
-(`name`, máx 120), `app/models/api_token.rb` (`name`, máx 80). Sin eso,
-`description` (que es `text`, sin límite) acepta 50 MB. Nótese que
-`Product#description` **no** tiene validación de largo: es un hueco real,
-menor pero real.
+(`name`, máx 120), `app/models/api_token.rb` (`name`, máx 80).
 
-### 12.3 Paginación sin límite — y el techo que este repo cree tener y no tiene
+**Este hueco existía y se tapó:** `Product#description` es una columna `text`,
+o sea **sin límite en Postgres**, y no tenía ninguna validación de largo. Un
+POST autenticado con 50 MB de `description` entraba a la base sin chistar, y de
+ahí a cada listado que lo serializara. Hoy
+(`app/models/product.rb:55`):
+
+```ruby
+validates :description, length: { maximum: 5_000 }
+```
+
+La regla general que deja: **cada columna `text` que el usuario escribe necesita
+un tope explícito**. `string` te da 255 gratis por el tipo; `text` no te da
+nada, y el "sin límite" del tipo se lee como "no hace falta pensarlo".
+
+### 12.3 Paginación sin límite — y el techo que este repo creía tener y no tenía
 
 El clásico: `?limit=1000000` y el worker se muere cargando objetos.
 
@@ -1689,8 +2046,8 @@ DEFAULT[:limit_extra] = true
 ```
 
 Este initializer requiere `overflow` y `headers`, **no `limit`**. O sea que
-`Pagy::DEFAULT[:max_limit] = 100` escribe una clave que nadie lee, y no hay techo.
-Lo comprobé en runtime:
+`Pagy::DEFAULT[:max_limit] = 100` escribe una clave que nadie lee, y del lado de
+la gema no hay ningún techo. Lo comprobé en runtime, y sigue dando lo mismo hoy:
 
 ```ruby
 Pagy::DEFAULT[:max_limit]   # => 100    ← la clave inventada, inerte
@@ -1702,35 +2059,60 @@ pagy.limit        # => 100000
 records.to_sql    # => SELECT "products".* FROM "products" LIMIT 100000 OFFSET 0
 ```
 
-El parámetro del usuario llega crudo al `LIMIT` del SQL. Y `paginate(scope)`
-—`pagy(scope, limit: params[:limit])`, `app/controllers/api/v1/base_controller.rb:135`—
-es exactamente el camino de seis endpoints de la API v1 (productos, stock items,
-purchase orders, transfers, reservas, reportes). **`GET /api/v1/products?limit=1000000`
-es hoy un DoS de una línea.** La UI web no está expuesta: todos sus `pagy` pasan
-un literal (25 o 30).
+O sea: **a nivel de Pagy sigue sin haber techo**, y el `Pagy::DEFAULT[:max_limit]`
+del initializer sigue siendo una clave inerte (lo verifiqué otra vez hoy:
+`max_limit # => 100`, `limit_max # => nil`). Esa parte del initializer no se
+tocó, y está bien que se lea así: es el ejemplo vivo del modo de falla.
 
-El arreglo son dos líneas, y conviene poner las dos porque cubren capas distintas:
+Lo que **sí** cambió es el único lugar donde ese parámetro llegaba desde afuera.
+`paginate(scope)` era literalmente `pagy(scope, limit: params[:limit])`, y es el
+camino de seis endpoints de la API v1 (productos, stock items, purchase orders,
+transfers, reservas, reportes), así que
+**`GET /api/v1/products?limit=1000000` era un DoS de una línea**: instanciás un
+millón de objetos ActiveRecord y el worker muere por memoria. La UI web nunca
+estuvo expuesta —todos sus `pagy` pasan un literal, 25 o 30.
+
+**Cómo quedó** (`app/controllers/api/v1/base_controller.rb:142-154`):
 
 ```ruby
-# config/initializers/pagy.rb
-require "pagy/extras/limit"      # ← sin esto, limit_max no existe
-Pagy::DEFAULT[:limit_max] = 100
-```
+MAX_PAGE_SIZE = 100
 
-```ruby
-# app/controllers/api/v1/base_controller.rb — no depender del initializer
 def paginate(scope)
-  pagy(scope, limit: params[:limit].presence&.to_i&.clamp(1, 100) || 25)
+  pagy(scope, limit: page_limit)
+end
+
+def page_limit
+  return Pagy::DEFAULT[:limit] if params[:limit].blank?
+
+  Integer(params[:limit]).clamp(1, MAX_PAGE_SIZE)
+rescue ArgumentError, TypeError
+  Pagy::DEFAULT[:limit]
 end
 ```
 
-**La moraleja es más general que el bug:** una opción de configuración mal
-escrita no falla, no avisa y no aparece en ningún test. Un `Hash` acepta
-cualquier clave. Es el mismo modo de falla que el `NullStore` del rate limiter
-(§5.3) y que la CSP en `nil` (§2.4): configuración que *parece* estar puesta.
+Tres decisiones chicas que vale la pena mirar:
+
+1. **`Integer(...)` y no `.to_i`.** `"todos".to_i` es `0`, y `0.clamp(1, 100)`
+   es `1`: te devolvería una página de un elemento en vez de decirte que el
+   parámetro es basura. `Integer()` levanta y el `rescue` cae al default.
+2. El clamp está en el **controller**, no en el initializer. Si mañana se cambia
+   de librería de paginación, el techo sobrevive.
+3. `MAX_PAGE_SIZE` es una constante con nombre, no un `100` suelto en una lambda.
+
+Tests de regresión en `spec/requests/api/v1/hardening_spec.rb`: `?limit=1000000`
+devuelve `meta.limit == 100`, `?limit=todos` cae a 25, y `?limit=2` sigue
+respetándose (el tercero importa: un clamp que rompe el caso normal se revierte
+a la semana).
+
+**La moraleja es más general que el bug, y sigue vigente:** una opción de
+configuración mal escrita no falla, no avisa y no aparece en ningún test. Un
+`Hash` acepta cualquier clave. Es el mismo modo de falla que el `NullStore` del
+rate limiter (§5.3), que la CSP en `nil` (§2.4) y que el throttle que leía un
+param anidado inexistente (§5.3): configuración que *parece* estar puesta.
 Cuando un control de seguridad depende de una opción, el test no es "¿está la
-línea en el initializer?" sino "¿pasa lo que tiene que pasar cuando pido el
-abuso?".
+línea en el initializer?" sino **"¿pasa lo que tiene que pasar cuando pido el
+abuso?"**. Los tres arreglos de este documento que valen algo tienen un spec que
+pide el abuso.
 
 `overflow: :last_page` sí funciona (el extra `overflow` está requerido) y cubre
 `?page=99999`: en vez de un 500 o una página vacía rara, devuelve la última.
@@ -1745,12 +2127,14 @@ MAX_LIMIT     = 200
 ```
 
 `clamp(1, 200)` — no confía en el default de la gema y no depende de que alguien
-no toque el initializer. **Defensa en profundidad en 12 caracteres**, y hoy es lo
-único que salva a un endpoint de la API: `Api::V1::StockMovementsController#index`
-le pasa `params[:limit] || 50` al query object, o sea el mismo parámetro crudo
-que revienta a los otros seis, y el `clamp` lo corta en 200. Ese contraste es el
-argumento entero a favor de validar en el borde de cada objeto en vez de confiar
-en un initializer global.
+no toque el initializer. **Defensa en profundidad en 12 caracteres**, y durante
+todo el tiempo que el bug estuvo vivo fue lo único que salvó a un endpoint de la
+API: `Api::V1::StockMovementsController#index` le pasa `params[:limit] || 50` al
+query object, o sea el mismo parámetro crudo que reventaba a los otros seis, y
+el `clamp` lo cortaba en 200. Ese contraste —un query object blindado al lado de
+seis endpoints abiertos, con el mismo parámetro— es el argumento entero a favor
+de validar en el borde de cada objeto en vez de confiar en un initializer
+global. Hoy están las dos capas.
 
 ### 12.4 Queries sin timeout
 
@@ -1782,10 +2166,10 @@ Spring aplica el timeout **del lado del cliente** (JDBC `Statement.setQueryTimeo
 que manda un cancel. Acá `statement_timeout` es del lado del **servidor**
 Postgres, que es más confiable: si el proceso Ruby muere, la query se mata igual.
 
-### 12.5 Rack::Attack está montado dos veces (y por qué NO duplica los contadores)
+### 12.5 Rack::Attack estuvo montado dos veces (y por qué NO duplicaba los contadores)
 
-Corriendo `bin/rails middleware` en este repo, `Rack::Attack` aparece **dos
-veces** en el stack:
+Corriendo `bin/rails middleware`, `Rack::Attack` aparecía **dos veces** en el
+stack:
 
 ```text
 use ActionDispatch::RemoteIp
@@ -1797,9 +2181,10 @@ use Bullet::Rack
 ```
 
 La gema `rack-attack` inserta su middleware automáticamente vía railtie, y
-`config/application.rb` lo vuelve a insertar después de `ActionDispatch::RemoteIp`
-(con un motivo excelente, documentado ahí: sin eso `req.ip` sería la IP del
-balanceador y todos los usuarios compartirían un contador).
+`config/application.rb` lo volvía a insertar después de
+`ActionDispatch::RemoteIp` (con un motivo excelente, documentado ahí: sin eso
+`req.ip` sería la IP del balanceador y todos los usuarios compartirían un
+contador).
 
 **La conclusión intuitiva es que cada contador se incrementa dos veces y los
 límites efectivos quedan a la mitad. Es falsa, y vale la pena saber por qué.**
@@ -1831,23 +2216,52 @@ rack-attack:rack::attack:<ventana>:logins/ip:198.51.100.7     = 4
 rack-attack:rack::attack:<ventana>:logins/email:nadie@x.com   = 4
 ```
 
-Los límites son los que dicen ser. Lo único que cuesta el montaje doble es una
-llamada de método por request y un lector desconcertado mirando
-`bin/rails middleware`. Aun así conviene limpiarlo, porque la duplicación es
-ruido y porque el día que alguien reordene el stack la intención tiene que estar
-escrita:
+Los límites eran los que decían ser. Lo único que costaba el montaje doble era
+una llamada de método por request y un lector desconcertado mirando
+`bin/rails middleware`. Aun así se limpió, porque la duplicación es ruido y
+porque el día que alguien reordene el stack la intención tiene que estar escrita.
+
+**Cómo quedó, y acá está el detalle que se aprende peleándolo.** El arreglo
+obvio —`delete` y después `insert_after`— **no funciona**:
 
 ```ruby
-# config/application.rb
+# ❌ NO HAGAS ESTO
 config.middleware.delete Rack::Attack
 config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+Las operaciones sobre el stack de middlewares **no se aplican al escribirlas**:
+se acumulan en una lista y se ejecutan en orden cuando el stack se construye,
+después de que corrieron los railties. Según el orden en que caigan, el `delete`
+puede llevarse el middleware que vos mismo insertaste y dejarte **sin ninguno**
+—o sea, sin rate limiting de borde y sin un solo error—. Es otra vez el mismo
+género de bug que el resto del documento: una defensa que desaparece en silencio.
+
+Lo correcto es **mover el que ya existe**, no borrar e insertar
+(`config/application.rb:64`):
+
+```ruby
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+Verificado con `bin/rails middleware`: hoy aparece **una sola vez**, justo
+después de `ActionDispatch::RemoteIp`.
+
+```text
+use ActionDispatch::RequestId
+use ActionDispatch::RemoteIp
+use Rack::Attack                     ← una sola vez, y en el lugar correcto
+use Propshaft::QuietAssets
+...
 ```
 
 **La lección que sí vale para la entrevista:** un middleware que se puede
 insertar dos veces necesita ser idempotente, y rack-attack lo es a propósito.
 Si escribís uno propio que incrementa contadores, cobra o escribe en la base,
 poné el mismo guard — porque el auto-insert de un railtie más un
-`insert_after` tuyo es una combinación normalísima.
+`insert_after` tuyo es una combinación normalísima. Y si lo que querés es
+reubicar un middleware que otro ya montó, el verbo es `move_after`/`move_before`,
+no `delete` + `insert_after`.
 
 ---
 
@@ -1864,7 +2278,7 @@ todos van a helpers de ruta (`root_path`, `products_path`, `stock_item_path(@x)`
 o a un modelo (`redirect_to @warehouse`).
 
 El único que toma algo "externo" es
-`app/controllers/concerns/authentication.rb:32-39`:
+`app/controllers/concerns/authentication.rb:41-48`:
 
 ```ruby
 def request_authentication
@@ -2058,7 +2472,7 @@ código.
 El primer nivel de defensa es `filter_parameters` (§8.4). El segundo es la
 disciplina: **nunca interpolar un objeto entero en un log**.
 
-`config/environments/production.rb:80` cubre el error más común de todos:
+`config/environments/production.rb:96` cubre el error más común de todos:
 
 ```ruby
 config.active_record.attributes_for_inspect = [ :id ]
@@ -2071,7 +2485,7 @@ report de Sentry que serializa el objeto — dumpea `password_digest`,
 
 ### 14.2 `request_id` para correlación
 
-`config/environments/production.rb:37-38`:
+`config/environments/production.rb:50-51`:
 
 ```ruby
 config.log_tags = [ :request_id ]
@@ -2100,7 +2514,7 @@ datos de la N. Eso es **fuga de datos entre usuarios**, y es un bug de seguridad
 real, no de higiene. El comentario de `app/models/current.rb` lo dice explícito.
 
 Y el `request_id` es lo único que la API devuelve al cliente cuando algo
-explota (`app/controllers/concerns/api/error_handling.rb:113-123`):
+explota (`app/controllers/concerns/api/error_handling.rb:138-145`):
 
 ```ruby
 Rails.logger.error(event: "api.internal_error", request_id: request.request_id,
@@ -2113,7 +2527,7 @@ render_error(:internal_error, "Ocurrió un error inesperado. Contactá a soporte
 Soporte pide el id, lo busca en el log agregado, y ve el stack completo. El
 cliente nunca ve un nombre de tabla ni un mensaje de Postgres.
 
-`config/environments/production.rb:44` agrega
+`config/environments/production.rb:57` agrega
 `config.silence_healthcheck_path = "/up"`: sin eso, el health check del
 balanceador cada 5 segundos es el 80% del volumen de tu log y te tapa las
 señales reales.
@@ -2283,26 +2697,39 @@ en un **job**, no en el request.
 
 ## Errores que ves en producción
 
-| # | Síntoma | Causa | Arreglo |
+Las filas marcadas **✅ CORREGIDO** son defectos que **estuvieron vivos en este
+repo** y hoy están arreglados; la columna "Arreglo" dice qué se hizo y dónde
+mirarlo. Las demás son el catálogo general (o pendientes reales, marcados como
+tales). Nada se borró: el bug y su arreglo juntos valen mucho más que el
+arreglo solo.
+
+| # | Síntoma | Causa | Arreglo / estado |
 |---|---|---|---|
-| 1 | Una sesión de hace 3 meses sigue funcionando | `find_session_by_cookie` usa `Session.find_by`, no `Session.active.find_by` (`app/controllers/concerns/authentication.rb:29`). Verificado: una sesión con `expires_at` de hace 10 días sigue autenticando | `Session.active.find_by(id:)`. Y no dependas del job de las 4 AM para cerrar sesiones |
-| 2 | Brakeman: "The application does not force use of HTTPS" | `config.force_ssl` comentado (`config/environments/production.rb:31`). Sin él: sin HSTS, sin redirect, y las cookies **sin `secure`** | `config.assume_ssl = true` + `config.force_ssl = true`. Sin `assume_ssl`, con proxy delante, entrás en loop de redirect |
-| 3 | Cualquier XSS ejecuta scripts sin restricción | `config/initializers/content_security_policy.rb` entero comentado. `Rails.application.config.content_security_policy # => nil`, pese a que el layout emite `csp_meta_tag` | Definir la política, nonce con `SecureRandom.base64(16)` (**no** `session.id`), arrancar con `report_only` |
-| 4 | El scanner enumera qué emails están registrados | Login con `find_by` + `authenticate`: **233 ms vs 0,7 ms** medidos acá. Dos órdenes de magnitud, visible desde internet | `User.authenticate_by` (ya usado en `sessions_controller.rb:17`). Mensaje de error idéntico en los dos casos |
+| 1 | Una sesión de hace 3 meses sigue funcionando | `find_session_by_cookie` usaba `Session.find_by`, no `Session.active.find_by`. Verificado: una sesión con `expires_at` de hace 10 días seguía autenticando | ✅ **CORREGIDO** — `Session.active.find_by(id:)` en `authentication.rb:38` y en `application_cable/connection.rb:15`. Spec: `spec/requests/session_expiry_spec.rb`. No dependas del job de las 4 AM para cerrar sesiones |
+| 2 | Brakeman: "The application does not force use of HTTPS" | `config.force_ssl` estaba comentado. Sin él: sin HSTS, sin redirect, y las cookies **sin `secure`** | ✅ **CORREGIDO** — `config.assume_ssl = true` (`production.rb:35`) + `config.force_ssl = true` (`:45`). Los dos juntos: sin `assume_ssl`, con proxy delante, entrás en loop de redirect. `brakeman -A` pasó de 3 warnings a 0 |
+| 3 | Cualquier XSS ejecuta scripts sin restricción | `config/initializers/content_security_policy.rb` estaba entero comentado. `content_security_policy # => nil`, pese a que el layout emite `csp_meta_tag` | ✅ **CORREGIDO** — política real en ese initializer, en `report_only` hasta que pongas `CSP_ENFORCE=1`. El nonce también se corrigió: usaba `request.session.id`, que es CONSTANTE durante toda la sesión (un nonce que no cambia no es un nonce), y ahora es `SecureRandom.base64(16)` por respuesta (§2.4) |
+| 4 | El scanner enumera qué emails están registrados | Login con `find_by` + `authenticate`: **233 ms vs 0,7 ms** medidos acá. Dos órdenes de magnitud, visible desde internet | `User.authenticate_by` (ya usado en `sessions_controller.rb:31`). Mensaje de error idéntico en los dos casos |
 | 5 | Un operador se autopromueve a admin | `permit(..., :role)` en un `user_params` que no discrimina quién pide | Allow-list condicional + `UserPolicy#change_role?` (`app/policies/user_policy.rb:12`) |
-| 6 | Un endpoint nuevo quedó sin control de acceso 8 meses | Te olvidaste de `authorize`. Nadie avisa | `after_action :verify_authorized`. Está en el `BaseController` de la API (`base_controller.rb:117`) pero **falta en `ApplicationController`** |
+| 6 | Un endpoint nuevo quedó sin control de acceso 8 meses | Te olvidaste de `authorize`. Nadie avisa. Estaba sólo en la API: un controller HTML nuevo no disparaba nada | ✅ **CORREGIDO** — `after_action :verify_pundit_usage` en las dos puntas: `base_controller.rb:117` (API) y `application_controller.rb:45` (UI web), con las exenciones declaradas explícitas (§7.3) |
 | 7 | El listado muestra registros de otro tenant | Autorizaste el `show` pero el `index` usa `Model.all` | `policy_scope` + `verify_policy_scoped`. El `Scope` base devuelve `scope.none`: falla cerrado |
-| 8 | `bin/rails middleware` muestra `Rack::Attack` **dos veces** y alguien concluye que los límites cortan a la mitad | El railtie de la gema lo auto-inserta y `config/application.rb:52` lo vuelve a insertar tras `RemoteIp`. **No duplica nada**: `Rack::Attack#call` corta con `env["rack.attack.called"]` (`rack-attack-6.8.0/lib/rack/attack.rb:105`) — medido contra un server real: 4 requests → contador 4 | Igual conviene limpiarlo: `config.middleware.delete Rack::Attack` antes del `insert_after`. Y si escribís un middleware propio que cuenta o cobra, ponele el mismo guard |
+| 8 | `bin/rails middleware` muestra `Rack::Attack` **dos veces** y alguien concluye que los límites cortan a la mitad | El railtie de la gema lo auto-inserta y el `insert_after` de `config/application.rb` lo volvía a montar tras `RemoteIp`. **No duplicaba nada**: `Rack::Attack#call` corta con `env["rack.attack.called"]` (`rack-attack-6.8.0/lib/rack/attack.rb:105`) — medido contra un server real: 4 requests → contador 4 | ✅ **CORREGIDO** — `config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack` (`config/application.rb:64`); hoy aparece una sola vez. ⚠️ `delete` + `insert_after` **no** sirve: las operaciones se aplican en lote y el delete puede llevarse el que vos insertaste (§12.5) |
 | 9 | El rate limit no limita nada y no hay error | `rate_limit` sobre un `NullStore`: `increment` devuelve `nil` y la comparación nunca se cumple | Elegir el store explícito y avisar si no sirve (`base_controller.rb:46-57`) |
 | 10 | Dos `rate_limit` comparten contador; el de 20 corta en 11 | Sin `name:`, la clave es `["rate-limit", controller_path, nil, by]` para los dos | `name:` distinto en cada declaración |
 | 11 | El worker se cuelga y no vuelve | Query sin `statement_timeout`, o webhook sin `read_timeout` | `statement_timeout`/`lock_timeout` en `database.yml:52`; `open_timeout`/`read_timeout` en `Net::HTTP.start` |
-| 12 | `?limit=100000` tumba el proceso | Paginación sin techo. **Pasa hoy en la API de este repo**: `max_limit` no es una opción de Pagy 9.4.0 (la real es `limit_max`, y necesita `require "pagy/extras/limit"`), así que `paginate` manda el parámetro crudo al `LIMIT` | Cargar el extra `limit` y setear `limit_max`, **más** un `clamp` propio en el controller — como ya hace `ledger.rb` |
+| 12 | `?limit=100000` tumba el proceso | Paginación sin techo: `max_limit` no es una opción de Pagy 9.4.0 (la real es `limit_max`, y necesita `require "pagy/extras/limit"`), así que `paginate` mandaba el parámetro crudo al `LIMIT` en seis endpoints de la API | ✅ **CORREGIDO** — `MAX_PAGE_SIZE = 100` y `page_limit` con `Integer(...).clamp` en `base_controller.rb:142-154`. Specs en `spec/requests/api/v1/hardening_spec.rb`. La clave inerte del initializer sigue ahí como recordatorio del modo de falla (§12.3) |
 | 13 | Un `%` en el buscador dispara un Seq Scan de la tabla entera | `LIKE` sin `sanitize_sql_like` | `sanitize_sql_like` en todo input que llegue a `LIKE`/`ILIKE` (`supplier.rb:23`, `products/search.rb:59`) |
 | 14 | El log tiene `password_digest` y emails de usuarios | `user.inspect` en un log o en el error report | `config.active_record.attributes_for_inspect = [:id]` + `filter_parameters` |
-| 15 | El cliente ve `PG::UndefinedColumn: column products.foo does not exist` | Se devuelve `e.message` crudo en el 500 | Mensaje genérico + `request_id` (`error_handling.rb:113`) |
-| 16 | Reset de contraseña: el atacante sigue adentro | No se revocan las sesiones al cambiar la clave | `@user.sessions.destroy_all` (ya está en `passwords_controller.rb:22`) |
+| 15 | El cliente ve `PG::UndefinedColumn: column products.foo does not exist` | Se devuelve `e.message` crudo en el 500 | Mensaje genérico + `request_id` (`error_handling.rb:142`) |
+| 16 | Reset de contraseña: el atacante sigue adentro | No se revocan las sesiones al cambiar la clave | `@user.sessions.destroy_all` (ya está en `passwords_controller.rb:24`) |
 | 17 | El webhook configurable lee las credenciales IAM del host | SSRF: URL de destino que controla el usuario | Allow-list de esquema + resolver DNS y validar la **IP**, conectar a esa IP, no seguir redirects, egress proxy, IMDSv2 |
 | 18 | La suite tarda minutos hasheando passwords | `bcrypt` con cost 12 en tests. Rails ya baja el cost solo (`min_cost = Rails.env.test?`, `active_model/railtie.rb:18`), así que si te pasa es porque alguien lo pisó, o porque estás generando digests fuera de `RAILS_ENV=test` | No lo re-configures a mano: verificá `ActiveModel::SecurePassword.min_cost` en el entorno que corre la suite |
+| 19 | El límite de intentos por cuenta nunca se dispara y nadie lo nota | El throttle `logins/email` leía `req.params.dig("session", "email_address")`, pero el form usa `form_with url:` y manda los params **planos**. Discriminador `nil` = Rack::Attack no cuenta nada, sin error ni warning | ✅ **CORREGIDO** — lee `req.params["email_address"]` con fallback al anidado, igual en `password-resets/email` (`config/initializers/rack_attack.rb`). Specs que disparan el límite de verdad en `spec/requests/api/v1/rate_limiting_spec.rb` |
+| 20 | El `rate_limit` "cuenta por IP + email" pero en realidad cuenta sólo por IP | No se pasó `by:`; el default de ActionController es `-> { request.remote_ip }`. El comentario mentía y el límite igual "funcionaba" | ✅ **CORREGIDO** — `by: -> { "#{request.remote_ip}:#{params[:email_address].to_s.downcase.strip}" }` en `sessions_controller.rb:19` |
+| 21 | Un atacante prueba tokens de API sin freno | El 401 sale de un `before_action` y **corta la cadena de callbacks**, así que el `rate_limit` de capa 2 nunca corre; y el throttle de borde discrimina por SHA del token, o sea un balde nuevo por token adivinado | ✅ **CORREGIDO** — blocklist Fail2Ban por IP en `rack_attack.rb` (10 fallos / 5 min → ban 1 h) + `record_authentication_failure!` en `Api::TokenAuthentication`, que marca el fallo en `Rack::Attack.cache` para que el middleware lo lea (§5.3.1) |
+| 22 | Una `description` de 50 MB entra a la base y aparece en cada listado | `text` no tiene límite en Postgres y el modelo no validaba largo | ✅ **CORREGIDO** — `validates :description, length: { maximum: 5_000 }` (`app/models/product.rb:55`). Regla: toda columna `text` que escribe el usuario necesita tope explícito |
+| 23 | Un 409 por duplicado le muestra al cliente el índice, la tabla y el valor que colisionó | `ApplicationService` adjuntaba `e.message` de `PG::UniqueViolation` al `Result` de `:duplicate`, y `ErrorSerializer` renderiza `details` tal cual | ✅ **CORREGIDO** — mensaje genérico afuera, `e.message` al log (`app/services/application_service.rb`). Spec con asserts negativos (`PG::`, `index_…`, `DETAIL`) en `hardening_spec.rb` |
+| 24 | Un endpoint devuelve 500 siempre y nadie se entera | Faltaba `StockReservationPolicy`: `policy_scope` levantaba `Pundit::NotDefinedError`. `verify_policy_scoped` no puede detectarlo — sólo corre en acciones que corren | ✅ **CORREGIDO** — `app/policies/stock_reservation_policy.rb` + `spec/requests/api/v1/reservations_spec.rb` y `endpoint_coverage_spec.rb`, que recorre todas las rutas y falla ante cualquier 5xx (§7.6) |
+| 25 | Reenviar una orden ya enviada devuelve 403 y el cliente cree que perdió permisos | La policy mezclaba permiso con estado (`manager? && record.draft?`) | ✅ **CORREGIDO** — la policy mira sólo el rol; el estado lo valida el modelo/service y devuelve **422 `invalid_transition`** (§7.6) |
 
 ---
 
@@ -2386,28 +2813,38 @@ así que la cookie viaja igual.
 **5. "Corriste Brakeman. ¿Qué encontró y qué NO encuentra?"**
 
 Con el set por defecto: **0 warnings** sobre 20 controllers, 22 modelos y 34
-templates, en 1.3 segundos, sin archivo de ignores. Con `-A` (todos los checks
-opcionales): **3**.
+templates, en 1.4 segundos, sin archivo de ignores. Con `-A` (todos los checks
+opcionales) daba **3**, y hoy da **0** porque los tres se arreglaron.
 
-El importante es `ForceSSL` — `config.force_ssl` comentado en producción, que
+El importante era `ForceSSL` — `config.force_ssl` comentado en producción, que
 significa sin HSTS, sin redirect a HTTPS y **sin flag `secure` en las cookies**.
-Verdadero positivo, arreglo de una línea.
+Verdadero positivo, arreglo de dos líneas (`assume_ssl` + `force_ssl`, y hacen
+falta las dos porque sin `assume_ssl` un proxy delante te mete en loop de
+redirects).
 
-Los otros dos son `UnscopedFind` (confianza Weak) sobre
-`Session.find_by(id: cookies.signed[:session_id])`. Como IDOR es **falso
+Los otros dos eran `UnscopedFind` (confianza Weak) sobre
+`Session.find_by(id: cookies.signed[:session_id])`. Como IDOR era **falso
 positivo**: el id sale de una cookie firmada con `secret_key_base`, no de
 `params`. Pero fui a mirar la línea igual y encontré un bug real por otro
-motivo: es `find_by` y no `active.find_by`, así que **una sesión vencida sigue
-autenticando**. Lo verifiqué creando una sesión con `expires_at` de hace 10 días
-y sigue resolviendo. Un analizador estático no es un oráculo; es un generador de
-preguntas.
+motivo: era `find_by` y no `active.find_by`, así que **una sesión vencida seguía
+autenticando** — en la UI y en Action Cable. Lo verifiqué creando una sesión con
+`expires_at` de hace 10 días. Un analizador estático no es un oráculo; es un
+generador de preguntas.
+
+Y agrego el matiz que me parece la parte interesante: el warning desapareció,
+pero **no porque Brakeman verifique que la sesión expira** — desapareció porque
+`Session.active.find_by(...)` ya no matchea su heurística sintáctica. Un arreglo
+cosmético lo habría apagado igual. Lo que garantiza el arreglo es el spec de
+regresión, no el scanner.
 
 Lo que Brakeman **no** encuentra: lógica de autorización rota, IDOR real en un
 modelo multi-tenant, race conditions, y bugs de negocio. Tampoco vio la CSP
-ausente (no hay check) ni que `Pagy::DEFAULT[:max_limit]` sea una opción que la
-gema no lee, con lo cual la API no tiene techo de paginación. Los dos son
-"configuración que parece puesta", y ningún análisis estático los ve. Cero
-warnings no es "app segura".
+ausente (no hay check), ni que `Pagy::DEFAULT[:max_limit]` sea una opción que la
+gema no lee —con lo cual la API no tenía techo de paginación—, ni un throttle de
+Rack::Attack que leía un parámetro anidado que el formulario nunca manda, así
+que jamás se disparó. Todos son "configuración que parece puesta", y ningún
+análisis estático los ve. **Cero warnings no es "app segura"**: acá el repo da
+cero hasta con `-A` y aun así la revisión a mano encontró siete defectos reales.
 Va con bundler-audit (que acá dio **0 vulnerabilidades** contra 1237 avisos de
 la Ruby Advisory DB) y Dependabot, que en este repo también cubre
 `github-actions` — que es el ecosistema que todos se olvidan y que corre con

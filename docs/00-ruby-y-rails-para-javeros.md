@@ -52,7 +52,7 @@ No hay resolución estática: `obj.foo(1)` es `obj.send(:foo, 1)`, y el intérpr
 `:foo` en la cadena de ancestros **en runtime**, cada vez (con inline cache).
 
 ```ruby
-# app/controllers/concerns/api/idempotency.rb:135
+# app/controllers/concerns/api/idempotency.rb:159 (dentro de skip_pundit_verification)
 skip_authorization if respond_to?(:skip_authorization, true)
 ```
 
@@ -311,7 +311,7 @@ La fila del `return` es la que muerde: si el método que creó el `proc` ya volv
 Este repo lo hace en todos lados:
 
 ```ruby
-scope :in_stock, -> { where(quantity_available: 1..) }        # stock_item.rb:40
+scope :in_stock, -> { where(quantity_available: 1..) }        # stock_item.rb:47
 normalizes :sku, with: ->(s) { s.to_s.strip.upcase }          # product.rb:29
 by: -> { current_api_token&.id || request.remote_ip }         # base_controller.rb:77
 "log" => -> { LogAdapter.new },                               # outbox/publisher.rb:18
@@ -379,11 +379,22 @@ Tres reglas salen de ahí:
 
 1. **Claves de hash y nombres de método/columna → símbolos.** Se comparan por identidad, no
    byte a byte, y no allocan.
-2. **`# frozen_string_literal: true` en la primera línea de cada archivo.** Está en 97 de
-   los 103 `.rb` de `app/` (los 6 que faltan son los que generó `rails generate
-   authentication` y nadie tocó). Es la optimización con mejor relación beneficio/esfuerzo
-   de Ruby. Efecto secundario: mutar un literal ahora tira `FrozenError` — y como no es
-   uniforme, el error aparece sólo en algunos archivos.
+2. **`# frozen_string_literal: true` en la primera línea de cada archivo.** Es la
+   optimización con mejor relación beneficio/esfuerzo de Ruby. Efecto secundario: mutar un
+   literal tira `FrozenError`, y como el comentario es **por archivo**, mientras la
+   cobertura sea despareja el error aparece sólo en algunos. Eso mismo pasaba acá: estaba
+   en 97 de los 103 `.rb` de `app/`, y los 6 que faltaban eran los que generó
+   `rails generate authentication` y nadie tocó. **Ya está corregido:** hoy lo tienen los
+   103 (`lib/` no tiene `.rb`, sólo la rake task). El chequeo, que sirve para cualquier
+   repo:
+
+   ```bash
+   $ find app -name '*.rb' | wc -l
+   103
+   $ grep -rl '^# frozen_string_literal: true' app --include='*.rb' | wc -l
+   103
+   ```
+
 3. **Los símbolos dinámicos sí se recolectan** desde Ruby 2.2. Antes eran un vector de DoS
    (10 millones de claves JSON distintas y llenabas la tabla hasta el OOM).
 
@@ -504,20 +515,34 @@ normal y todo queda donde esperás — confirmado: la excepción se levanta como
 
 ### 5.2 Pattern matching con `case/in` — los record patterns de Java 21
 
-El caso más completo está en `app/controllers/concerns/api/idempotency.rb:101-127`:
+El caso más completo está en `app/controllers/concerns/api/idempotency.rb:101-151`:
 
 ```ruby
 case record
 in { replay: true, record: IdempotencyKey => stored }
+  skip_pundit_verification
   response.set_header("Idempotent-Replay", "true")
   render json: stored.response_body, status: stored.response_status
 in { conflict: true }  then render_error(:idempotency_conflict, "...", status: :conflict)
 in { mismatch: true }  then render_error(:idempotency_key_reuse, "...", status: :unprocessable_content)
 in { record: IdempotencyKey => fresh }
-  yield
-  persist_response(fresh)
+  begin
+    yield
+  rescue StandardError
+    mark_failed(fresh)        # y re-lanzamos: que el rescue_from haga su trabajo
+    raise
+  else
+    persist_response(fresh)   # sólo si NO hubo excepción
+  end
 end
 ```
+
+(Esa última rama arrastra otro bug que estuvo vivo acá y ya está arreglado: el `yield`
+pelado dejaba la fila en `processing` para siempre cuando la acción levantaba una excepción
+que atrapaba un `rescue_from`, y el arreglo obvio —`ensure`— tampoco alcanza, porque el
+`ensure` corre **antes** de que el `rescue_from` renderice y ahí `response.status` todavía
+es 200. La forma correcta es `rescue/else`; el comentario del archivo, líneas 125-142, lo
+explica entero.)
 
 Es el `switch` con record patterns de Java 21, con dos diferencias que importan:
 
@@ -580,7 +605,7 @@ end
 
 ```ruby
 def ok? = @ok                                                    # result.rb:56
-def available = quantity_available.to_i                          # stock_item.rb:51
+def available = quantity_available.to_i                          # stock_item.rb:58
 def readonly? = persisted?                                       # stock_movement.rb:47
 def iso(time) = time&.iso8601(3)                                 # application_serializer.rb:43
 def self.digest(raw) = OpenSSL::Digest::SHA256.hexdigest(raw)    # api_token.rb:52
@@ -620,12 +645,12 @@ firma de ninguno. En Java necesitarías varargs de `Object` y castear.
 **Rangos sin extremo** (2.6/2.7) — ActiveRecord traduce `1..` a `>= 1`, `..0` a `<= 0`:
 
 ```ruby
-scope :in_stock,     -> { where(quantity_available: 1..) }         # stock_item.rb:40
-scope :out_of_stock, -> { where(quantity_available: ..0) }         # stock_item.rb:41
+scope :in_stock,     -> { where(quantity_available: 1..) }         # stock_item.rb:47
+scope :out_of_stock, -> { where(quantity_available: ..0) }         # stock_item.rb:48
 scope :live,         -> { where(expires_at: Time.current..) }      # idempotency_key.rb:14
 scope :active,       -> { where(expires_at: Time.current..) }      # session.rb:10
 scope :stuck,        -> { pending.where(attempts: MAX_ATTEMPTS..) }# outbox_event.rb:11
-relation = relation.where(occurred_at: @from..) if @from           # queries/stock_movements/ledger.rb:54
+relation = relation.where(occurred_at: @from..) if @from           # queries/stock_movements/ledger.rb:62
 ```
 
 Más legible que `where("quantity_available >= ?", 1)` y —más importante— **no es SQL
@@ -634,9 +659,9 @@ crudo**: cero riesgo de inyección y Rails puede seguir componiendo la relación
 **Safe navigation `&.`** — el `?.` de Kotlin:
 
 ```ruby
-def current_user = @current_api_token&.user            # token_authentication.rb:88
+def current_user = @current_api_token&.user            # token_authentication.rb:108
 kinds: params[:kinds]&.split(",")                      # api/v1/stock_movements_controller.rb:15
-kinds: params[:kind].presence&.then { |k| [ k ] }      # app/controllers/stock_movements_controller.rb:8
+kinds: params[:kind].presence&.then { |k| [ k ] }      # app/controllers/stock_movements_controller.rb:9
 ```
 
 **Contra `Optional` de Java:** `&.` es más barato (no aloca un wrapper) y más discreto,
@@ -819,15 +844,16 @@ Números reales de este repo:
 $ ruby -e 'puts File.read("/proc/self/status")[/VmRSS:\s+(\d+)/,1].to_i / 1024'
 18                       # Ruby pelado: 18 MB
 $ bin/rails runner '...'
-RSS = 94 MB              # Rails booteado, entorno de desarrollo
-objetos vivos: ~265 000 ; GC count: 35 ; clases cargadas: 4 649
+RSS = 93 MB              # Rails booteado, entorno de desarrollo
+objetos vivos: ~265 000 ; GC count: 35 ; clases cargadas: 4 614
 ```
 
-(`objetos vivos` es `GC.stat[:heap_live_slots]` y baila unos miles entre corridas; `clases`
-es `ObjectSpace.each_object(Class).count` — si contás `Module` en vez de `Class` te da 5 684,
+(`objetos vivos` es `GC.stat[:heap_live_slots]` y baila unos miles entre corridas —según
+dónde caiga el GC salta a ~313 000 y el RSS a 98 MB—; `clases` es
+`ObjectSpace.each_object(Class).count`, y si contás `Module` en vez de `Class` te da 5 626,
 que es el número que la gente suele citar sin darse cuenta.)
 
-94 MB **por worker de Puma**, antes de servir una request. Con 4 workers son ~376 MB de piso.
+93 MB **por worker de Puma**, antes de servir una request. Con 4 workers son ~372 MB de piso.
 Una JVM de Spring Boot arranca más pesada, pero todos los threads comparten ese costo; en
 Ruby lo pagás N veces, salvo por copy-on-write.
 
@@ -891,7 +917,10 @@ Las gemas con extensiones nativas (`pg`) aparecen con una línea por plataforma
 **`require: false`** (`Gemfile:12-16`) significa "instalala pero **no la cargues** al
 bootear". Se usa para herramientas de línea de comandos (`brakeman`, `rubocop`) que no
 tienen por qué estar dentro del proceso de la app: cada gema cargada suma RAM y tiempo de
-boot a **todos** los procesos (web, worker, consola). No hay equivalente directo en Maven.
+boot a **todos** los procesos (web, worker, consola). También aplica a una gema que sólo
+hace falta con cierta configuración: `sidekiq` es `require: false` (`Gemfile:93`) porque
+únicamente se usa con `QUEUE_ADAPTER=sidekiq`, y el `require` condicional vive en
+`config/initializers/sidekiq.rb`. No hay equivalente directo en Maven.
 Quién dispara la carga: `Bundler.require(*Rails.groups)` en `config/application.rb:19`.
 
 **rbenv** funciona con *shims*: binarios falsos en el `PATH` que resuelven la versión leyendo
@@ -1003,27 +1032,33 @@ la cadena. Es `javax.servlet.Filter` con menos ceremonia.
 $ bin/rails middleware
 ...
 use ActionDispatch::RemoteIp
-use Rack::Attack                      # <- insertado por config/application.rb:52
+use Rack::Attack                      # <- movido acá por config/application.rb:64
 use Propshaft::QuietAssets
 ...
-use Rack::TempfileReaper
-use Rack::Attack                      # <- insertado por el railtie de la gema
+use ActionDispatch::Flash
 use Bullet::Rack
+use ActionDispatch::ContentSecurityPolicy::Middleware
+use Rack::Head
+use Rack::ConditionalGet
+use Rack::ETag
+use Rack::TempfileReaper
 run Stock::Application.routes
 ```
 
-`config/application.rb:52` hace `insert_after ActionDispatch::RemoteIp, Rack::Attack`, y el
-motivo está en las líneas 33-51: en la posición 0 correría **antes** de `RemoteIp` y
+`config/application.rb:64` hace `move_after ActionDispatch::RemoteIp, Rack::Attack`, y el
+motivo está en las líneas 31-63: en la posición 0 correría **antes** de `RemoteIp` y
 `request.ip` sería la IP del load balancer, así que todos tus usuarios compartirían un
 contador.
 
-⚠️ **Mirá el resultado real: `Rack::Attack` aparece DOS VECES.** La segunda la agrega el
-railtie de la gema (`rack-attack-6.8.0/lib/rack/attack/railtie.rb`, que hace
-`app.middleware.use(Rack::Attack)`); el `insert_after` de la app no reemplaza esa inserción,
-la suma.
+⚠️ **Acá hubo un bug real, y vale entero porque el arreglo obvio es el equivocado.** La
+línea decía `insert_after ActionDispatch::RemoteIp, Rack::Attack`, y `bin/rails middleware`
+mostraba **`Rack::Attack` DOS VECES**: una donde la ponía la app y otra al final del stack,
+puesta por el railtie de la gema (`rack-attack-6.8.0/lib/rack/attack/railtie.rb`, que hace
+`app.middleware.use(Rack::Attack)`). El `insert_after` de la app no reemplazaba esa
+inserción: la sumaba.
 
 El instinto dice "entonces cada request pasa por el throttle dos veces y todos los contadores
-se incrementan el doble". **Lo medí y es falso**, y el porqué es la parte que vale: la gema es
+se incrementan el doble". **Lo medí y era falso**, y el porqué es la parte que vale: la gema es
 idempotente a propósito. `rack-attack-6.8.0/lib/rack/attack.rb:104-107` arranca así:
 
 ```ruby
@@ -1033,7 +1068,7 @@ def call(env)
   env["rack.attack.called"] = true
 ```
 
-La primera instancia marca el `env`; la segunda se ve marcada y pasa de largo. Comprobado
+La primera instancia marca el `env`; la segunda se ve marcada y pasa de largo. Se comprobó
 empujando 3 requests por el stack completo con `Rack::MockRequest`, con un `alias` sobre
 `Rack::Attack#call` para ver cada pasada, y leyendo después el contador del store:
 
@@ -1044,14 +1079,53 @@ empujando 3 requests por el stack completo con `Rack::MockRequest`, con un `alia
 CONTADOR req/ip tras 3 requests = 3              <- 3, no 6
 ```
 
-O sea: el duplicado **no rompe los límites**, pero sí es basura en la cadena — un frame de
+O sea: el duplicado **no rompía los límites**, pero sí era basura en la cadena — un frame de
 Rack por request y una trampa para el que lea `bin/rails middleware` y saque la conclusión
-apurada. Vale sacarlo:
+apurada.
+
+**Cómo quedó arreglado, y por qué `delete` + `insert_after` NO era la solución.** Mirá cómo
+Rails acumula estas operaciones (`railties-8.1.3.1/lib/rails/configuration.rb:46-94`):
 
 ```ruby
-config.middleware.delete Rack::Attack
-config.middleware.insert_after ActionDispatch::RemoteIp, Rack::Attack
+class MiddlewareStackProxy
+  def insert_after(...)
+    @operations << -> middleware { middleware.insert_after(...) }
+  end
+  def use(...)
+    @operations << -> middleware { middleware.use(...) }
+  end
+  def delete(...)
+    @delete_operations << -> middleware { middleware.delete(...) }
+  end
+  def move_after(...)
+    @delete_operations << -> middleware { middleware.move_after(...) }
+  end
+
+  # Corren primero TODAS las @operations y recién después las @delete_operations:
+  def merge_into(other)
+    (@operations + @delete_operations).each { |operation| operation.call(other) }
+  end
+end
 ```
+
+Son **dos listas**, y las `delete_operations` corren **después** de todas las `operations`.
+Con `delete` + `insert_after` pasa esto: el `insert_after` tuyo y el `use` del railtie se
+aplican primero (dos instancias), y tu `delete` se ejecuta al final — y
+`ActionDispatch::MiddlewareStack#delete` hace `middlewares.reject! { |m| m.name == ... }`,
+o sea que se lleva **todas** las instancias, incluida la tuya. Te quedás con **cero**
+`Rack::Attack`: el rate limiting apagado, sin un solo mensaje. Cambiar un doble frame inútil
+por un agujero de seguridad silencioso.
+
+`move_after` es la operación correcta: también es una `delete_operation` (corre al final,
+cuando el railtie ya montó la suya) pero hace `delete_at` de **una** instancia y la reinserta
+después del target. Por eso hoy la línea es
+
+```ruby
+config.middleware.move_after ActionDispatch::RemoteIp, Rack::Attack
+```
+
+y la salida de `bin/rails middleware` de arriba —que es la real de hoy— muestra un solo
+`Rack::Attack`, justo después de `RemoteIp`.
 
 La lección transferible, y la respuesta buena en una entrevista: **un middleware que se puede
 montar dos veces tiene que ser idempotente**, y la marca en el `env` es el patrón estándar
@@ -1139,7 +1213,7 @@ interactivo.
 backfills, cron simples y verificar afirmaciones:
 `bin/rails runner 'puts StockItem.ancestors.first(3).inspect'`.
 
-**El debugger** — el gem `debug` (default gem desde Ruby 3.1) está en el `Gemfile:139` con
+**El debugger** — el gem `debug` (default gem desde Ruby 3.1) está en el `Gemfile:156` con
 `require: "debug/prelude"`. Poné `binding.break` y el proceso para con un REPL completo:
 `n`/`s`/`fin` son step over/into/out, y remoto es `rdbg --open --port 12345 -- bin/rails s`.
 La ventaja que Java no tiene: en el breakpoint no evaluás expresiones en una caja aparte,
@@ -1177,9 +1251,11 @@ cadena. Cada vez que un middleware "no anda", el primer comando es este (§10.4)
 ## Errores que ves en producción
 
 **1. Mutar un literal de string con `frozen_string_literal: true`.** *Síntoma:*
-`FrozenError: can't modify frozen String`, sólo en algunos archivos (acá: 97 de 103 lo
-tienen). *Arreglo:* `+"texto"`
-(unary plus) o `String.new`; mejor todavía, no mutes strings.
+`FrozenError: can't modify frozen String`, y **sólo en algunos archivos**, porque el
+comentario mágico es por archivo. *Arreglo:* `+"texto"` (unary plus) o `String.new`; mejor
+todavía, no mutes strings. *En este repo:* la cobertura despareja estuvo viva un tiempo (97
+de los 103 `.rb` de `app/`; faltaban los 6 que genera `rails generate authentication`). **Ya
+está corregido:** los 103 lo tienen (§4).
 
 **2. `.to_i` sobre entrada del usuario.** *Síntoma:* `"abc".to_i == 0` y
 `"10 unidades".to_i == 10`; un movimiento con la cantidad equivocada y ningún error.
@@ -1216,8 +1292,17 @@ un SELECT y lo cachea por request. *Arreglo:* `connection.uncached { … }` +
 un test unitario** porque el cache está apagado fuera del executor.
 
 **9. `find_or_create_by!` bajo concurrencia.** *Síntoma:* `RecordNotUnique` esporádico: dos
-requests pasan el `find` a la vez. *Arreglo:* confiar en el índice único y rescatar el choque
-(`app/models/stock_item.rb:116-126`, `find_or_provision!`).
+requests pasan el `find` a la vez. *Arreglo:* confiar en el índice único y rescatar el
+choque… pero el rescue ingenuo no alcanza, y las dos trampas estuvieron vivas acá.
+**(a)** Los tres llamadores invocan esto **dentro de una transacción**, y en Postgres una
+sentencia que falla **aborta la transacción entera**: el `find_by!` del rescate moría con
+`PG::InFailedSqlTransaction`. Por eso el `create!` va en `transaction(requires_new: true)`,
+que abre un SAVEPOINT y deja viva la transacción de afuera. **(b)** El choque no siempre
+llega como `RecordNotUnique`: si el ganador commitea justo antes de que corra la validación
+`uniqueness` del modelo, el perdedor recibe `RecordInvalid`, así que se rescatan las dos.
+**Ya está corregido** en `app/models/stock_item.rb:127-169` (`find_or_provision!`), con test
+de regresión —que crea el ganador desde **otra conexión**, porque con un stub el UNIQUE no
+revienta de verdad— en `spec/models/stock_item_spec.rb:92`.
 
 **10. `MemoryStore` como store de rate limiting o caché con varios workers.** *Síntoma:* el
 límite de 100 corta cerca de 400, inconsistente: cada proceso tiene su contador. *Arreglo:*
@@ -1228,10 +1313,12 @@ en 10, porque cada request incrementa el mismo contador dos veces. Pasa con el `
 nativo de Rails sin `name:`, porque la clave es
 `["rate-limit", scope, name, by].compact.join(":")` y sin `name` las dos declaraciones la
 arman igual (verificado y documentado en `app/controllers/api/v1/base_controller.rb:59-74`).
-*Arreglo:* `name:` distinto por límite. *Falso positivo relacionado:* `bin/rails middleware`
-muestra `Rack::Attack` dos veces en esta app y **no** duplica los contadores — la gema se
-protege con `env["rack.attack.called"]` (§10.4). Sacá igual el duplicado, pero no lo
-diagnostiques como doble conteo sin medirlo.
+*Arreglo:* `name:` distinto por límite. *Falso positivo relacionado:* durante un tiempo
+`bin/rails middleware` mostró `Rack::Attack` dos veces en esta app y **no** duplicaba los
+contadores — la gema se protege con `env["rack.attack.called"]`. El duplicado ya se sacó
+(`move_after` en `config/application.rb:64`, y ojo que `delete` + `insert_after` te habría
+dejado con **cero** middlewares: §10.4), pero la moraleja queda: no diagnostiques doble
+conteo sin medirlo.
 
 **12. Pool de conexiones menor que `RAILS_MAX_THREADS`.** *Síntoma:*
 `ActiveRecord::ConnectionTimeoutError` bajo carga; o, del otro lado,

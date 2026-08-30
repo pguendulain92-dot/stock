@@ -117,7 +117,7 @@ config.active_record.verbose_query_logs = true      # muestra la LÍNEA de tu c�
 config.active_record.query_log_tags_enabled = true  # agrega /*application='Stock',controller=...*/ al SQL
 ```
 
-`verbose_query_logs` es lo que te imprime el `↳ app/models/product.rb:69:in
+`verbose_query_logs` es lo que te imprime el `↳ app/models/product.rb:73:in
 'total_available'` debajo de cada query. Es la forma más rápida que hay de
 encontrar quién generó un N+1. Los query log tags viajan hasta
 `pg_stat_activity`, así que en producción podés ver **qué controller o job** está
@@ -162,7 +162,7 @@ lejos del controller, y nadie lo mira cuando debuggea "el listado está lento".
 
 ### 3.3 Forma 3: un método del modelo que consulta
 
-`app/models/product.rb:67-69` tiene tres métodos que son una trampa perfecta, y
+`app/models/product.rb:71-73` tiene tres métodos que son una trampa perfecta, y
 el propio código lo avisa:
 
 ```ruby
@@ -177,12 +177,12 @@ Se ve así:
 ```bash
 $ bin/rails runner 'Product.limit(3).each { |p| p.total_available }'
 
-StockItem Sum (0.8ms)  SELECT SUM("stock_items"."quantity_available") FROM "stock_items" WHERE "stock_items"."product_id" = 1
-  ↳ app/models/product.rb:69:in 'total_available'
-StockItem Sum (0.4ms)  SELECT SUM(...) WHERE "stock_items"."product_id" = 2
-  ↳ app/models/product.rb:69:in 'total_available'
+StockItem Sum (0.7ms)  SELECT SUM("stock_items"."quantity_available") FROM "stock_items" WHERE "stock_items"."product_id" = 2
+  ↳ app/models/product.rb:73:in 'total_available'
 StockItem Sum (0.3ms)  SELECT SUM(...) WHERE "stock_items"."product_id" = 3
-  ↳ app/models/product.rb:69:in 'total_available'
+  ↳ app/models/product.rb:73:in 'total_available'
+StockItem Sum (0.3ms)  SELECT SUM(...) WHERE "stock_items"."product_id" = 4
+  ↳ app/models/product.rb:73:in 'total_available'
 ```
 
 Desde el call site (`products.each(&:total_available)`) no hay **ninguna** pista
@@ -204,10 +204,20 @@ comentario justamente porque este caso es invisible desde el controller:
 
 Lo mismo en `app/views/stock_movements/_table.html.erb:18-22`, que toca
 `m.product`, `m.warehouse` y `m.user`. Funciona porque
-`StockMovements::Ledger#call` (`app/queries/stock_movements/ledger.rb:58`) hace
-`includes(:product, :warehouse, :user)`. Si mañana alguien saca ese `includes`
-"porque no lo usa el endpoint JSON", la vista HTML se convierte en 3N queries y
-nadie se entera hasta que un depósito grande abre el listado.
+`StockMovements::Ledger#call` (`app/queries/stock_movements/ledger.rb`) termina en
+`includes(*@preload)`, y `DEFAULT_PRELOAD` es `%i[product warehouse user]`. Si
+mañana alguien saca esa precarga "porque no la usa el endpoint JSON", la vista
+HTML se convierte en 3N queries y nadie se entera hasta que un depósito grande
+abre el listado.
+
+Ese `preload:` es un parámetro del query object, no una constante fija, y la
+razón es la otra cara del N+1: el dashboard **no** muestra quién hizo el
+movimiento, así que cargar `:user` ahí es una query regalada en cada visita. Por
+eso `DashboardController#index` llama
+`Ledger.call(limit: 15, preload: %i[product warehouse])`
+(`app/controllers/dashboard_controller.rb:22`). Un query object compartido por
+varias vistas necesita ese parámetro: sin él precarga de más para unas o de menos
+para otras. El desperdicio lo encontró Bullet con `BULLET_UNUSED=1` (§4.1).
 
 ### 3.5 El número medido en este repo
 
@@ -239,61 +249,176 @@ del número de filas.
 
 ## 4. Cómo se detecta un N+1
 
-### 4.1 Bullet, configurado para romper el CI (y por qué hoy no rompe nada)
+### 4.1 Bullet, configurado para romper el CI (y el bug que lo tuvo mudo)
 
-El cableado está en `spec/support/bullet.rb`:
+La **configuración** vive en `config/environments/test.rb`, adentro de un
+`after_initialize`:
 
 ```ruby
 Bullet.enable = true
-Bullet.raise = true                    # <- el N+1 LEVANTA UNA EXCEPCIÓN y el test falla
-Bullet.unused_eager_loading_enable = true  # detecta también el problema INVERSO
+Bullet.raise  = true                   # <- el N+1 LEVANTA UNA EXCEPCIÓN y el test falla
+Bullet.unused_eager_loading_enable = ENV["BULLET_UNUSED"].present?  # opt-in, ver abajo
 ```
 
-Dos decisiones acá que conviene poder defender:
+Que esté en el archivo de entorno y no en un `before(:suite)` de RSpec no es
+cosmético: **`Bullet.enable = true` aplica los parches sobre ActiveRecord en el
+momento de la asignación**. Si lo hacés después de que Rails terminó de bootear,
+para algunos ganchos ya es tarde y la detección queda muda. El archivo de entorno
+corre en el momento correcto del boot. En `spec/support/bullet.rb` queda sólo el
+ciclo de vida por ejemplo (`start_request` / `end_request`) y el helper
+`detectando_n_plus_one`.
+
+Tres decisiones acá que conviene poder defender:
 
 1. **`raise = true`.** Un logger que nadie lee no sirve. La única forma de que
    los N+1 no vuelvan es que el CI los rechace.
 2. **Sólo se activa en los ejemplos marcados con `:n_plus_one`**
-   (`spec/rails_helper.rb:61-69`). El comentario explica el porqué: en muchos
-   specs unitarios el "N+1" es intencional (probás un método que consulta) y
-   activarlo globalmente genera falsos positivos que la gente termina
-   silenciando... y ahí perdés la herramienta. Es exactamente el mismo problema
-   que un SpotBugs con 400 warnings ignorados.
+   (`spec/support/bullet.rb`). El porqué: en muchos specs unitarios el "N+1" es
+   intencional (probás un método que consulta) y activarlo globalmente genera
+   falsos positivos que la gente termina silenciando... y ahí perdés la
+   herramienta. Es exactamente el mismo problema que un SpotBugs con 400
+   warnings ignorados.
+3. **El detector de eager loading INNECESARIO quedó opt-in** con
+   `BULLET_UNUSED=1`, por el motivo que está más abajo.
 
-El test que lo usa (`spec/queries/products_search_spec.rb:64-71`):
+El test que lo usa (`spec/queries/products_search_spec.rb:64-83`) viene con su
+**control positivo**, que es lo que hace que el ejemplo verde signifique algo:
 
 ```ruby
 describe "prevención de N+1", :n_plus_one do
-  it "trae la categoría con includes" do
+  it "trae la categoría con includes (Bullet rompe el test si aparece un N+1)" do
     create_list(:product, 5, :with_category)
-    described_class.call.to_a.each { |p| p.category&.name }
+    expect {
+      detectando_n_plus_one { described_class.call.to_a.each { |p| p.category&.name } }
+    }.not_to raise_error
+  end
+
+  it "sin includes el mismo recorrido SÍ dispara la alarma (control)" do
+    create_list(:product, 5, :with_category)
+    expect {
+      detectando_n_plus_one { Product.kept.to_a.each { |p| p.category&.name } }
+    }.to raise_error(Bullet::Notification::UnoptimizedQueryError)
   end
 end
 ```
 
-`unused_eager_loading_enable` detecta el problema opuesto: hiciste `includes` de
-algo que después no usaste. Es una query de más y memoria desperdiciada; en un
-listado de 500 filas con una asociación gorda se nota.
-
-> ⚠️ **Hallazgo: en este repo el cableado está muerto.** `gem "bullet", "~> 8.0"`
-> está declarado en `group :development do` (Gemfile:183), **no** en
+> ✅ **Este bug ESTUVO vivo en este repo: el cableado estaba muerto.**
+> `gem "bullet", "~> 8.0"` estaba declarado en `group :development do`, **no** en
 > `group :development, :test`. Bundler sólo requiere los grupos de `Rails.groups`,
 > que en el entorno de test son `:default` y `:test`, así que Bullet nunca se
-> carga ahí. Y como tanto `spec/support/bullet.rb:14` como
-> `spec/rails_helper.rb:62` están guardados con `if defined?(Bullet)`, los dos
-> bloques son un no-op silencioso: el ejemplo `:n_plus_one` pasa exista o no el
-> N+1. Verificado:
+> cargaba ahí. Y como tanto `spec/support/bullet.rb` como `spec/rails_helper.rb`
+> guardaban sus bloques con `if defined?(Bullet)`, los dos eran un no-op
+> silencioso: el ejemplo `:n_plus_one` pasaba existiera o no el N+1. Así se veía:
 >
 > ```bash
 > $ RAILS_ENV=test bin/rails runner 'puts defined?(Bullet) ? "cargado" : "NO cargado"'
 > NO cargado
 > ```
 >
-> El arreglo es de una línea: mover el `gem "bullet"` al bloque
-> `group :development, :test do`. Lo dejo anotado y no lo toco porque este
-> documento no modifica código, pero es exactamente el tipo de red de seguridad
-> que la gente cree tener y no tiene. Todo lo que sigue describe cómo se comporta Bullet
-> cuando **sí** está cargado.
+> **Arreglado.** La gema se movió a `group :development, :test` (Gemfile) y la
+> configuración pasó de `spec/support/bullet.rb` a `config/environments/test.rb`.
+> Hoy el mismo comando devuelve:
+>
+> ```bash
+> $ RAILS_ENV=test bin/rails runner 'puts defined?(Bullet) ? "cargado" : "NO cargado"'
+> cargado
+> ```
+>
+> La regresión la custodia **`spec/n_plus_one_guard_spec.rb`**, un meta-test que
+> verifica LA HERRAMIENTA y no el código: que la constante exista, que
+> `Bullet.enable?` sea `true`, que `UniformNotifier.active_notifiers` incluya
+> `UniformNotifier::Raise` (`Bullet.raise` no tiene getter, chocaría con
+> `Kernel#raise`, así que se pregunta por el notificador que instala) y —el que
+> más importa— que un N+1 **de verdad** haga fallar el ejemplo. Ese último es el
+> **control positivo**: sin él no sabés si tu detector detecta.
+>
+> La lección general vale más que el arreglo: cuando una herramienta de test se
+> puede desactivar en silencio (un linter, un detector, un mock que no se
+> aplica), escribí un test que verifique que **está activa**. Cuesta cinco líneas.
+> Un chequeo verde que no verifica nada es peor que no tener chequeo, porque te
+> saca las ganas de mirar.
+
+**La segunda trampa: los objetos "imposibles".** Prender la gema no alcanzó, y
+esto es lo que hace perder la tarde. Bullet clasifica los objetos en POSIBLES e
+IMPOSIBLES: uno que se cargó **de a uno** (o que acabás de crear) queda marcado
+como imposible y no se reporta nunca — es una heurística para no llenarte de
+falsos positivos. Consecuencia en un test: si hacés `create_list(...)`
+**adentro** del request de Bullet, esos registros quedan mudos y la detección no
+dice nada aunque el N+1 exista.
+
+Por eso `spec/support/bullet.rb` expone `detectando_n_plus_one`: cierra y vuelve
+a abrir el request **después** del setup, y envuelve sólo la consulta que querés
+auditar.
+
+```ruby
+it "no tiene N+1", :n_plus_one do
+  create_list(:product, 5, :with_category)          # datos PRIMERO
+  detectando_n_plus_one { Products::Search.call.each { |p| p.category.name } }
+end
+```
+
+Y un detalle más del helper, de los que cuestan una hora:
+`perform_out_of_channel_notifications` **notifica pero no limpia** el colector.
+Si no reiniciás el request, el hook `after` vuelve a encontrar la misma
+notificación y la levanta otra vez; RSpec marca el ejemplo como fallado aunque tu
+`expect { }.to raise_error` la haya capturado perfecto, y el reporte apunta al
+hook en vez de a tu test.
+
+**Por qué `unused_eager_loading` quedó opt-in.** `unused_eager_loading_enable`
+detecta el problema opuesto: hiciste `includes` de algo que después no usaste.
+Es una query de más y memoria desperdiciada; en un listado de 500 filas con una
+asociación gorda se nota. Y encontró desperdicio real acá: el `:user` que el
+dashboard precargaba en cada visita sin mostrarlo nunca (§3.4).
+
+Pero como **gate de CI** es contraproducente, y esto es un hallazgo del propio
+repo: cualquier código que precargue para el camino feliz y corte antes por una
+validación lo dispara. Ejemplo real, `Purchasing::ReceiveOrder`, que hace
+`PurchaseOrder.lock.includes(lines: :product).find(...)` porque necesita las
+líneas para recorrerlas — si una cantidad recibida es inválida corta en la
+primera y la precarga "no se usó". No hay nada que arreglar ahí: no podés saber
+de antemano si vas a fallar. Un chequeo que grita sobre código correcto entrena a
+la gente a ignorarlo, y ahí perdés también las alertas buenas. Quedó disponible
+para correrlo a propósito de vez en cuando:
+
+```bash
+BULLET_UNUSED=1 bundle exec rspec
+```
+
+El detector de N+1, en cambio, queda **siempre** activo: sus hallazgos son bugs
+reales, no ruido.
+
+**Los N+1 que aparecieron apenas Bullet empezó a mirar.** No era un ejercicio
+teórico. Con el detector funcionando saltaron N+1 reales en los serializers de
+órdenes de compra y de transferencias, que recorren las líneas tocando
+`line.product`. El arreglo interesante es el de las órdenes de compra, porque
+**no** es un `includes` al buscar
+(`app/controllers/api/v1/purchase_orders_controller.rb`):
+
+```ruby
+def serialize(order)
+  ActiveRecord::Associations::Preloader.new(
+    records: [ order ],
+    associations: [ :supplier, :warehouse, :created_by, { lines: :product } ]
+  ).call
+  PurchaseOrderSerializer.new(order).as_json
+end
+```
+
+¿Por qué a mano y no `includes` en el `find`? Porque esas acciones tienen caminos
+de error —estado inválido → 422, sin permiso → 403— que cortan **antes** de
+serializar: ahí el eager loading se paga y no se usa, y `BULLET_UNUSED=1` lo
+reporta como "AVOID eager loading detected", con razón.
+`ActiveRecord::Associations::Preloader` es el objeto que `includes` usa por
+debajo; llamándolo a mano precargás **exactamente cuando hace falta**. Es la
+herramienta correcta para "ya tengo el objeto y ahora sí necesito sus
+asociaciones", y muy poca gente sabe que se puede usar directo.
+
+En transferencias el mismo N+1 se arregló con la forma clásica, porque ahí el
+objeto se busca justo para operarlo y serializarlo:
+`StockTransfer.with_associations` es
+`includes(:source_warehouse, :destination_warehouse, :requested_by, lines: :product)`
+(`app/models/stock_transfer.rb:29`). Las dos formas son válidas; lo que decide
+cuál usar es **cuánto camino hay entre el `find` y la serialización**.
 
 ### 4.2 `strict_loading`: la versión de Rails, sin gema
 
@@ -302,7 +427,8 @@ listado de 500 filas con una asociación gorda se nota.
 `LazyInitializationException` de Hibernate, pero *opt-in*: se activa por
 asociación (`has_many :x, strict_loading: true`), por modelo
 (`self.strict_loading_by_default = true`) o por app. Este repo no lo usa: eligió
-Bullet porque además detecta el eager loading inútil.
+Bullet porque además detecta el eager loading inútil (que acá quedó opt-in con
+`BULLET_UNUSED=1`, §4.1).
 
 ### 4.3 Las otras herramientas
 
@@ -310,7 +436,7 @@ Bullet porque además detecta el eager loading inútil.
 |---|---|---|
 | `verbose_query_logs` | la línea de Ruby que disparó cada query | ✅ activo en desarrollo |
 | `query_log_tags` | comentario SQL con controller/action/job, visible en `pg_stat_activity` | ✅ activo en desarrollo |
-| `bullet` | detecta N+1 y eager loading inútil, rompe el test | ⚠️ configurado en `spec/`, pero la gema está sólo en `group :development` y no se carga en test (ver §4.1) |
+| `bullet` | detecta N+1 y eager loading inútil, rompe el test | ✅ activo en test: gema en `group :development, :test`, config en `config/environments/test.rb`. El N+1 siempre; el eager loading inútil con `BULLET_UNUSED=1`. Estuvo inerte y hoy lo custodia `spec/n_plus_one_guard_spec.rb` (ver §4.1) |
 | `rack-mini-profiler` | badge flotante con desglose de tiempo SQL/render por request | ⚠️ en el Gemfile con `require: false` y nadie lo requiere: hay que cargarlo a mano |
 | `prosopite` | detecta N+1 mirando queries *estructuralmente idénticas* seguidas; menos falsos negativos que Bullet en asociaciones raras y en SQL crudo | ❌ no está |
 | APM (Datadog, Scout, New Relic) | traza de producción con la pila de queries por endpoint | ❌ no está |
@@ -412,7 +538,7 @@ SELECT "products"."id" AS t0_r0, ... FROM "products"
 
 Un `SELECT DISTINCT` con JOIN es un sort o un hash agregado sobre toda la tabla.
 Le pagaste el precio del JOIN y del DISTINCT para terminar haciendo dos queries
-igual. Por eso `Product.with_associations` (`app/models/product.rb:60`) usa
+igual. Por eso `Product.with_associations` (`app/models/product.rb:64`) usa
 `includes` y no `eager_load`.
 
 ### 5.4 Tabla de decisión
@@ -763,7 +889,7 @@ principio del orden, eso pasa todo el tiempo.
 
 ### 9.2 Keyset: el plan del mismo dataset
 
-`StockMovements::Ledger` (`app/queries/stock_movements/ledger.rb:76-89`) pagina
+`StockMovements::Ledger` (`app/queries/stock_movements/ledger.rb:84-97`) pagina
 por cursor:
 
 ```ruby
@@ -863,15 +989,20 @@ Tres cosas que tienen que coincidir para que esto funcione:
    para `ORDER BY a ASC, b DESC`, porque eso no es ni el orden del índice ni su
    reverso exacto.
 3. El cursor se serializa opaco (Base64 de un JSON,
-   `app/queries/stock_movements/ledger.rb:66-72`), así que el día que cambie el
+   `app/queries/stock_movements/ledger.rb:74-80`), así que el día que cambie el
    criterio de orden no se rompen los clientes que guardaron un cursor.
 
-### 9.5 Hallazgo: el ledger SIN filtro no tiene índice
+### 9.5 Hallazgo (corregido): el ledger SIN filtro no tenía índice
 
-Los índices de `stock_movements` son todos compuestos con la FK adelante:
-`(stock_item_id, occurred_at, id)`, `(product_id, occurred_at)`,
-`(warehouse_id, occurred_at)`. **No hay ninguno sobre `(occurred_at, id)` solo.**
-Entonces una consulta al ledger global sin filtros no puede usar ninguno:
+Este es el hallazgo que mejor muestra para qué sirve leer un plan, así que va
+completo: cómo se veía, cómo se detectó y cómo quedó.
+
+**Cómo se veía.** Los índices de `stock_movements` eran todos compuestos con una
+FK adelante: `(stock_item_id, occurred_at, id)`, `(product_id, occurred_at)`,
+`(warehouse_id, occurred_at)`. **No había ninguno sobre `(occurred_at, id)`
+solo**, y un B-tree sólo sirve si la query usa un **prefijo izquierdo** de sus
+columnas (§10.2). O sea que una consulta al ledger global —sin filtros— no podía
+usar ninguno de los tres:
 
 ```
  Limit (actual time=34.804..39.970 rows=50 loops=1)
@@ -883,13 +1014,74 @@ Entonces una consulta al ledger global sin filtros no puede usar ninguno:
  Execution Time: 40.043 ms
 ```
 
-Con 300k filas son 40 ms de seq scan paralelo. Con 50M no arranca. Y hay dos
-call sites que caen justo ahí: `DashboardController#index`
-(`app/controllers/dashboard_controller.rb:12`, `Ledger.call(limit: 15)`) y
+Con 300k filas son 40 ms de seq scan paralelo **más un Sort de toda la tabla**.
+Con 50M no arranca. Y había dos call sites que caían justo ahí:
+`DashboardController#index` (`Ledger.call(limit: 15, ...)`) y
 `Api::V1::StockMovementsController#index` cuando el cliente no manda filtros.
-El arreglo es un `add_index :stock_movements, [:occurred_at, :id], order: { occurred_at: :desc, id: :desc }`
-(o forzar un filtro obligatorio en el endpoint). Vale la pena mencionarlo:
-saber leer un plan sirve justamente para encontrar esto antes de que duela.
+Detalle que lo hacía más fácil de pasar por alto: el comentario de
+`StockMovements::Ledger` hablaba de "el índice compuesto
+`(occurred_at DESC, id DESC)`" como si existiera. La documentación decía que
+estaba; el `\di` decía que no.
+
+**Cómo quedó.** Se agregó `db/migrate/20260830220000_add_ledger_global_index.rb`:
+
+```ruby
+class AddLedgerGlobalIndex < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!          # CONCURRENTLY no puede correr en transacción
+
+  def change
+    add_index :stock_movements, [ :occurred_at, :id ],
+              order: { occurred_at: :desc, id: :desc },
+              algorithm: :concurrently,
+              if_not_exists: true,
+              name: "index_stock_movements_global_ledger"
+  end
+end
+```
+
+`algorithm: :concurrently` no es adorno: un `CREATE INDEX` normal toma un lock
+que **bloquea las escrituras** de la tabla durante toda la construcción, y sobre
+millones de filas eso son minutos de app caída. El precio de CONCURRENTLY es que
+tarda el doble y, si falla a mitad, deja un índice inválido que hay que borrar a
+mano (`DROP INDEX CONCURRENTLY`); los detectás con
+`SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;`.
+
+**Cómo verificarlo, con el cuidado de §11.5.** En esta base hay 109 movimientos,
+así que el planner elige Seq Scan igual — y hace bien, leer la tabla entera es
+más barato que saltar por el índice:
+
+```
+$ psql -d stock_development -c "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM stock_movements
+    ORDER BY occurred_at DESC, id DESC LIMIT 50;"
+
+ Limit  (cost=7.71..7.84 rows=50 width=140) (actual time=0.101..0.106 rows=50 loops=1)
+   ->  Sort  (cost=7.71..7.98 rows=109 width=140) (actual time=0.099..0.102 rows=50 loops=1)
+         Sort Key: occurred_at DESC, id DESC
+         Sort Method: top-N heapsort  Memory: 44kB
+         ->  Seq Scan on stock_movements  (actual time=0.013..0.034 rows=109 loops=1)
+ Execution Time: 0.188 ms
+```
+
+Para demostrar que el índice **existe y sirve** hay que forzarlo:
+
+```
+$ psql -d stock_development -c "SET enable_seqscan = off;
+    EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM stock_movements
+    ORDER BY occurred_at DESC, id DESC LIMIT 50;"
+
+ Limit  (cost=0.14..8.68 rows=50 width=140) (actual time=0.052..0.087 rows=50 loops=1)
+   Buffers: shared hit=5
+   ->  Index Scan using index_stock_movements_global_ledger on stock_movements
+       (cost=0.14..18.76 rows=109 width=140) (actual time=0.051..0.081 rows=50 loops=1)
+         Buffers: shared hit=5
+ Execution Time: 0.147 ms
+```
+
+Fijate en lo que **desapareció**: no hay nodo `Sort`. El orden `DESC, DESC` del
+índice coincide con el `ORDER BY`, así que Postgres lo recorre de una pasada y
+lee 50 entradas contiguas (§10.5). En esta base de juguete la diferencia son
+microsegundos; a 50M de filas es la diferencia entre un dashboard que abre y uno
+que no, porque el Seq Scan + Sort crece con la tabla y el Index Scan no.
 
 ### 9.6 El desempate por `id` no es opcional
 
@@ -929,6 +1121,32 @@ Pagy::DEFAULT[:overflow] = :last_page
 **Cualquier parámetro de paginación que venga del usuario tiene que estar
 acotado.** El ledger hace lo mismo a mano con `MAX_LIMIT = 200` y
 `limit.to_i.clamp(1, MAX_LIMIT)`.
+
+Y hay un tercer lugar donde hacía falta, que estuvo suelto y se corrigió:
+`Api::V1::BaseController#paginate` le pasaba a `pagy` el `params[:limit]` crudo.
+Hoy va por `page_limit`, que acota con `MAX_PAGE_SIZE = 100` y cae al default si
+el parámetro no es un entero:
+
+```ruby
+# app/controllers/api/v1/base_controller.rb
+MAX_PAGE_SIZE = 100
+
+def paginate(scope) = pagy(scope, limit: page_limit)
+
+def page_limit
+  return Pagy::DEFAULT[:limit] if params[:limit].blank?
+
+  Integer(params[:limit]).clamp(1, MAX_PAGE_SIZE)
+rescue ArgumentError, TypeError
+  Pagy::DEFAULT[:limit]
+end
+```
+
+Ojo con **dónde** queda el tope: acá `pagy` recibe el `limit:` ya resuelto por el
+controller, así que el número que manda en la API es `MAX_PAGE_SIZE` y no el
+`Pagy::DEFAULT[:max_limit]` del initializer. Tener el límite en dos lugares es
+como se cuelan estos descuidos; el que gana siempre es el más cercano a la
+llamada.
 
 ---
 
@@ -1404,10 +1622,27 @@ psql -d stock_development -c "EXPLAIN (ANALYZE, BUFFERS) SELECT ..."
    Ojo con el `.inspect` del ejemplo: **hace falta para ver el error**. Sin él la
    llamada no explota, porque el proxy todavía no armó nada (punto 2).
 
-   Por eso el helper `ApplicationRecord.explain_analyze`
-   (`app/models/application_record.rb:44-46`) **está roto hoy**, y el comentario
-   de `app/queries/stock_items/low_stock.rb:13` sugiere la forma que no anda.
-   Usá `.explain(:analyze, :buffers)` directo sobre la relación.
+   El helper `ApplicationRecord.explain_analyze`
+   (`app/models/application_record.rb:60-62`) **estuvo roto por esto mismo**:
+   estaba escrito como `relation.explain(analyze: true, verbose: true)`. El
+   adapter de Postgres arma la cláusula con `options.join(", ").upcase`, así que
+   el hash se interpolaba como texto y la base contestaba el `PG::SyntaxError` de
+   arriba. Hoy es `relation.explain(:analyze, :verbose).inspect` y funciona:
+
+   ```bash
+   $ bin/rails runner 'puts ApplicationRecord.explain_analyze(StockItems::LowStock.call)'
+   EXPLAIN (ANALYZE, VERBOSE) SELECT "stock_items".* FROM "stock_items" WHERE ...
+   ...
+   EXPLAIN (ANALYZE, VERBOSE) SELECT "products".* FROM "products" WHERE "products"."id" IN (...)
+   ...
+   ```
+
+   Lo que **sigue vivo** es el comentario de
+   `app/queries/stock_items/low_stock.rb:13`, que todavía sugiere
+   `StockItems::LowStock.call.explain(analyze: true)` — la forma que no anda.
+   Sirve como recordatorio de que un comentario no compila: si el código de al
+   lado se arregla y nadie mira el comentario, queda mintiendo. Usá
+   `.explain(:analyze, :buffers)` directo sobre la relación, o el helper.
 
 2. `.explain` devuelve un `ExplainProxy`; `puts` te imprime
    `#<ActiveRecord::Relation::ExplainProxy:0x...>`. Hay que hacer `.inspect`.
@@ -1744,7 +1979,7 @@ de la misma transacción, y (c) tenés un verificador que corre periódicamente.
 ### 15.1 `Rails.cache.fetch`
 
 El store en desarrollo y producción es Solid Cache
-(`config/environments/development.rb:32` y `config/environments/production.rb:50`;
+(`config/environments/development.rb:32` y `config/environments/production.rb:63`;
 en test es `:memory_store`), o sea **una tabla de Postgres**, no Redis. Eso
 cambia el cálculo: un `fetch` cuesta una query, así que cachear algo
 que ya era una query rápida no gana nada. Cachear una agregación de 200 ms sí.
@@ -1752,7 +1987,7 @@ que ya era una query rápida no gana nada. Cachear una agregación de 200 ms sí
 Los dos usos reales:
 
 ```ruby
-# app/controllers/dashboard_controller.rb:9
+# app/controllers/dashboard_controller.rb:16
 # El dashboard hace 6 agregaciones. Cachearlas 60 s no cambia nada para el
 # usuario y le saca un montón de carga a la base cuando 20 operarios lo
 # tienen abierto en una pantalla.
@@ -1910,7 +2145,7 @@ los clientes, y el próximo `PATCH` de cualquiera de ellos va a dar 409. Correct
 pero hay que saberlo.
 
 El caso más interesante de `update_all` en este repo es el UPDATE condicional
-atómico (`app/models/stock_item.rb:104-114`):
+atómico (`app/models/stock_item.rb:115-125`):
 
 ```ruby
 def self.atomically_decrement(stock_item_id, amount)
@@ -2000,10 +2235,19 @@ En Rails aparece porque tocar una asociación no cargada **dispara la query en e
 instante** — no hay `LazyInitializationException` que te avise como en Hibernate;
 nunca falla, sólo se pone lento. Se arregla con `includes`, y se **previene** con
 Bullet configurado con `raise = true` para que el N+1 rompa el CI
-(`spec/support/bullet.rb`) — con la advertencia de §4.1: acá la gema quedó sólo
-en `group :development`, así que el guard `if defined?(Bullet)` la desactiva en
-test y la red de seguridad hoy no existe. Que la protección esté escrita no
-quiere decir que esté corriendo; eso también se verifica.
+(`config/environments/test.rb`).
+*La anécdota que vale contar*: en este repo esa red de seguridad estuvo colgada
+pero desconectada. La gema estaba sólo en `group :development`, así que en test
+la constante no existía, el guard `if defined?(Bullet)` daba false y los ejemplos
+marcados `:n_plus_one` pasaban en verde hubiera o no un N+1. Se arregló moviéndola
+a `group :development, :test` y llevando la configuración al archivo de entorno
+(porque `Bullet.enable = true` parchea ActiveRecord en el momento de la
+asignación, y desde un `before(:suite)` llega tarde). Apenas empezó a mirar de
+verdad aparecieron N+1 reales en los serializers de órdenes de compra y de
+transferencias. La moraleja: que la protección esté escrita no quiere decir que
+esté corriendo, así que la herramienta también se testea — para eso está
+`spec/n_plus_one_guard_spec.rb`, con un control positivo que verifica que un N+1
+de verdad hace fallar la suite.
 *El remate que separa una buena respuesta*: `includes` arregla el N+1 de **carga
 de asociaciones**, no el de **agregación**. Si el serializer llama
 `product.stock_items.sum(...)`, `includes` no cambia nada: sigue habiendo una
