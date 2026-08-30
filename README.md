@@ -82,13 +82,28 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ### Correr los tests
 
 ```bash
-bundle exec rspec                       # toda la suite (~20 s, 300+ ejemplos)
+bundle exec rspec                       # toda la suite (~20 s, 358 ejemplos)
 bundle exec rspec spec/services         # sólo los casos de uso
 bundle exec rspec spec/integration      # concurrencia con threads reales
 COVERAGE=1 bundle exec rspec            # con reporte de cobertura
+LINT_FACTORIES=1 bundle exec rspec      # valida todas las factories y traits
+BULLET_UNUSED=1 bundle exec rspec       # además, eager loading innecesario
 bundle exec rubocop                     # estilo
 bundle exec brakeman -q                 # seguridad
 bundle exec bundle-audit check --update # CVEs en las dependencias
+bin/rails zeitwerk:check                # autoloading (lo que rompe en prod)
+```
+
+### Diagnóstico y operación
+
+```bash
+bin/rails stock:reconcile        # ¿el ledger cuadra con la proyección?
+bin/rails stock:low[BA-01]       # qué hay que reponer
+bin/rails stock:valuation        # cuánta plata hay parada
+bin/rails stock:outbox           # estado de la cola de eventos
+bin/rails stock:token[admin@stock.test,mi-app]
+bin/rails db:unused_indexes      # índices que Postgres nunca usó
+bin/rails db:table_sizes         # tuplas muertas y bloat
 ```
 
 ---
@@ -227,6 +242,11 @@ negocio— vive en `services/`.
 | Autorización | Pundit | policies = Strategy, testeables sin HTTP |
 | Rate limiting | Rack::Attack + `rate_limit` de Rails | borde + política de negocio |
 | Tests | RSpec, FactoryBot, Capybara, Cuprite, Bullet | ver `docs/09` |
+
+**Estado de la suite**: 358 ejemplos, 0 fallas (~20 s). RuboCop sin ofensas,
+Brakeman sin warnings, `zeitwerk:check` OK, lint de factories OK.
+La detección de N+1 con Bullet está activa de verdad y hay un
+[control positivo](spec/n_plus_one_guard_spec.rb) que falla si deja de detectar.
 
 Cambiá el backend de colas sin tocar una línea de código:
 
